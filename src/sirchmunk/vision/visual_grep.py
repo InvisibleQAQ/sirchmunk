@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from typing import Dict, List, Optional, Tuple
 
@@ -55,6 +55,11 @@ _DYNAMIC_SURVIVAL_RATIO = 0.25
 # When score variance is negligible, further cap to limit CLIP cost.
 _ADAPTIVE_CLIP_CAP = 500
 _ADAPTIVE_STD_THRESHOLD = 0.01
+
+# FAST mode: more aggressive filtering to reduce Phase 2 cost.
+_FAST_TIGHTEN_TRIGGER = 500
+_FAST_SURVIVAL_RATIO = 0.10
+_FAST_ADAPTIVE_CAP = 200
 
 
 class VisualGrep:
@@ -84,6 +89,7 @@ class VisualGrep:
         paths: List[str],
         max_depth: int = 10,
         weight_overrides: Optional[Dict[str, float]] = None,
+        fast: bool = False,
     ) -> Tuple[List[ImageCandidate], VisualConstraint]:
         """Scan *paths*, compile constraints, score via operator fusion.
 
@@ -185,26 +191,31 @@ class VisualGrep:
         # ---- Step 1: initial cap ----
         result = scored[: self._max_candidates]
 
-        # ---- Step 2: Dynamic threshold (Scheme D) ----
-        if len(result) > _DYNAMIC_TIGHTEN_TRIGGER:
+        # ---- Step 2: Dynamic threshold ----
+        trigger = _FAST_TIGHTEN_TRIGGER if fast else _DYNAMIC_TIGHTEN_TRIGGER
+        survival = _FAST_SURVIVAL_RATIO if fast else _DYNAMIC_SURVIVAL_RATIO
+        cap = _FAST_ADAPTIVE_CAP if fast else _ADAPTIVE_CLIP_CAP
+
+        if len(result) > trigger:
             scores_arr = [c.grep_score for c in result]
-            p75 = float(np.percentile(scores_arr, 75))
+            pct = max(0.0, (1.0 - survival) * 100)
+            cutoff = float(np.percentile(scores_arr, pct))
             before = len(result)
-            tightened = [c for c in result if c.grep_score >= p75]
-            min_keep = max(int(before * _DYNAMIC_SURVIVAL_RATIO), 1)
+            tightened = [c for c in result if c.grep_score >= cutoff]
+            min_keep = max(int(before * survival), 1)
             if len(tightened) < min_keep:
                 tightened = result[:min_keep]
             result = tightened
             print(
                 f"  [VisualGrep] Dynamic threshold: {before} → {len(result)} "
-                f"(≥ {p75:.3f})"
+                f"(≥ {cutoff:.3f})"
             )
 
         # ---- Step 3: Adaptive cap (uninformative scores) ----
-        if len(result) > _ADAPTIVE_CLIP_CAP:
+        if len(result) > cap:
             score_std = float(np.std([c.grep_score for c in result]))
             if score_std < _ADAPTIVE_STD_THRESHOLD:
-                result = result[:_ADAPTIVE_CLIP_CAP]
+                result = result[:cap]
                 print(
                     f"  [VisualGrep] Scores uninformative (σ={score_std:.4f}), "
                     f"capped to {len(result)}"
@@ -341,22 +352,29 @@ class VisualGrep:
             f"{len(stale)} to sign ({cache_elapsed:.2f}s lookup)"
         )
 
-        # Sign stale/new files
+        # Sign stale/new files (parallelised)
         if stale:
             t1 = time.time()
             new_entries: list = []
-            for fp, mt, sz in stale:
-                try:
-                    sig = self._signer.sign(fp)
-                    cached[fp] = sig
-                    new_entries.append((fp, mt, sz, sig))
-                except Exception:
-                    continue
+            n_workers = min(8, os.cpu_count() or 4)
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                future_map = {
+                    pool.submit(self._signer.sign, fp): (fp, mt, sz)
+                    for fp, mt, sz in stale
+                }
+                for future in as_completed(future_map):
+                    fp, mt, sz = future_map[future]
+                    try:
+                        sig = future.result()
+                        cached[fp] = sig
+                        new_entries.append((fp, mt, sz, sig))
+                    except Exception:
+                        continue
             self._sig_store.store_signatures_batch(new_entries)
             sign_elapsed = time.time() - t1
             print(
                 f"    [VisualGrep:SigCache] Signed {len(new_entries)} new "
-                f"images in {sign_elapsed:.2f}s"
+                f"images in {sign_elapsed:.2f}s ({n_workers} threads)"
             )
 
         return list(cached.values())

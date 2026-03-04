@@ -48,6 +48,11 @@ _THUMB_SIZE = (224, 224)
 _CACHE_VERSION = 3
 _N_SCALES = 6  # global, TL, TR, BL, BR, center
 
+# FAST early-stopping parameters
+_FAST_CHUNK_SIZE = 100
+_FAST_PATIENCE = 2
+_FAST_MIN_EVAL_FACTOR = 5   # process at least top_k * this before stopping
+
 # Backward-compatible alias used by external modules
 DEFAULT_CLIP_MODEL = DEFAULT_MODEL_ID
 
@@ -80,7 +85,12 @@ def _ensure_model(model_id: str = DEFAULT_MODEL_ID) -> None:
 
     resolved = _resolve_model_path(model_id)
     _processor = AutoProcessor.from_pretrained(resolved)
-    _device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        _device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        _device = "mps"
+    else:
+        _device = "cpu"
     _model = AutoModel.from_pretrained(resolved).to(_device).eval()
     print(f"    [SigLIPScout] SigLIP2 model loaded on device: {_device}")
 
@@ -132,11 +142,18 @@ def _extract_features(output: Any) -> Any:
 def _generate_crops(
     img: Image.Image,
     size: Tuple[int, int] = _THUMB_SIZE,
+    global_only: bool = False,
 ) -> List[Image.Image]:
-    """Generate 6 crops: global, 4 quadrants (TL/TR/BL/BR), centre.
+    """Generate image crops for SigLIP2 encoding.
 
-    Each crop is resized to *size* for consistent SigLIP2 input.
+    When *global_only* is ``True`` (FAST mode), returns a single resized
+    thumbnail — 6× cheaper than the full multi-scale crop set.
     """
+    if global_only:
+        thumb = img.copy()
+        thumb.thumbnail(size, Image.LANCZOS)
+        return [thumb.convert("RGB")]
+
     w, h = img.size
     half_w, half_h = max(w // 2, 1), max(h // 2, 1)
     qw, qh = max(w // 4, 1), max(h // 4, 1)
@@ -285,11 +302,16 @@ class ProbabilisticScout:
         candidates: List[ImageCandidate],
         embed_dim: int,
         label: str = "",
+        global_only: bool = False,
     ) -> Dict[str, np.ndarray]:
-        """Load cached + compute new multi-scale embeddings for all candidates.
+        """Load cached + compute embeddings for candidates.
+
+        When *global_only* is ``True``, only the global thumbnail is
+        encoded (1 crop vs 6), yielding ``(1, embed_dim)`` matrices for
+        uncached images.  Cached multi-scale entries are returned as-is.
 
         Returns:
-            ``{path: np.ndarray(N_SCALES, embed_dim)}``
+            ``{path: np.ndarray(S, embed_dim)}`` where S is 1 or N_SCALES.
         """
         import torch
 
@@ -301,10 +323,12 @@ class ProbabilisticScout:
         else:
             cached_embeds, uncached_paths = {}, list(all_paths)
 
+        n_crops = 1 if global_only else _N_SCALES
         tag = f" ({label})" if label else ""
+        mode_tag = "global-only" if global_only else "multi-scale"
         print(
             f"    [SigLIPScout]{tag} Embeddings: {len(cached_embeds)} cached, "
-            f"{len(uncached_paths)} to compute"
+            f"{len(uncached_paths)} to compute ({mode_tag})"
         )
 
         if not uncached_paths:
@@ -315,12 +339,12 @@ class ProbabilisticScout:
         # Flatten all crops into one big list for efficient batching
         batch_crops: List[Image.Image] = []
         valid_paths: List[str] = []
-        crop_offsets: List[int] = []          # start index per image
+        crop_offsets: List[int] = []
 
         for p in uncached_paths:
             try:
                 img = Image.open(p)
-                crops = _generate_crops(img, _THUMB_SIZE)
+                crops = _generate_crops(img, _THUMB_SIZE, global_only=global_only)
                 crop_offsets.append(len(batch_crops))
                 batch_crops.extend(crops)
                 valid_paths.append(p)
@@ -358,14 +382,15 @@ class ProbabilisticScout:
 
         feat_matrix = np.concatenate(all_feats, axis=0)  # (total_crops, D)
 
-        # Reassemble per-image (N_SCALES, D) matrices
         for i, path in enumerate(valid_paths):
             offset = crop_offsets[i]
-            end = offset + _N_SCALES
+            end = offset + n_crops
             if end <= feat_matrix.shape[0]:
                 new_embeds[path] = feat_matrix[offset:end]
 
-        if new_embeds and self._cache is not None:
+        # Only persist full multi-scale embeddings (don't pollute cache
+        # with global-only entries that would fail shape validation).
+        if new_embeds and self._cache is not None and not global_only:
             self._cache.store(new_embeds)
             self._cache.flush()
 
@@ -394,6 +419,170 @@ class ProbabilisticScout:
                 feat = feat / feat.norm(dim=-1, keepdim=True)
             feats.append(feat.cpu().numpy()[0])
         return np.stack(feats)
+
+    # ------------------------------------------------------------------ #
+    # FAST: global-only encoding helper
+    # ------------------------------------------------------------------ #
+
+    def _encode_global_batch(
+        self,
+        paths: List[str],
+    ) -> Dict[str, np.ndarray]:
+        """Encode global thumbnails for a list of image paths.
+
+        Returns ``{path: np.ndarray(embed_dim,)}`` — one vector per image.
+        Used by :meth:`_batch_rank_fast` for uncached candidates.
+        """
+        import torch
+
+        imgs: List[Image.Image] = []
+        valid: List[str] = []
+        for p in paths:
+            try:
+                img = Image.open(p)
+                img.thumbnail(_THUMB_SIZE, Image.LANCZOS)
+                imgs.append(img.convert("RGB"))
+                valid.append(p)
+            except Exception:
+                continue
+
+        if not imgs:
+            return {}
+
+        result: Dict[str, np.ndarray] = {}
+        bs = self._batch_size
+        for bi in range(0, len(imgs), bs):
+            batch = imgs[bi: bi + bs]
+            batch_paths = valid[bi: bi + bs]
+            px = _processor(images=batch, return_tensors="pt")
+            with torch.no_grad():
+                raw = _model.get_image_features(
+                    pixel_values=px["pixel_values"].to(_device),
+                )
+                feat = _extract_features(raw)
+                feat = feat / feat.norm(dim=-1, keepdim=True)
+            feats = feat.cpu().numpy()
+            for j, p in enumerate(batch_paths):
+                result[p] = feats[j]
+        return result
+
+    # ------------------------------------------------------------------ #
+    # FAST: greedy ranking with early stopping
+    # ------------------------------------------------------------------ #
+
+    def _batch_rank_fast(
+        self,
+        candidates: List[ImageCandidate],
+        queries: List[str],
+        top_k: int = 9,
+    ) -> List[ScoredCandidate]:
+        """FAST greedy ranking: global-crop-only + batch-wise early stopping.
+
+        Candidates are assumed pre-sorted by ``grep_score`` (descending).
+        Processes them in chunks of ``_FAST_CHUNK_SIZE``; stops when
+        ``_FAST_PATIENCE`` consecutive chunks fail to improve the running
+        top-k, provided at least ``top_k * _FAST_MIN_EVAL_FACTOR``
+        candidates have been evaluated.
+        """
+        import torch
+
+        _ensure_model(self._model_id)
+        t0 = time.time()
+
+        text_matrix = self._encode_texts(queries)  # (Q, D)
+        embed_dim = text_matrix.shape[1]
+        print(
+            f"    [SigLIPScout] Encoded {len(queries)} query variant(s), "
+            f"dim={embed_dim}"
+        )
+
+        # Bulk cache lookup — extract global row from cached multi-scale
+        cached_global: Dict[str, np.ndarray] = {}
+        if self._cache is not None:
+            cached_ms, _ = self._cache.lookup(
+                [c.path for c in candidates], expected_dim=embed_dim,
+            )
+            cached_global = {p: ms[0] for p, ms in cached_ms.items()}
+
+        n_to_compute = len(candidates) - len(cached_global)
+        print(
+            f"    [SigLIPScout] (fast) {len(cached_global)} cached, "
+            f"{n_to_compute} to compute (global-only)"
+        )
+
+        top_scores: Dict[str, float] = {}
+        min_top = float("-inf")
+        stale = 0
+        total_encoded = 0
+        min_before_stop = min(
+            top_k * _FAST_MIN_EVAL_FACTOR, len(candidates),
+        )
+        processed = 0
+
+        for ci in range(0, len(candidates), _FAST_CHUNK_SIZE):
+            chunk = candidates[ci: ci + _FAST_CHUNK_SIZE]
+            improved = False
+
+            # Separate cached vs. uncached within this chunk
+            to_encode: List[str] = []
+            chunk_embeds: Dict[str, np.ndarray] = {}
+            for c in chunk:
+                g = cached_global.get(c.path)
+                if g is not None:
+                    chunk_embeds[c.path] = g
+                else:
+                    to_encode.append(c.path)
+
+            if to_encode:
+                new = self._encode_global_batch(to_encode)
+                chunk_embeds.update(new)
+                total_encoded += len(new)
+
+            # Score each candidate
+            for c in chunk:
+                emb = chunk_embeds.get(c.path)
+                if emb is None:
+                    continue
+                score = float((text_matrix @ emb).max())
+
+                if len(top_scores) < top_k:
+                    top_scores[c.path] = score
+                    improved = True
+                    if len(top_scores) >= top_k:
+                        min_top = min(top_scores.values())
+                elif score > min_top:
+                    worst = min(top_scores, key=top_scores.get)
+                    del top_scores[worst]
+                    top_scores[c.path] = score
+                    min_top = min(top_scores.values())
+                    improved = True
+
+            processed = ci + len(chunk)
+            stale = 0 if improved else stale + 1
+
+            if (
+                stale >= _FAST_PATIENCE
+                and len(top_scores) >= top_k
+                and processed >= min_before_stop
+            ):
+                print(
+                    f"    [SigLIPScout] Early stop at "
+                    f"{processed}/{len(candidates)} "
+                    f"(encoded {total_encoded} new)"
+                )
+                break
+
+        elapsed = time.time() - t0
+        scored = [
+            ScoredCandidate(path=p, score=s, round_scores=[s])
+            for p, s in top_scores.items()
+        ]
+        scored.sort(key=lambda x: x.score, reverse=True)
+        print(
+            f"    [SigLIPScout] Ranked {processed} images (fast) "
+            f"in {elapsed:.1f}s"
+        )
+        return scored
 
     # ------------------------------------------------------------------ #
     # Text-to-image ranking (multi-query × multi-scale)
@@ -450,6 +639,7 @@ class ProbabilisticScout:
         self,
         candidates: List[ImageCandidate],
         query_images: List[Image.Image],
+        fast: bool = False,
     ) -> List[ScoredCandidate]:
         """Rank by SigLIP2 image-to-image similarity (multi-scale on candidates)."""
         _ensure_model(self._model_id)
@@ -460,6 +650,7 @@ class ProbabilisticScout:
 
         all_embeds = self._get_candidate_multiscale(
             candidates, embed_dim, label="image-search",
+            global_only=fast,
         )
 
         scored: List[ScoredCandidate] = []
@@ -490,6 +681,7 @@ class ProbabilisticScout:
         text_queries: List[str],
         image_queries: List[Image.Image],
         text_weight: float = 0.5,
+        fast: bool = False,
     ) -> List[ScoredCandidate]:
         """Weighted combination of text and image SigLIP2 scores (multi-scale)."""
         _ensure_model(self._model_id)
@@ -501,6 +693,7 @@ class ProbabilisticScout:
 
         all_embeds = self._get_candidate_multiscale(
             candidates, embed_dim, label="hybrid",
+            global_only=fast,
         )
 
         img_w = 1.0 - text_weight
@@ -531,13 +724,19 @@ class ProbabilisticScout:
         query: str,
         top_k: int = 10,
         expanded_queries: Optional[List[str]] = None,
+        fast: bool = False,
     ) -> List[ScoredCandidate]:
-        """Rank candidates using multi-scale SigLIP2 scoring with query expansion.
+        """Rank candidates using SigLIP2 scoring with query expansion.
+
+        When *fast* is ``True``, uses global-crop-only encoding with
+        batch-wise early stopping — typically 6-10× faster than the
+        full multi-scale pipeline.
 
         Args:
             expanded_queries: Additional semantic variants of *query* for
                 max-pooled scoring.  If ``None``, only the primary query
                 is used.
+            fast: Use greedy ranking with early stopping (FAST mode).
 
         Returns:
             Up to *top_k* :class:`ScoredCandidate`, sorted by score desc.
@@ -549,14 +748,20 @@ class ProbabilisticScout:
         if expanded_queries:
             queries.extend(expanded_queries)
 
+        mode = "fast (global-only + early-stop)" if fast else "full (multi-scale)"
         print(
-            f"  [SigLIPScout] Multi-scale ranking: {len(candidates)} "
+            f"  [SigLIPScout] {mode} ranking: {len(candidates)} "
             f"candidates, {len(queries)} query variant(s) → top {top_k}"
         )
 
-        ranked = await asyncio.to_thread(
-            self._batch_rank, candidates, queries,
-        )
+        if fast:
+            ranked = await asyncio.to_thread(
+                self._batch_rank_fast, candidates, queries, top_k,
+            )
+        else:
+            ranked = await asyncio.to_thread(
+                self._batch_rank, candidates, queries,
+            )
 
         if not ranked:
             print("  [SigLIPScout] No candidates scored")
@@ -575,18 +780,20 @@ class ProbabilisticScout:
         candidates: List[ImageCandidate],
         query_images: List[Image.Image],
         top_k: int = 10,
+        fast: bool = False,
     ) -> List[ScoredCandidate]:
-        """Rank candidates by SigLIP2 image-to-image similarity (multi-scale)."""
+        """Rank candidates by SigLIP2 image-to-image similarity."""
         if not candidates:
             return []
 
+        mode = "fast" if fast else "full"
         print(
-            f"  [SigLIPScout] Image-to-image ranking: "
+            f"  [SigLIPScout] Image-to-image ranking ({mode}): "
             f"{len(candidates)} candidates → top {top_k}"
         )
 
         ranked = await asyncio.to_thread(
-            self._image_rank, candidates, query_images,
+            self._image_rank, candidates, query_images, fast,
         )
 
         if not ranked:
@@ -609,8 +816,9 @@ class ProbabilisticScout:
         top_k: int = 10,
         text_weight: float = 0.5,
         expanded_queries: Optional[List[str]] = None,
+        fast: bool = False,
     ) -> List[ScoredCandidate]:
-        """Rank by combined text + image SigLIP2 similarity (multi-scale)."""
+        """Rank by combined text + image SigLIP2 similarity."""
         if not candidates:
             return []
 
@@ -618,15 +826,17 @@ class ProbabilisticScout:
         if expanded_queries:
             text_queries.extend(expanded_queries)
 
+        mode = "fast" if fast else "full"
         print(
-            f"  [SigLIPScout] Hybrid ranking: {len(candidates)} candidates, "
+            f"  [SigLIPScout] Hybrid ranking ({mode}): "
+            f"{len(candidates)} candidates, "
             f"text={len(text_queries)} variants, "
             f"images={len(image_queries)} → top {top_k}"
         )
 
         ranked = await asyncio.to_thread(
             self._hybrid_rank,
-            candidates, text_queries, image_queries, text_weight,
+            candidates, text_queries, image_queries, text_weight, fast,
         )
 
         if not ranked:

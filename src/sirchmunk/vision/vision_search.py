@@ -280,6 +280,7 @@ class VisionSearch:
             input_type=input_type,
             pil_images=pil_images,
             source_paths=source_paths,
+            fast=fast,
         )
         t1_elapsed = time.time() - t1
         if not candidates:
@@ -303,6 +304,7 @@ class VisionSearch:
             input_type=input_type,
             pil_images=pil_images,
             top_k=min(self._scout_top_k, top_k) if fast else self._scout_top_k,
+            fast=fast,
         )
         t2_elapsed = time.time() - t2
         if not scored:
@@ -428,6 +430,7 @@ class VisionSearch:
         input_type: str,
         pil_images: Optional[List[Any]] = None,
         source_paths: Optional[List[str]] = None,
+        fast: bool = False,
     ) -> tuple:
         """Phase 1: Visual Grep — dispatch by input type.
 
@@ -452,6 +455,7 @@ class VisionSearch:
             query, paths,
             max_depth=self._max_scan_depth,
             weight_overrides=weight_overrides,
+            fast=fast,
         )
         clip_query = (
             constraint.clip_query
@@ -469,6 +473,7 @@ class VisionSearch:
         input_type: str,
         pil_images: Optional[List[Any]] = None,
         top_k: int = 9,
+        fast: bool = False,
     ) -> List[ScoredCandidate]:
         """Phase 2: SigLIP2 ranking — dispatch by input type."""
         print(
@@ -478,19 +483,17 @@ class VisionSearch:
 
         if input_type == "image":
             return await self._scout.scout_by_image(
-                candidates, pil_images, top_k=top_k,
+                candidates, pil_images, top_k=top_k, fast=fast,
             )
         if input_type == "hybrid":
             return await self._scout.scout_hybrid(
                 candidates, clip_query, pil_images,
-                top_k=top_k,
-                expanded_queries=expanded,
+                top_k=top_k, expanded_queries=expanded, fast=fast,
             )
         # text-only
         return await self._scout.scout(
             candidates, clip_query,
-            top_k=top_k,
-            expanded_queries=expanded,
+            top_k=top_k, expanded_queries=expanded, fast=fast,
         )
 
     async def _phase3_verify(
