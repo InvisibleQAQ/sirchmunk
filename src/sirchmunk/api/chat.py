@@ -3,6 +3,7 @@
 Unified API endpoints for chat and search functionality
 Provides WebSocket endpoint for real-time chat conversations with integrated search
 """
+import logging
 import platform
 import time
 
@@ -16,10 +17,55 @@ from datetime import datetime
 import random
 import os
 import threading
+
+import openai
+
 from sirchmunk.search import AgenticSearch
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.api.components.history_storage import HistoryStorage
 from sirchmunk.api.components.monitor_tracker import llm_usage_tracker
+
+logger = logging.getLogger(__name__)
+
+# Maximum number of full-pipeline retries for transient LLM errors in RAG
+# search.  Individual LLM calls already retry internally (see OpenAIChat);
+# this is a coarser-grained retry around the entire search pipeline.
+_RAG_PIPELINE_MAX_RETRIES = 1
+_RAG_PIPELINE_RETRY_DELAY = 2.0  # seconds
+
+
+def _is_transient_llm_error(exc: Exception) -> bool:
+    """Return True if *exc* is a transient LLM/network error worth retrying."""
+    return isinstance(exc, (
+        openai.APIConnectionError,
+        openai.APITimeoutError,
+        openai.InternalServerError,   # all 5xx
+        openai.RateLimitError,        # 429
+        openai.NotFoundError,         # 404 — transient on some providers
+        ConnectionError,
+        TimeoutError,
+    ))
+
+
+def _classify_error(exc: Exception) -> str:
+    """Return a human-readable error class for user-facing messages."""
+    if isinstance(exc, openai.AuthenticationError):
+        return "LLM authentication failed — check LLM_API_KEY"
+    if isinstance(exc, openai.PermissionDeniedError):
+        return "LLM permission denied — check API key permissions"
+    if isinstance(exc, openai.BadRequestError):
+        return "LLM rejected the request — check LLM_MODEL_NAME"
+    if isinstance(exc, openai.NotFoundError):
+        return "LLM endpoint returned 404 — check LLM_BASE_URL and LLM_MODEL_NAME"
+    if isinstance(exc, openai.RateLimitError):
+        return "LLM rate limit exceeded — wait and retry"
+    if isinstance(exc, openai.InternalServerError):
+        return "LLM server error (5xx) — provider-side issue"
+    if isinstance(exc, (openai.APIConnectionError, openai.APITimeoutError)):
+        return "LLM connection/timeout error — check network"
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return "Network error — check connectivity"
+    return str(exc)
 
 
 # Try to import tkinter for file dialogs
@@ -558,6 +604,24 @@ async def _chat_only(
         raise
 
 
+async def _run_rag_search(
+    message: str,
+    paths: List[str],
+    search_mode: str,
+    search_log_callback,
+) -> tuple[str, list]:
+    """Execute a single RAG search attempt. Returns (result_text, llm_usages)."""
+    search_engine = get_search_instance(log_callback=search_log_callback)
+
+    result = await search_engine.search(
+        query=message,
+        paths=paths,
+        mode=search_mode,
+        top_k_files=3,
+    )
+    return result, list(search_engine.llm_usages)
+
+
 async def _chat_rag(
     message: str,
     kb_name: str,
@@ -567,7 +631,11 @@ async def _chat_rag(
 ) -> tuple[str, Dict[str, Any]]:
     """
     Mode 2: Chat + RAG (enable_rag=True, enable_web_search=False)
-    LLM chat with knowledge base retrieval
+    LLM chat with knowledge base retrieval.
+
+    Transient LLM errors (404, 5xx, timeouts) trigger a pipeline-level
+    retry before falling back to pure chat mode.  Permanent errors
+    (auth, bad request) skip the retry and fall back immediately.
     """
     sources = {}
     if not kb_name:
@@ -577,69 +645,76 @@ async def _chat_rag(
         }), websocket)
         response = "Please specify search paths for RAG search."
         return response, sources
-    
-    try:
-        # Create log callback for streaming search logs
-        search_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
 
-        # Create search instance with log callback
-        search_engine = get_search_instance(log_callback=search_log_callback)
+    paths = [path.strip() for path in kb_name.split(",")]
+    last_error: Optional[Exception] = None
 
-        paths = [path.strip() for path in kb_name.split(",")]
-        await search_log_callback("info", f"📂 Parsed search paths: {paths}", "\n", False)
+    for attempt in range(_RAG_PIPELINE_MAX_RETRIES + 1):
+        try:
+            search_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
+            await search_log_callback("info", f"📂 Parsed search paths: {paths}", "\n", False)
 
-        # Execute RAG search
-        print(f"[MODE 2] RAG search with query: {message}, paths: {paths}")
-        
-        search_result = await search_engine.search(
-            query=message,
-            paths=paths,
-            mode=search_mode,
-            top_k_files=3,
-        )
+            logger.info("[MODE 2] RAG search with query: %s, paths: %s", message, paths)
 
-        # Calculate the llm usage
-        for usage in search_engine.llm_usages:
-            llm_usage_tracker.record_usage(
-                model=search_engine.llm._model,
-                usage=usage,
+            search_result, llm_usages = await _run_rag_search(
+                message, paths, search_mode, search_log_callback,
             )
 
-        # Send search completion
-        await manager.send_personal_message(json.dumps({
-            "type": "search_complete",
-            "message": "✅ Knowledge base search completed"
-        }), websocket)
-        
-        # Use search result as response
-        response = search_result
-        
-        # Add RAG sources
-        sources["rag"] = [
-            {
+            search_engine = get_search_instance()
+            for usage in llm_usages:
+                llm_usage_tracker.record_usage(
+                    model=search_engine.llm._model,
+                    usage=usage,
+                )
+
+            await manager.send_personal_message(json.dumps({
+                "type": "search_complete",
+                "message": "✅ Knowledge base search completed"
+            }), websocket)
+
+            sources["rag"] = [{
                 "kb_name": kb_name,
                 "content": f"Retrieved content from {kb_name}",
-                "relevance_score": 0.92
-            }
-        ]
-        
-    except Exception as e:
-        # Send search error
-        await manager.send_personal_message(json.dumps({
-            "type": "search_error",
-            "message": f"❌ RAG search failed: {str(e)}"
-        }), websocket)
-        
-        # Fallback to chat only
-        await manager.send_personal_message(json.dumps({
-            "type": "status",
-            "stage": "fallback",
-            "message": "⚠️ RAG mode did not find relevant results, falling back to pure chat mode..."
-        }), websocket)
-        
-        print(f"[MODE 2] RAG search failed, falling back to chat only: {str(e)}")
-        response, sources = await _chat_only(message, websocket, manager)
-    
+                "relevance_score": 0.92,
+            }]
+            return search_result, sources
+
+        except Exception as e:
+            last_error = e
+            friendly = _classify_error(e)
+
+            if _is_transient_llm_error(e) and attempt < _RAG_PIPELINE_MAX_RETRIES:
+                logger.warning(
+                    "[MODE 2] Transient error on attempt %d/%d (%s), retrying in %.1fs",
+                    attempt + 1, _RAG_PIPELINE_MAX_RETRIES + 1, friendly,
+                    _RAG_PIPELINE_RETRY_DELAY,
+                )
+                await manager.send_personal_message(json.dumps({
+                    "type": "status",
+                    "stage": "retrying",
+                    "message": f"⚠️ {friendly}, retrying..."
+                }), websocket)
+                await asyncio.sleep(_RAG_PIPELINE_RETRY_DELAY)
+                continue
+
+            # Permanent error or final retry exhausted — report and fall back
+            logger.error("[MODE 2] RAG search failed: %s (%s)", friendly, e)
+
+            await manager.send_personal_message(json.dumps({
+                "type": "search_error",
+                "message": f"❌ RAG search failed: {friendly}"
+            }), websocket)
+            await manager.send_personal_message(json.dumps({
+                "type": "status",
+                "stage": "fallback",
+                "message": "⚠️ Falling back to pure chat mode..."
+            }), websocket)
+
+            response, sources = await _chat_only(message, websocket, manager)
+            return response, sources
+
+    # Should not be reached, but handle defensively
+    response, sources = await _chat_only(message, websocket, manager)
     return response, sources
 
 
@@ -734,49 +809,64 @@ async def _chat_rag_web_search(
         response = "Please specify search paths for RAG search."
         return response, sources
 
-    # Step 1: Perform RAG search
-    try:
-        search_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
+    # Step 1: Perform RAG search (with pipeline-level retry for transient errors)
+    paths = [path.strip() for path in kb_name.split(",")]
+    rag_result = None
 
-        search_engine = get_search_instance(log_callback=search_log_callback)
-        paths = [path.strip() for path in kb_name.split(",")]
-        await search_log_callback("info", f"📂 RAG search paths: {paths}", "\n", False)
+    for attempt in range(_RAG_PIPELINE_MAX_RETRIES + 1):
+        try:
+            search_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
+            await search_log_callback("info", f"📂 RAG search paths: {paths}", "\n", False)
 
-        print(f"[MODE 4] RAG search with query: {message}, paths: {paths}")
-        
-        rag_result = await search_engine.search(
-            query=message,
-            paths=paths,
-            mode=search_mode,
-            top_k_files=3,
-        )
+            logger.info("[MODE 4] RAG search with query: %s, paths: %s", message, paths)
 
-        for rag_usage in search_engine.llm_usages:
-            llm_usage_tracker.record_usage(
-                model=search_engine.llm._model,
-                usage=rag_usage,
+            rag_result, llm_usages = await _run_rag_search(
+                message, paths, search_mode, search_log_callback,
             )
-        
-        await manager.send_personal_message(json.dumps({
-            "type": "search_complete",
-            "message": "✅ Knowledge base search completed"
-        }), websocket)
-        
-        sources["rag"] = [
-            {
+
+            search_engine = get_search_instance()
+            for usage in llm_usages:
+                llm_usage_tracker.record_usage(
+                    model=search_engine.llm._model,
+                    usage=usage,
+                )
+
+            await manager.send_personal_message(json.dumps({
+                "type": "search_complete",
+                "message": "✅ Knowledge base search completed"
+            }), websocket)
+
+            sources["rag"] = [{
                 "kb_name": kb_name,
                 "content": f"Retrieved from {kb_name}",
-                "relevance_score": 0.92
-            }
-        ]
-        
-    except Exception as e:
-        await manager.send_personal_message(json.dumps({
-            "type": "search_error",
-            "message": f"⚠️ RAG search failed: {str(e)}, continuing with web search..."
-        }), websocket)
-        rag_result = f"[RAG search unavailable: {str(e)}]"
-        sources["rag"] = [{"error": str(e)}]
+                "relevance_score": 0.92,
+            }]
+            break  # success
+
+        except Exception as e:
+            friendly = _classify_error(e)
+
+            if _is_transient_llm_error(e) and attempt < _RAG_PIPELINE_MAX_RETRIES:
+                logger.warning(
+                    "[MODE 4] Transient RAG error on attempt %d/%d (%s), retrying",
+                    attempt + 1, _RAG_PIPELINE_MAX_RETRIES + 1, friendly,
+                )
+                await manager.send_personal_message(json.dumps({
+                    "type": "status",
+                    "stage": "retrying",
+                    "message": f"⚠️ {friendly}, retrying..."
+                }), websocket)
+                await asyncio.sleep(_RAG_PIPELINE_RETRY_DELAY)
+                continue
+
+            logger.error("[MODE 4] RAG search failed: %s (%s)", friendly, e)
+            await manager.send_personal_message(json.dumps({
+                "type": "search_error",
+                "message": f"⚠️ RAG search failed: {friendly}, continuing with web search..."
+            }), websocket)
+            rag_result = f"[RAG search unavailable: {friendly}]"
+            sources["rag"] = [{"error": friendly}]
+            break
     
     # Step 2: Perform web search
     await manager.send_personal_message(json.dumps({

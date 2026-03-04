@@ -1,12 +1,37 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+import asyncio
+import logging
+import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import openai
 from openai import AsyncOpenAI, OpenAI
-from sirchmunk.utils import create_logger, LogCallback
+
+from sirchmunk.utils import LogCallback, create_logger
 
 if TYPE_CHECKING:
     pass
+
+logger = logging.getLogger(__name__)
+
+# Transient error types that warrant automatic retry.
+# - APIConnectionError / APITimeoutError: network-level failures.
+# - InternalServerError: covers all 5xx (500, 502, 503, 504).
+# - RateLimitError (429): provider throttling.
+# - NotFoundError (404): many third-party OpenAI-compatible providers
+#   return 404 during transient routing / load-balancer hiccups.
+_RETRYABLE_ERRORS = (
+    openai.APIConnectionError,
+    openai.APITimeoutError,
+    openai.InternalServerError,   # all 5xx
+    openai.RateLimitError,        # 429
+    openai.NotFoundError,         # 404 — transient on some providers
+)
+
+_DEFAULT_MAX_RETRIES = 3
+_DEFAULT_BASE_DELAY = 1.0   # seconds
+_DEFAULT_MAX_DELAY = 10.0   # seconds
 
 
 @dataclass
@@ -52,6 +77,9 @@ class OpenAIChat:
             base_url: str = None,
             model: str = None,
             log_callback: LogCallback = None,
+            max_retries: int = _DEFAULT_MAX_RETRIES,
+            retry_base_delay: float = _DEFAULT_BASE_DELAY,
+            retry_max_delay: float = _DEFAULT_MAX_DELAY,
             **kwargs,
     ):
         """
@@ -62,6 +90,9 @@ class OpenAIChat:
             base_url (str): The base URL for the OpenAI API.
             model (str): The model to use for chat completions.
             log_callback (LogCallback): Optional callback for logging.
+            max_retries: Maximum number of retries for transient API errors.
+            retry_base_delay: Initial backoff delay in seconds (doubled each retry).
+            retry_max_delay: Upper bound on backoff delay in seconds.
             **kwargs: Additional keyword arguments passed to the OpenAI client create method.
         """
         self._client = OpenAI(
@@ -76,8 +107,10 @@ class OpenAIChat:
 
         self._model = model
         self._kwargs = kwargs
+        self._max_retries = max_retries
+        self._retry_base_delay = retry_base_delay
+        self._retry_max_delay = retry_max_delay
 
-        # Initialize synchronous and asynchronous loggers
         self._logger = create_logger(log_callback=log_callback, enable_async=False)
         self._logger_async = create_logger(log_callback=log_callback, enable_async=True)
 
@@ -108,6 +141,17 @@ class OpenAIChat:
 
         return request_kwargs
 
+    def _backoff_delay(self, attempt: int) -> float:
+        """Compute exponential backoff with jitter for retry *attempt* (0-based)."""
+        import random
+        delay = min(self._retry_base_delay * (2 ** attempt), self._retry_max_delay)
+        return delay * (0.5 + random.random() * 0.5)
+
+    @staticmethod
+    def _is_retryable(exc: Exception) -> bool:
+        """Return True if *exc* is a transient error worth retrying."""
+        return isinstance(exc, _RETRYABLE_ERRORS)
+
     def chat(
             self,
             messages: List[Dict[str, Any]],
@@ -117,6 +161,10 @@ class OpenAIChat:
     ) -> OpenAIChatResponse:
         """
         Generate a chat completion synchronously.
+
+        Automatically retries on transient API errors (404 from provider
+        routing hiccups, 429 rate-limits, 5xx server errors, and connection
+        failures) with exponential backoff.
 
         Args:
             messages (List[Dict[str, Any]]): A list of messages for the chat.
@@ -130,7 +178,32 @@ class OpenAIChat:
             OpenAIChatResponse: The structured response containing content, usage, etc.
         """
         request_kwargs = self._build_request_kwargs(stream, enable_thinking, **kwargs)
+        last_exc: Optional[Exception] = None
 
+        for attempt in range(self._max_retries + 1):
+            try:
+                return self._do_chat(messages, stream, request_kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if not self._is_retryable(exc) or attempt >= self._max_retries:
+                    raise
+                delay = self._backoff_delay(attempt)
+                logger.warning(
+                    "[LLM] chat() attempt %d/%d failed (%s: %s), retrying in %.1fs",
+                    attempt + 1, self._max_retries + 1,
+                    type(exc).__name__, exc, delay,
+                )
+                time.sleep(delay)
+
+        raise last_exc  # unreachable, but keeps type checkers happy
+
+    def _do_chat(
+            self,
+            messages: List[Dict[str, Any]],
+            stream: bool,
+            request_kwargs: Dict[str, Any],
+    ) -> OpenAIChatResponse:
+        """Single-attempt synchronous chat completion (no retry)."""
         resp = self._client.chat.completions.create(
             model=self._model, messages=messages, stream=stream, **request_kwargs
         )
@@ -143,11 +216,9 @@ class OpenAIChat:
 
         if stream:
             for chunk in resp:
-                # Extract usage if present (usually in the last chunk if stream_options is set)
                 if chunk.usage:
                     usage = chunk.usage.model_dump()
 
-                # Update model name if provided in chunks
                 if chunk.model:
                     response_model = chunk.model
 
@@ -156,25 +227,20 @@ class OpenAIChat:
 
                 delta = chunk.choices[0].delta
 
-                # Capture role (usually only in the first chunk)
                 if delta.role:
                     role = delta.role
                     self._logger.info(f"[role={delta.role}] ", end="", flush=True)
 
-                # Capture content
                 if delta.content:
                     self._logger.info(delta.content, end="", flush=True)
                     res_content += delta.content
 
-                # Capture finish reason
                 if chunk.choices[0].finish_reason:
                     finish_reason = chunk.choices[0].finish_reason
 
-            # Print a newline at the end of streaming for cleaner logs
             self._logger.info("", end="\n", flush=True)
 
         else:
-            # Non-streaming response
             message = resp.choices[0].message
             res_content = message.content or ""
             role = message.role
@@ -183,7 +249,6 @@ class OpenAIChat:
             if resp.usage:
                 usage = resp.usage.model_dump()
 
-            # Log the full response content since we didn't stream it
             self._logger.info(f"[role={role}] {res_content}")
 
         return OpenAIChatResponse(
@@ -204,6 +269,9 @@ class OpenAIChat:
         """
         Generate a chat completion asynchronously.
 
+        Automatically retries on transient API errors with exponential
+        backoff (same policy as :meth:`chat`).
+
         Args:
             messages (List[Dict[str, Any]]): A list of messages for the chat.
             stream (bool): Whether to stream the response.
@@ -216,7 +284,32 @@ class OpenAIChat:
             OpenAIChatResponse: The structured response containing content, usage, etc.
         """
         request_kwargs = self._build_request_kwargs(stream, enable_thinking, **kwargs)
+        last_exc: Optional[Exception] = None
 
+        for attempt in range(self._max_retries + 1):
+            try:
+                return await self._do_achat(messages, stream, request_kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if not self._is_retryable(exc) or attempt >= self._max_retries:
+                    raise
+                delay = self._backoff_delay(attempt)
+                logger.warning(
+                    "[LLM] achat() attempt %d/%d failed (%s: %s), retrying in %.1fs",
+                    attempt + 1, self._max_retries + 1,
+                    type(exc).__name__, exc, delay,
+                )
+                await asyncio.sleep(delay)
+
+        raise last_exc  # unreachable, but keeps type checkers happy
+
+    async def _do_achat(
+            self,
+            messages: List[Dict[str, Any]],
+            stream: bool,
+            request_kwargs: Dict[str, Any],
+    ) -> OpenAIChatResponse:
+        """Single-attempt asynchronous chat completion (no retry)."""
         resp = await self._async_client.chat.completions.create(
             model=self._model, messages=messages, stream=stream, **request_kwargs
         )
@@ -229,7 +322,6 @@ class OpenAIChat:
 
         if stream:
             async for chunk in resp:
-                # Extract usage if present (usually in the last chunk if stream_options is set)
                 if chunk.usage:
                     usage = chunk.usage.model_dump()
 
@@ -241,25 +333,20 @@ class OpenAIChat:
 
                 delta = chunk.choices[0].delta
 
-                # Capture role
                 if delta.role:
                     role = delta.role
                     await self._logger_async.info(f"[role={delta.role}] ", end="", flush=True)
 
-                # Capture content
                 if delta.content:
                     await self._logger_async.info(delta.content, end="", flush=True)
                     res_content += delta.content
 
-                # Capture finish reason
                 if chunk.choices[0].finish_reason:
                     finish_reason = chunk.choices[0].finish_reason
 
-            # Print a newline at the end of streaming for cleaner logs
             await self._logger_async.info("", end="\n", flush=True)
 
         else:
-            # Non-streaming response
             message = resp.choices[0].message
             res_content = message.content or ""
             role = message.role
@@ -268,7 +355,6 @@ class OpenAIChat:
             if resp.usage:
                 usage = resp.usage.model_dump()
 
-            # Log the full response content since we didn't stream it
             await self._logger_async.info(f"[role={role}] {res_content}")
 
         return OpenAIChatResponse(
