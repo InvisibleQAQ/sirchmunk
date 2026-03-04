@@ -1,0 +1,13 @@
+# Sirchmunk Vision — image search dependencies
+# (packages already in core.txt are omitted: pillow, numpy, duckdb, modelscope)
+
+# Layer 1: Visual Grep (image fingerprinting)
+imagehash>=4.3.1
+opencv-python-headless>=4.8.0
+
+# Layer 2: SigLIP2 semantic ranking (multi-scale + query expansion)
+torch>=2.0.0
+transformers>=4.45.0
+
+# VLM client (OpenAI-compatible multimodal HTTP)
+httpx>=0.24.0

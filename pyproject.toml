@@ -56,11 +56,13 @@ dependencies = {file = ["requirements/core.txt"]}
 [tool.setuptools.dynamic.optional-dependencies]
 mcp = {file = ["requirements/mcp.txt"]}
 web = {file = ["requirements/web.txt"]}
+vision = {file = ["requirements/vision.txt"]}
 docs = {file = ["requirements/docs.txt"]}
 tests = {file = ["requirements/tests.txt"]}
 all = {file = [
   "requirements/mcp.txt",
   "requirements/web.txt",
+  "requirements/vision.txt",
   "requirements/docs.txt",
   "requirements/tests.txt",
 ]}

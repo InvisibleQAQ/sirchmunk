@@ -18,4 +18,16 @@ def __getattr__(name):
     if name == "SearchContext":
         from .schema.search_context import SearchContext
         return SearchContext
+    if name == "VisionSearch":
+        from .vision.vision_search import VisionSearch
+        return VisionSearch
+    if name == "VisionSearchResult":
+        from .vision.vision_search import VisionSearchResult
+        return VisionSearchResult
+    if name == "VLMClient":
+        from .llm.vlm_chat import VLMClient
+        return VLMClient
+    if name == "AgentMemory":
+        from .memory.agent_memory import AgentMemory
+        return AgentMemory
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

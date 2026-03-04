@@ -32,6 +32,7 @@ from sirchmunk.utils.install_rga import install_rga
 from sirchmunk.utils.utils import (
     KeywordValidation,
     extract_fields,
+    parse_llm_json,
 )
 
 
@@ -45,9 +46,12 @@ class AgenticSearch(BaseSearch):
         verbose: bool = True,
         log_callback: LogCallback = None,
         reuse_knowledge: bool = True,
+        vlm: Optional[Any] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
+
+        self._vlm = vlm
 
         # Normalise and store default search paths
         if paths is not None:
@@ -143,6 +147,18 @@ class AgenticSearch(BaseSearch):
         self.spec_path: Path = self.work_path / ".cache" / "spec"
         self.spec_path.mkdir(parents=True, exist_ok=True)
         self._spec_lock = asyncio.Lock()  # guards concurrent spec writes
+
+        # ---- Agent memory (shared with vision pipeline) ----
+        self._agent_memory = None
+        try:
+            from sirchmunk.memory.agent_memory import AgentMemory
+            mem_path = str(self.work_path / ".cache" / "agent_memory.duckdb")
+            self._agent_memory = AgentMemory(db_path=mem_path)
+        except Exception:
+            pass
+
+        # ---- Vision search (lazy-initialised on first VISION-mode call) ----
+        self._vision_search = None
     
     def update_log_callback(self, log_callback: LogCallback = None) -> None:
         """Replace the per-request log callback on all sub-components.
@@ -370,6 +386,40 @@ class AgenticSearch(BaseSearch):
         except Exception as e:
             await self._logger.warning(f"Parquet force_sync failed: {e}")
     
+    def _record_search_episode(
+        self,
+        query: str,
+        query_type: str,
+        paths: List[str],
+        hit_paths: Optional[List[str]] = None,
+        timings: Optional[Dict[str, float]] = None,
+        phase_stats: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record a search episode to the shared agent memory.
+
+        Silently no-ops when ``AgentMemory`` is unavailable (e.g. vision
+        extras not installed).
+        """
+        if self._agent_memory is None:
+            return
+        try:
+            import uuid
+            from sirchmunk.memory.agent_memory import SearchEpisode
+            ep = SearchEpisode(
+                episode_id=str(uuid.uuid4())[:12],
+                query=query,
+                query_type=query_type,
+                paths=paths,
+                top_k=0,
+                result_count=len(hit_paths or []),
+                hit_paths=hit_paths or [],
+                timings=timings or {},
+                phase_stats=phase_stats or {},
+            )
+            self._agent_memory.record_episode(ep)
+        except Exception:
+            pass
+
     @staticmethod
     def _make_answer_cluster(
         query: str, answer: str, prefix: str = "FS",
@@ -486,8 +536,8 @@ class AgenticSearch(BaseSearch):
         # Extract SUMMARY content
         summary_fields = extract_fields(content=llm_response, tags=["SUMMARY", "SHOULD_SAVE"])
         
-        summary = summary_fields.get("summary", "").strip()
-        should_save_str = summary_fields.get("should_save", "true").strip().lower()
+        summary = (summary_fields.get("summary") or "").strip()
+        should_save_str = (summary_fields.get("should_save") or "true").strip().lower()
         
         # Parse should_save flag
         should_save = should_save_str in ["true", "yes", "1"]
@@ -633,27 +683,134 @@ class AgenticSearch(BaseSearch):
         return registry
 
     # ------------------------------------------------------------------
+    # Vision search (lazy initialisation)
+    # ------------------------------------------------------------------
+
+    def _ensure_vision_search(self):
+        """Build the VisionSearch orchestrator on first use.
+
+        Heavy dependencies (torch, transformers, SigLIP2) are imported and
+        loaded only when VISION mode is actually requested, keeping FAST /
+        DEEP searches lightweight.
+
+        Returns:
+            Ready-to-use ``VisionSearch`` instance.
+        """
+        if self._vision_search is not None:
+            return self._vision_search
+
+        from sirchmunk.vision.vision_search import VisionSearch
+        from sirchmunk.llm.vlm_chat import VLMClient
+
+        vlm = self._vlm
+        if vlm is None:
+            base_url = os.getenv("VLM_BASE_URL", "")
+            api_key = os.getenv("VLM_API_KEY", os.getenv("LLM_API_KEY", ""))
+            if self.llm is not None:
+                if not base_url:
+                    try:
+                        base_url = str(self.llm._client.base_url)
+                    except AttributeError:
+                        base_url = ""
+                if not api_key:
+                    try:
+                        api_key = self.llm._client.api_key
+                    except AttributeError:
+                        pass
+            vlm = VLMClient(
+                base_url=base_url,
+                api_key=api_key,
+                model=os.getenv("VLM_MODEL", "qwen3.5-plus"),
+            )
+
+        vision_work = str(self.work_path / ".cache" / "vision")
+        self._vision_search = VisionSearch(
+            vlm=vlm,
+            work_path=vision_work,
+        )
+        _loguru_logger.info(
+            f"VisionSearch initialised (work_path={vision_work})"
+        )
+        return self._vision_search
+
+    async def _try_vision_dispatch(
+        self,
+        query: str,
+        paths: list,
+        mode: str = "FAST",
+    ) -> Optional[list]:
+        """Check whether *query* has vision intent and dispatch if so.
+
+        Uses the same LLM call as FAST keyword extraction (the
+        ``modality`` field).  Returns ``None`` when the query is
+        text-oriented so the caller can continue with the text pipeline.
+        Returns a list of ``VisionSearchResult`` when vision intent is
+        detected and the pipeline succeeds.  Falls back to ``None`` on
+        any vision pipeline error.
+        """
+        prompt = FAST_QUERY_ANALYSIS.format(user_input=query)
+        resp = await self.llm.achat(
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+        )
+        self.llm_usages.append(resp.usage)
+        analysis = self._parse_fast_json(resp.content)
+        modality = analysis.get("modality", "text").lower()
+
+        if modality != "vision":
+            return None
+
+        await self._logger.info(
+            f"[search] Vision intent detected — routing to vision pipeline ({mode})"
+        )
+        try:
+            vs = self._ensure_vision_search()
+            return await vs.search(
+                query=query,
+                paths=[str(p) for p in paths],
+                top_k=10,
+                mode=mode,
+            )
+        except Exception as e:
+            await self._logger.warning(
+                f"[search] Vision pipeline failed ({e}), continuing with text"
+            )
+            return None
+
+    # ------------------------------------------------------------------
     # Unified search entry point
     # ------------------------------------------------------------------
 
     async def search(
         self,
-        query: str,
+        query: str = "",
         paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
         *,
         mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = "FAST",
+        query_images: Optional[List[Any]] = None,
         max_loops: int = 10,
         max_token_budget: int = 64000,
-        max_depth: Optional[int] = 5,
+        max_depth: Optional[int] = 10,
         top_k_files: int = 3,
+        top_k: int = 10,
         enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         return_context: bool = False,
         return_cluster: bool = False,
         spec_stale_hours: float = 72.0,
-    ) -> Union[str, Tuple[str, SearchContext], List[Dict[str, Any]], KnowledgeCluster]:
+    ) -> Union[str, Tuple[str, "SearchContext"], List[Dict[str, Any]], "KnowledgeCluster", List[Any]]:
         """Perform intelligent search with multi-mode support.
+
+        Vision intent is **auto-detected** during query analysis — if the
+        LLM determines the user is looking for images, the query is
+        transparently routed to the vision pipeline.  When ``query_images``
+        is provided, vision mode is forced.  The vision pipeline inherits
+        the current ``mode`` (FAST or DEEP):
+
+        - **FAST vision**: Visual Grep → SigLIP2 → return (no VLM call).
+        - **DEEP vision**: Visual Grep → SigLIP2 → VLM verification →
+          feedback loop.
 
         Modes:
             +--------------+-------------------+-------------------------------------------+
@@ -662,83 +819,54 @@ class AgenticSearch(BaseSearch):
             | FILENAME_ONLY| Very Fast / 0     | Pattern-based file discovery, no LLM.     |
             | FAST         | 1-5s / 0-2        | Greedy: cluster reuse or keyword search    |
             |              |                   | → best file → answer. Early termination.  |
+            |              |                   | Auto-detects vision intent.               |
             | DEEP         | 5-30s / 4-6       | Parallel multi-path retrieval + ReAct     |
             |              |                   | refinement with Monte-Carlo evidence.     |
+            |              |                   | Auto-detects vision intent.               |
             +--------------+-------------------+-------------------------------------------+
-
-        FAST architecture (greedy early-termination):
-
-        ┌──────────────────────────────────────────────────────────┐
-        │ Step 0  Cluster reuse check (instant short-circuit)       │
-        ├──────────────────────────────────────────────────────────┤
-        │ Step 1  LLM query analysis → keywords + file hints       │
-        │         (single call, stream=False)                      │
-        ├──────────────────────────────────────────────────────────┤
-        │ Step 2  rga keyword search → ranked file hits + snippets │
-        │         (no LLM, greedy: take first good results)        │
-        ├──────────────────────────────────────────────────────────┤
-        │ Step 3  Read top file(s) content                         │
-        │         (no LLM, early termination at top_k_files)       │
-        ├──────────────────────────────────────────────────────────┤
-        │ Step 4  LLM answer synthesis from evidence               │
-        └──────────────────────────────────────────────────────────┘
-
-        DEEP architecture (phases execute as parallel as possible):
-
-        ┌──────────────────────────────────────────────────────────┐
-        │ Phase 0a Direct document analysis (intent-gated,         │
-        │          short-circuit if query is doc-level operation)   │
-        ├──────────────────────────────────────────────────────────┤
-        │ Phase 0  Cluster reuse check (instant, short-circuit)    │
-        ├──────────────────────────────────────────────────────────┤
-        │ Phase 1  Parallel probing (all concurrent):              │
-        │  ├─ LLM keyword extraction                               │
-        │  ├─ DirectoryScanner.scan() (filesystem only, fast)      │
-        │  ├─ Knowledge cache similarity search                    │
-        │  └─ Spec-path cache load                                 │
-        ├──────────────────────────────────────────────────────────┤
-        │ Phase 2  Parallel retrieval (depends on Phase 1):        │
-        │  ├─ keyword_search per extracted keyword (concurrent rga)│
-        │  └─ DirectoryScanner.rank() (LLM ranks candidates)      │
-        ├──────────────────────────────────────────────────────────┤
-        │ Phase 3  Merge + evidence assembly:                      │
-        │  └─ knowledge_base.build() (parallel per-file Monte      │
-        │     Carlo evidence sampling)                             │
-        ├──────────────────────────────────────────────────────────┤
-        │ Phase 4  Summary / ReAct refinement:                     │
-        │  └─ If evidence sufficient → LLM summary                 │
-        │     Else → ReAct loop for adaptive follow-up             │
-        ├──────────────────────────────────────────────────────────┤
-        │ Phase 5  Persistence (concurrent, awaited):                │
-        │  ├─ Save cluster + embeddings                            │
-        │  └─ Save spec-path cache                                 │
-        └──────────────────────────────────────────────────────────┘
 
         Args:
             query: User's search query.
             paths: Directories / files to search.  Falls back to
                 ``self.paths`` or the current working directory.
-            mode: Search mode — ``"DEEP"``, ``"FAST"``, or ``"FILENAME_ONLY"``.
+            mode: Search mode — ``"DEEP"``, ``"FAST"``, or
+                ``"FILENAME_ONLY"``.
             max_loops: Maximum ReAct iterations (DEEP mode, default: 10).
             max_token_budget: LLM token budget (DEEP mode, default: 64000).
             max_depth: Maximum directory depth for file search (default: 5).
-                Used in both FILENAME_ONLY and DEEP modes.
             top_k_files: Max files for evidence extraction (default: 3).
+            top_k: Max results for vision search (default: 10).
             enable_dir_scan: Enable directory scanning tool (DEEP mode).
-            include: File glob patterns to include (e.g. ``["*.py", "*.md"]``).
-                Used in both FILENAME_ONLY and DEEP modes.
-            exclude: File glob patterns to exclude (e.g. ``["*.log"]``).
-                Used in both FILENAME_ONLY and DEEP modes.
+            include: File glob patterns to include.
+            exclude: File glob patterns to exclude.
             return_context: If True, return ``(answer, SearchContext)`` tuple.
             return_cluster: If True, return the full KnowledgeCluster.
             spec_stale_hours: Hours before spec cache is stale (default: 72).
+            query_images: Reference images for vision similarity or
+                hybrid search.  Each element can be a file path ``str``,
+                base64 data URI ``str``, raw ``bytes``, or a
+                ``PIL.Image.Image`` object.  When provided, forces vision
+                mode.
 
         Returns:
-            - ``str``: Answer summary (default).
-            - ``(str, SearchContext)``: If *return_context*.
-            - ``KnowledgeCluster``: If *return_cluster*.
-            - ``List[Dict]``: File matches in FILENAME_ONLY mode.
+            - ``str``: Answer summary (default for FAST/DEEP text search).
+            - ``(str, SearchContext)``: If *return_context* (text search).
+            - ``KnowledgeCluster``: If *return_cluster* (text search).
+            - ``List[Dict]``: File matches (FILENAME_ONLY).
+            - ``List[VisionSearchResult]``: Image results (vision).
         """
+        # Force vision mode when query_images are provided
+        if query_images:
+            paths = self._resolve_paths(paths)
+            vs = self._ensure_vision_search()
+            return await vs.search(
+                query=query or "",
+                paths=[str(p) for p in paths],
+                top_k=top_k,
+                query_images=query_images,
+                mode=mode,
+            )
+
         paths = self._resolve_paths(paths)
 
         # ---- FILENAME_ONLY: pattern-based file discovery, no LLM ----
@@ -754,12 +882,15 @@ class AgenticSearch(BaseSearch):
             await self._logger.success(f"Retrieved {len(results)} matching files")
             return results
 
-        # ---- FAST / DEEP → both produce (answer, optional cluster) ----
+        # ---- FAST / DEEP → intent analysis determines text vs vision ----
         if mode == "FAST":
             answer = await self._search_fast(
                 query=query, paths=paths, max_depth=max_depth,
-                top_k_files=top_k_files, include=include, exclude=exclude,
+                top_k_files=top_k_files, top_k=top_k,
+                include=include, exclude=exclude,
             )
+            if isinstance(answer, list):
+                return answer
             cluster: Optional[KnowledgeCluster] = None
             context = SearchContext()
         else:
@@ -827,6 +958,18 @@ class AgenticSearch(BaseSearch):
             return str(content), reused, context
 
         await self._logger.info(f"[search] Starting multi-path retrieval for: '{query[:80]}'")
+
+        # ==============================================================
+        # Phase 0c: Vision intent quick-check (single LLM call, no-op
+        #           if the query doesn't look image-related)
+        # ==============================================================
+        vision_result = await self._try_vision_dispatch(query, paths, mode="DEEP")
+        if vision_result is not None:
+            summary = (
+                f"Found {len(vision_result)} image(s) matching your query."
+                if vision_result else "No matching images found."
+            )
+            return summary, self._make_answer_cluster(query, summary, "VS"), context
 
         # ==============================================================
         # Phase 1: Parallel probing — all four paths fire concurrently
@@ -966,6 +1109,11 @@ class AgenticSearch(BaseSearch):
         await asyncio.gather(*phase5_tasks, return_exceptions=True)
 
         await self._logger.success(f"[search] Complete: {context.summary()}")
+
+        self._record_search_episode(
+            query=query, query_type="text_deep", paths=paths,
+            hit_paths=list(context.read_file_ids) if context else [],
+        )
         return answer, cluster, context
 
     # ------------------------------------------------------------------
@@ -1041,9 +1189,10 @@ class AgenticSearch(BaseSearch):
         *,
         max_depth: Optional[int] = 5,
         top_k_files: int = 2,
+        top_k: int = 10,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
-    ) -> str:
+    ) -> Union[str, List[Any]]:
         """Greedy search: 2 LLM calls, single best file, focused evidence.
 
         Two-level keyword cascade extracted in one LLM call:
@@ -1098,6 +1247,27 @@ class AgenticSearch(BaseSearch):
         primary = analysis.get("primary", [])[:2]
         fallback = analysis.get("fallback", [])[:3]
         file_hints = analysis.get("file_hints", [])
+        modality = analysis.get("modality", "text").lower()
+
+        # ==============================================================
+        # Step 1b: Vision intent auto-detection
+        # ==============================================================
+        if modality == "vision":
+            await self._logger.info(
+                f"[FAST:Step1] Vision intent detected — routing to vision pipeline"
+            )
+            try:
+                vs = self._ensure_vision_search()
+                return await vs.search(
+                    query=query,
+                    paths=[str(p) for p in paths],
+                    top_k=top_k,
+                    mode="FAST",
+                )
+            except Exception as e:
+                await self._logger.warning(
+                    f"[FAST] Vision search failed ({e}), falling back to text"
+                )
 
         if not primary and not fallback:
             await self._logger.warning("[FAST] No keywords extracted")
@@ -1173,6 +1343,11 @@ class AgenticSearch(BaseSearch):
         self.llm_usages.append(answer_resp.usage)
 
         await self._logger.success("[FAST] Search complete (2 LLM calls)")
+
+        self._record_search_episode(
+            query=query, query_type="text_fast", paths=paths,
+            hit_paths=[file_path],
+        )
         return answer_resp.content or ""
 
     # ---- FAST helpers ----
@@ -1376,24 +1551,7 @@ class AgenticSearch(BaseSearch):
     @staticmethod
     def _parse_fast_json(text: str) -> Dict[str, Any]:
         """Extract JSON from the FAST query analysis LLM response."""
-        text = text.strip()
-        try:
-            return json.loads(text)
-        except (json.JSONDecodeError, TypeError):
-            pass
-        cleaned = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
-        cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
-        try:
-            return json.loads(cleaned)
-        except (json.JSONDecodeError, TypeError):
-            pass
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except (json.JSONDecodeError, TypeError):
-                pass
-        return {}
+        return parse_llm_json(text)
 
     # ------------------------------------------------------------------
     # Phase 1 probes (each designed to run concurrently)

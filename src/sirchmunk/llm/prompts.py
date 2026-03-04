@@ -249,23 +249,27 @@ based strictly on the document content.
 """
 
 
-FAST_QUERY_ANALYSIS = """Extract search terms at two granularity levels from the user query for a ripgrep file search. Both levels in one response.
+FAST_QUERY_ANALYSIS = """Extract search terms at two granularity levels from the user query for a ripgrep file search. Both levels in one response. Also determine the search modality.
 
 ### User Query
 {user_input}
 
 ### Output
 Return JSON only, no extra text:
-{{"primary": ["compound phrase"], "fallback": ["term1", "term2"], "file_hints": [], "intent": "..."}}
+{{"primary": ["compound phrase"], "fallback": ["term1", "term2"], "file_hints": [], "intent": "...", "modality": "text"}}
 
 Rules:
 - **primary**: 1 compound phrase (2-3 words) that is the most discriminating and likely to appear **verbatim** in the target document. This is tried first.
 - **fallback**: 1-3 single-word atomic terms decomposed from the primary phrase. These are tried only if primary misses. Pick the most specific word(s), not generic ones.
 - **file_hints**: filename fragments or glob patterns ONLY if clearly implied; empty array otherwise.
-- **intent**: one sentence.
+- **intent**: one sentence describing the user's goal.
+- **modality**: "text" if the query targets textual content (documents, code, etc.); "vision" if the query targets images/photos (e.g. "find photos of cats", "找客机的图片", "locate screenshots with error messages"). Default to "text" when ambiguous.
 
-Example: query "How does transformer attention work?"
-→ {{"primary": ["transformer attention"], "fallback": ["attention", "transformer"], "file_hints": [], "intent": "understand transformer attention mechanism"}}
+Example 1: query "How does transformer attention work?"
+→ {{"primary": ["transformer attention"], "fallback": ["attention", "transformer"], "file_hints": [], "intent": "understand transformer attention mechanism", "modality": "text"}}
+
+Example 2: query "找出带有长颈鹿的照片"
+→ {{"primary": ["长颈鹿"], "fallback": ["giraffe"], "file_hints": [], "intent": "find photos containing giraffes", "modality": "vision"}}
 """
 
 

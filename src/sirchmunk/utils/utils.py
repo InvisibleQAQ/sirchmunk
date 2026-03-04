@@ -1,7 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import json
 import math
 import re
-from typing import Dict, List, LiteralString, Optional
+from typing import Any, Dict, List, LiteralString, Optional
 
 from pydantic import RootModel, model_validator
 
@@ -81,6 +82,40 @@ def extract_fields(
             extracted_data[tag.lower()] = None
 
     return extracted_data
+
+
+def parse_llm_json(text: str) -> Dict[str, Any]:
+    """Extract a JSON object from an LLM response.
+
+    Handles common LLM quirks: markdown fences, preamble text, and
+    trailing commentary.  Falls back gracefully to an empty dict.
+
+    Args:
+        text: Raw LLM response that should contain a JSON object.
+
+    Returns:
+        Parsed dict, or ``{}`` if extraction fails.
+    """
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Strip markdown code fences
+    cleaned = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
+    cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
+    try:
+        return json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Last resort: extract first JSON object
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return {}
 
 
 if __name__ == "__main__":
