@@ -20,7 +20,7 @@ from pathlib import Path
 from datetime import datetime
 from loguru import logger
 
-from .duckdb import DuckDBManager
+from .duckdb_manager import DuckDBManager
 from sirchmunk.schema.knowledge import (
     KnowledgeCluster,
     EvidenceUnit,

@@ -14,7 +14,7 @@ from pathlib import Path
 from datetime import datetime
 from loguru import logger
 
-from sirchmunk.storage.duckdb import DuckDBManager
+from sirchmunk.storage.duckdb_manager import DuckDBManager
 from sirchmunk.utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH
 
 
