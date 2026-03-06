@@ -248,7 +248,7 @@ class BatchVerifier:
                 f"    [BatchVerifier] #{i + 1} "
                 f"{os.path.basename(cand.path)}: "
                 f"{status} confidence={conf:.2f}{detail}"
-                f"{f'  reason: {reason[:80]}' if reason else ''}"
+                f"{f'  reason: {reason[:500]}' if reason else ''}"
             )
             results.append(VerificationResult(
                 path=cand.path,
