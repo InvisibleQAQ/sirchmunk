@@ -173,7 +173,13 @@ class AgenticSearch(BaseSearch):
         self,
         paths: Optional[Union[str, Path, List[str], List[Path]]],
     ) -> List[str]:
-        """Resolve and normalise paths: arg > self.paths > cwd.
+        """Resolve and normalise paths with layered fallback.
+
+        Priority (highest → lowest):
+            1. Explicit ``paths`` argument  (``search(..., paths=xxx)``)
+            2. Instance default ``self.paths``  (constructor ``paths=``)
+            3. ``SIRCHMUNK_SEARCH_PATHS`` environment variable (comma-separated)
+            4. Current working directory
 
         Always returns ``List[str]`` so callers need no further coercion.
         """
@@ -183,6 +189,14 @@ class AgenticSearch(BaseSearch):
             return [str(p) for p in paths]
         if self.paths is not None:
             return list(self.paths)
+        env_paths = os.getenv("SIRCHMUNK_SEARCH_PATHS", "")
+        if env_paths:
+            parsed = [p.strip() for p in env_paths.split(",") if p.strip()]
+            if parsed:
+                _loguru_logger.info(
+                    f"[paths] Using SIRCHMUNK_SEARCH_PATHS: {parsed}"
+                )
+                return parsed
         cwd = str(Path.cwd())
         _loguru_logger.info(
             f"[paths] No paths provided; using current working directory: {cwd}"
@@ -285,81 +299,56 @@ class AgenticSearch(BaseSearch):
     async def _try_reuse_cluster(self, query: str) -> Optional[KnowledgeCluster]:
         """Try to reuse existing knowledge cluster based on semantic similarity.
 
+        The method waits (non-blocking) for the embedding model to become
+        ready so that reuse works reliably even on the first search call
+        within a process.
+
         Returns:
             KnowledgeCluster if a suitable cached cluster is found, None otherwise.
         """
         if not self.embedding_client:
             return None
 
-        # Skip cluster reuse while the embedding model is still loading in
-        # its background thread; kick off loading so it's ready next time.
-        if not self.embedding_client.is_ready():
-            self.embedding_client.start_loading()
-            return None
-
         try:
+            # Wait for the model (non-blocking via executor) instead of
+            # returning None immediately — this ensures reuse works even
+            # on the very first search call.
+            if not self.embedding_client.is_ready():
+                self.embedding_client.start_loading()
+                try:
+                    await self.embedding_client._ensure_model_async(timeout=60)
+                except Exception:
+                    await self._logger.debug(
+                        "Embedding model not ready yet, skipping cluster reuse"
+                    )
+                    return None
+
             await self._logger.info("Searching for similar knowledge clusters...")
-            
-            # Compute query embedding
+
             query_embedding = (await self.embedding_client.embed([query]))[0]
-            
-            # Search for similar clusters
+
             similar_clusters = await self.knowledge_storage.search_similar_clusters(
                 query_embedding=query_embedding,
                 top_k=self.cluster_sim_top_k,
                 similarity_threshold=self.cluster_sim_threshold,
             )
-            
+
             if not similar_clusters:
                 await self._logger.info("No similar clusters found, performing new search...")
                 return None
-            
-            # Found similar cluster - process reuse
+
             best_match = similar_clusters[0]
             await self._logger.success(
                 f"♻️ Found similar cluster: {best_match['name']} "
                 f"(similarity: {best_match['similarity']:.3f})"
             )
-            
-            # Retrieve full cluster object
+
             existing_cluster = await self.knowledge_storage.get(best_match["id"])
-            
             if not existing_cluster:
                 await self._logger.warning("Failed to retrieve cluster, falling back to new search")
                 return None
-            
-            # Add current query to queries list with FIFO strategy
-            self._add_query_to_cluster(existing_cluster, query)
-            
-            # Update hotness and timestamp for reused cluster
-            existing_cluster.hotness = min(1.0, (existing_cluster.hotness or 0.5) + 0.1)
-            existing_cluster.last_modified = datetime.now()
-            
-            # Recompute embedding with new query (before update to avoid double save)
-            if self.embedding_client and self.embedding_client.is_ready():
-                try:
-                    from sirchmunk.utils.embedding_util import compute_text_hash
 
-                    combined_text = self.knowledge_storage.combine_cluster_fields(
-                        existing_cluster.queries
-                    )
-                    text_hash = compute_text_hash(combined_text)
-                    embedding_vector = (await self.embedding_client.embed([combined_text]))[0]
-
-                    await self.knowledge_storage.store_embedding(
-                        cluster_id=existing_cluster.id,
-                        embedding_vector=embedding_vector,
-                        embedding_model=self.embedding_client.model_id,
-                        embedding_text_hash=text_hash,
-                    )
-                    await self._logger.debug(f"Updated embedding for cluster {existing_cluster.id}")
-                except Exception as emb_error:
-                    await self._logger.warning(f"Failed to update embedding: {emb_error}")
-            
-            # Single update call - saves cluster data and embedding together
-            await self.knowledge_storage.update(existing_cluster)
-            
-            # Validate cluster has usable content
+            # Validate cluster has usable content BEFORE mutating it
             content = existing_cluster.content
             if isinstance(content, list):
                 content = "\n".join(content)
@@ -369,9 +358,41 @@ class AgenticSearch(BaseSearch):
                 )
                 return None
 
+            # Mutate only after validation passes
+            self._add_query_to_cluster(existing_cluster, query)
+            existing_cluster.hotness = min(1.0, (existing_cluster.hotness or 0.5) + 0.1)
+            existing_cluster.last_modified = datetime.now()
+
+            # Recompute embedding with updated queries list
+            try:
+                from sirchmunk.utils.embedding_util import compute_text_hash
+
+                combined_text = self.knowledge_storage.combine_cluster_fields(
+                    existing_cluster.queries
+                )
+                text_hash = compute_text_hash(combined_text)
+                embedding_vector = (await self.embedding_client.embed([combined_text]))[0]
+
+                await self.knowledge_storage.store_embedding(
+                    cluster_id=existing_cluster.id,
+                    embedding_vector=embedding_vector,
+                    embedding_model=self.embedding_client.model_id,
+                    embedding_text_hash=text_hash,
+                )
+            except Exception as emb_error:
+                await self._logger.warning(f"Failed to update embedding: {emb_error}")
+
+            await self.knowledge_storage.update(existing_cluster)
+
+            # Flush to parquet so the updated cluster is visible to future searches
+            try:
+                self.knowledge_storage.force_sync()
+            except Exception as sync_err:
+                await self._logger.warning(f"Parquet force_sync failed: {sync_err}")
+
             await self._logger.success("Reused existing knowledge cluster")
             return existing_cluster
-        
+
         except Exception as e:
             await self._logger.warning(
                 f"Failed to search similar clusters: {e}. Falling back to full search."
@@ -406,12 +427,17 @@ class AgenticSearch(BaseSearch):
         Args:
             cluster: KnowledgeCluster to save
         """
-        # Save knowledge cluster to persistent storage
+        # Save knowledge cluster to persistent storage.
+        # insert() returns False (without raising) when the cluster already
+        # exists, so we explicitly fall back to update() in that case.
         try:
-            await self.knowledge_storage.insert(cluster)
-            await self._logger.info(f"Saved knowledge cluster {cluster.id} to cache")
+            inserted = await self.knowledge_storage.insert(cluster)
+            if inserted:
+                await self._logger.info(f"Saved knowledge cluster {cluster.id} to cache")
+            else:
+                await self.knowledge_storage.update(cluster)
+                await self._logger.info(f"Updated knowledge cluster {cluster.id} in cache")
         except Exception as e:
-            # If cluster exists, update it instead
             try:
                 await self.knowledge_storage.update(cluster)
                 await self._logger.info(f"Updated knowledge cluster {cluster.id} in cache")
@@ -978,6 +1004,8 @@ class AgenticSearch(BaseSearch):
 
         # ==============================================================
         # Phase 0: Cluster reuse (instant short-circuit)
+        # When reuse_knowledge=True and a similar cluster is found, we
+        # return here — Phase 5 (Persistence) is not executed for that path.
         # ==============================================================
         reused = await self._try_reuse_cluster(query)
         if reused is not None:
@@ -1116,14 +1144,19 @@ class AgenticSearch(BaseSearch):
                 context.add_llm_tokens(total_tok, usage=usage)
 
         # ==============================================================
-        # Phase 5: Persistence
+        # Phase 5: Persistence (only when no cluster was reused in Phase 0)
+        # When Phase 0 reuses a cluster we return early, so this block
+        # runs only for newly built clusters from Phase 1–4.
         # ==============================================================
         phase5_tasks = []
         if cluster:
             self._add_query_to_cluster(cluster, query)
             phase5_tasks.append(self._save_cluster_with_embedding(cluster))
         phase5_tasks.append(self._save_spec_context(paths, context, scan_result=scan_result))
-        await asyncio.gather(*phase5_tasks, return_exceptions=True)
+        results = await asyncio.gather(*phase5_tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                _loguru_logger.warning(f"[Phase 5] Persistence task failed: {r}")
 
         await self._logger.success(f"[search] Complete: {context.summary()}")
         return answer, cluster, context
@@ -1219,6 +1252,7 @@ class AgenticSearch(BaseSearch):
 
         # ==============================================================
         # Step 0: Cluster reuse — instant short-circuit (no LLM cost)
+        # When reuse succeeds we return here; no persistence step runs.
         # ==============================================================
         reused = await self._try_reuse_cluster(query)
         if reused is not None:
@@ -1336,7 +1370,7 @@ class AgenticSearch(BaseSearch):
             query, answer, file_path, evidence, keywords_used,
         )
 
-        # Persist the FAST cluster so it can be reused by future queries
+        # Persist the new cluster (only reached when Step 0 did not reuse)
         self._add_query_to_cluster(cluster, query)
         try:
             await self._save_cluster_with_embedding(cluster)

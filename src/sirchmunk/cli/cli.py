@@ -20,6 +20,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 from sirchmunk.version import __version__
 
@@ -119,6 +120,10 @@ SIRCHMUNK_WORK_PATH=~/.sirchmunk
 SIRCHMUNK_VERBOSE=false
 
 # ===== Search Settings =====
+# Default search paths (comma-separated), e.g. /data/docs,/data/pdfs
+# When set, acts as the default for search(..., paths=...) if none are provided.
+SIRCHMUNK_SEARCH_PATHS=
+
 # Maximum directory depth to search
 DEFAULT_MAX_DEPTH=5
 
@@ -470,7 +475,7 @@ def cmd_search(args: argparse.Namespace) -> int:
             _load_env_file(env_file)
 
         query = args.query
-        paths = args.paths or [os.getcwd()]
+        paths = args.paths or None
 
         if args.api:
             # Client mode: call API server
@@ -502,7 +507,7 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 async def _search_local(
     query: str,
-    paths: list,
+    paths: Optional[list] = None,
     mode: str = "FAST",
     output_format: str = "text",
     verbose: bool = False,
@@ -511,7 +516,7 @@ async def _search_local(
 
     Args:
         query: Search query
-        paths: Paths to search
+        paths: Paths to search (None lets AgenticSearch resolve via env/cwd fallback)
         mode: Search mode (FAST, DEEP, FILENAME_ONLY)
         output_format: Output format (text, json)
         verbose: Enable verbose output
@@ -551,7 +556,8 @@ async def _search_local(
     if not verbose:
         print(f"  Searching: {query}")
         print(f"   Mode: {mode}")
-        print(f"   Paths: {', '.join(paths)}")
+        if paths:
+            print(f"   Paths: {', '.join(paths)}")
         print()
 
     # Execute search
@@ -584,7 +590,7 @@ async def _search_local(
 
 def _search_via_api(
     query: str,
-    paths: list,
+    paths: Optional[list] = None,
     api_url: str = "http://localhost:8584",
     mode: str = "FAST",
     output_format: str = "text",
@@ -593,7 +599,7 @@ def _search_via_api(
 
     Args:
         query: Search query
-        paths: Paths to search
+        paths: Paths to search (None lets server resolve via env/cwd)
         api_url: API server URL
         mode: Search mode
         output_format: Output format

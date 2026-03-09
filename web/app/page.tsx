@@ -118,6 +118,34 @@ export default function HomePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Sync file selector with SIRCHMUNK_SEARCH_PATHS from .env
+  useEffect(() => {
+    fetch(apiUrl("/api/v1/settings/environment"))
+      .then((res) => res.json())
+      .then((result) => {
+        if (result.success && result.data?.SIRCHMUNK_SEARCH_PATHS) {
+          const envValue = result.data.SIRCHMUNK_SEARCH_PATHS.value;
+          if (envValue && envValue.trim()) {
+            const envPaths = envValue
+              .split(",")
+              .map((p: string) => p.trim())
+              .filter((p: string) => p.length > 0);
+            if (envPaths.length > 0 && selectedPaths.length === 0) {
+              setSelectedPaths(envPaths);
+              setSelectedPath(envPaths[0]);
+              setChatState((prev) => ({
+                ...prev,
+                enableRag: true,
+                selectedKb: envPaths.join(","),
+              }));
+            }
+          }
+        }
+      })
+      .catch((err) => console.error("Failed to fetch SIRCHMUNK_SEARCH_PATHS:", err));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Check if Tkinter file picker is available (will be false in Docker)
   useEffect(() => {
     fetch(apiUrl("/api/v1/file-picker/status"))

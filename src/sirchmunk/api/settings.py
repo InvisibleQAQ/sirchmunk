@@ -88,6 +88,7 @@ class UISettings(BaseModel):
 
 class EnvironmentVariables(BaseModel):
     SIRCHMUNK_WORK_PATH: Optional[str] = None
+    SIRCHMUNK_SEARCH_PATHS: Optional[str] = None
     LLM_BASE_URL: Optional[str] = None
     LLM_API_KEY: Optional[str] = None
     LLM_MODEL_NAME: Optional[str] = None
@@ -114,6 +115,13 @@ def get_current_env_variables() -> Dict[str, Any]:
             "default": _DEFAULT_WORK_PATH,
             "description": "Working directory for Sirchmunk data",
             "category": "system"
+        },
+        "SIRCHMUNK_SEARCH_PATHS": {
+            "value": os.getenv("SIRCHMUNK_SEARCH_PATHS", ""),
+            "default": "",
+            "description": "Default search paths (comma-separated). "
+                           "Overridden by explicit paths passed to search().",
+            "category": "search"
         },
         "LLM_BASE_URL": {
             "value": os.getenv("LLM_BASE_URL", _DEFAULT_LLM_BASE_URL),
