@@ -95,6 +95,7 @@ class OpenAIChat:
             retry_max_delay: Upper bound on backoff delay in seconds.
             **kwargs: Additional keyword arguments passed to the OpenAI client create method.
         """
+        self.base_url = base_url
         self._client = OpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -114,6 +115,21 @@ class OpenAIChat:
         self._logger = create_logger(log_callback=log_callback, enable_async=False)
         self._logger_async = create_logger(log_callback=log_callback, enable_async=True)
 
+    def _detect_provider(self) -> str:
+        url = (self.base_url or "").lower()
+
+        if "openai.com" in url:
+            return "openai"
+        if "anthropic.com" in url:
+            return "anthropic"
+        if "generativelanguage.googleapis.com" in url or "googleapis.com" in url:
+            return "gemini"
+        if "deepseek.com" in url:
+            return "deepseek"
+        # Add more provider detections as needed
+        
+        return "openai" # default to OpenAI if unknown
+    
     def _build_request_kwargs(
             self,
             stream: bool,
@@ -127,12 +143,21 @@ class OpenAIChat:
         """
         request_kwargs = {**self._kwargs, **kwargs}
 
+        provider = self._detect_provider()
+
         extra_body = {
             **(self._kwargs.get("extra_body") or {}),
             **(kwargs.get("extra_body") or {}),
         }
-        if enable_thinking is not None:
-            extra_body["enable_thinking"] = enable_thinking
+
+        # Add enable_thinking except for OpenAI
+        if provider != "openai" \
+            and provider != "anthropic" \
+            and enable_thinking is not None:
+            if provider == "gemini": 
+                extra_body["reasoning_effort"] = "high"
+            else:
+                extra_body["enable_thinking"] = enable_thinking
         if extra_body:
             request_kwargs["extra_body"] = extra_body
 
