@@ -1004,6 +1004,8 @@ class AgenticSearch(BaseSearch):
 
         # ==============================================================
         # Phase 0: Cluster reuse (instant short-circuit)
+        # When reuse_knowledge=True and a similar cluster is found, we
+        # return here — Phase 5 (Persistence) is not executed for that path.
         # ==============================================================
         reused = await self._try_reuse_cluster(query)
         if reused is not None:
@@ -1142,7 +1144,9 @@ class AgenticSearch(BaseSearch):
                 context.add_llm_tokens(total_tok, usage=usage)
 
         # ==============================================================
-        # Phase 5: Persistence
+        # Phase 5: Persistence (only when no cluster was reused in Phase 0)
+        # When Phase 0 reuses a cluster we return early, so this block
+        # runs only for newly built clusters from Phase 1–4.
         # ==============================================================
         phase5_tasks = []
         if cluster:
@@ -1248,6 +1252,7 @@ class AgenticSearch(BaseSearch):
 
         # ==============================================================
         # Step 0: Cluster reuse — instant short-circuit (no LLM cost)
+        # When reuse succeeds we return here; no persistence step runs.
         # ==============================================================
         reused = await self._try_reuse_cluster(query)
         if reused is not None:
@@ -1365,7 +1370,7 @@ class AgenticSearch(BaseSearch):
             query, answer, file_path, evidence, keywords_used,
         )
 
-        # Persist the FAST cluster so it can be reused by future queries
+        # Persist the new cluster (only reached when Step 0 did not reuse)
         self._add_query_to_cluster(cluster, query)
         try:
             await self._save_cluster_with_embedding(cluster)
