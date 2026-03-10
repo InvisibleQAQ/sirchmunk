@@ -151,11 +151,10 @@ class OpenAIChat:
         }
 
         # Add enable_thinking except for OpenAI
-        if provider != "openai" \
-            and provider != "anthropic" \
-            and enable_thinking is not None:
-            if provider == "gemini": 
-                extra_body["reasoning_effort"] = "high"
+        if enable_thinking is not None and provider not in ("openai", "anthropic"):
+            if provider == "gemini":
+                if enable_thinking:
+                    extra_body["reasoning_effort"] = "high"
             else:
                 extra_body["enable_thinking"] = enable_thinking
         if extra_body:
