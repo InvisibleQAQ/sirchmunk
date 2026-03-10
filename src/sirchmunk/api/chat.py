@@ -87,6 +87,92 @@ def _resolve_rag_paths(kb_name: str) -> Tuple[List[str], str]:
     return paths, display
 
 
+# ---------------------------------------------------------------------------
+# Multi-turn conversation support
+# ---------------------------------------------------------------------------
+
+_DEFAULT_HISTORY_MAX_TURNS = 10
+_DEFAULT_HISTORY_MAX_TOKENS = 8000
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate for mixed CJK / Latin text (~3.5 chars per token)."""
+    return max(1, int(len(text) / 3.5))
+
+
+def _build_chat_history(
+    session_id: str,
+    *,
+    max_turns: int = 0,
+    max_tokens: int = 0,
+) -> List[Dict[str, str]]:
+    """Build an OpenAI-format message list from session history.
+
+    Reads from the in-memory ``chat_sessions`` cache (populated on each
+    WebSocket turn).  Falls back to ``history_storage`` on cache miss
+    (e.g. after a server restart mid-session).
+
+    Returns the most recent messages that fit within *max_turns* and
+    *max_tokens* (whichever is more restrictive), ordered oldest-first.
+    The *current* user message (not yet appended) is excluded.
+    """
+    if not max_turns:
+        max_turns = int(os.getenv("CHAT_HISTORY_MAX_TURNS", str(_DEFAULT_HISTORY_MAX_TURNS)))
+    if not max_tokens:
+        max_tokens = int(os.getenv("CHAT_HISTORY_MAX_TOKENS", str(_DEFAULT_HISTORY_MAX_TOKENS)))
+
+    raw: List[Dict[str, str]] = []
+    session = chat_sessions.get(session_id)
+    if session and session.get("messages"):
+        raw = [{"role": m["role"], "content": m["content"]} for m in session["messages"]]
+    else:
+        raw = history_storage.get_recent_messages(session_id, limit=max_turns * 2)
+
+    if not raw:
+        return []
+
+    # Traverse from newest to oldest, accumulating within budget
+    kept: List[Dict[str, str]] = []
+    budget = max_tokens
+    for msg in reversed(raw[-(max_turns * 2):]):
+        cost = _estimate_tokens(msg["content"])
+        if budget - cost < 0 and kept:
+            break
+        budget -= cost
+        kept.append(msg)
+
+    kept.reverse()
+    return kept
+
+
+async def _rewrite_query_with_context(
+    message: str,
+    history: List[Dict[str, str]],
+    llm: OpenAIChat,
+) -> str:
+    """Rewrite a context-dependent query into a self-contained search query.
+
+    Uses a single lightweight LLM call (stream=False).  If the message
+    is already self-contained the LLM returns it unchanged.
+    """
+    from sirchmunk.llm.prompts import QUERY_REWRITE
+
+    history_text = "\n".join(
+        f"{m['role'].capitalize()}: {m['content']}" for m in history[-6:]
+    )
+    prompt = QUERY_REWRITE.format(history=history_text, message=message)
+    resp = await llm.achat(
+        messages=[{"role": "user", "content": prompt}],
+        stream=False,
+    )
+    rewritten = (resp.content or message).strip()
+    if not rewritten:
+        return message
+    if rewritten != message:
+        logger.info("[multi-turn] Query rewritten: '%s' → '%s'", message[:60], rewritten[:60])
+    return rewritten
+
+
 # Tkinter availability is checked lazily to avoid initialising
 # the macOS Cocoa/AppKit framework at module-import time.
 # Eagerly importing tkinter in a headless server causes the macOS
@@ -586,11 +672,14 @@ async def _perform_web_search(query: str, websocket: WebSocket, manager: ChatCon
 async def _chat_only(
     message: str,
     websocket: WebSocket,
-    manager: ChatConnectionManager
+    manager: ChatConnectionManager,
+    *,
+    history: Optional[List[Dict[str, str]]] = None,
 ) -> tuple[str, Dict[str, Any]]:
-    """
-    Mode 1: Pure chat mode (no RAG, no web search)
-    Direct LLM chat without any retrieval augmentation
+    """Mode 1: Pure chat mode (no RAG, no web search).
+
+    When *history* is provided the LLM receives prior conversation turns
+    so it can maintain context across messages.
     """
     try:
         await manager.send_personal_message(json.dumps({
@@ -598,11 +687,9 @@ async def _chat_only(
             "stage": "generating",
             "message": "💬 Generating response..."
         }), websocket)
-        
-        # Create log callback for streaming LLM output
+
         llm_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
-        
-        # Initialize OpenAI client with log callback for streaming
+
         envs: Dict[str, Any] = get_envs()
         llm = OpenAIChat(
             api_key=envs["api_key"],
@@ -610,27 +697,22 @@ async def _chat_only(
             model=envs["model_name"],
             log_callback=llm_log_callback
         )
-        
-        # Prepare messages for LLM
+
         messages = [
             {"role": "system", "content": "You are a helpful AI assistant. Provide clear, accurate, and helpful responses."},
-            {"role": "user", "content": message}
+            *(history or []),
+            {"role": "user", "content": message},
         ]
-        
-        # Generate response with streaming
+
         llm_response = await llm.achat(messages=messages, stream=True)
-        
-        # Record LLM usage for monitoring (always record call, even if usage is empty)
-        # Some LLM APIs don't return usage in streaming mode
+
         usage_data = llm_response.usage if llm_response.usage else {}
         llm_usage_tracker.record_usage(
             model=llm_response.model or envs["model_name"],
-            usage=usage_data
+            usage=usage_data,
         )
-        
-        sources = {}
-        
-        return llm_response.content, sources
+
+        return llm_response.content, {}
     
     except Exception as e:
         # Send error message to frontend
@@ -697,14 +779,14 @@ async def _chat_rag(
     websocket: WebSocket,
     manager: ChatConnectionManager,
     search_mode: str = "FAST",
+    *,
+    history: Optional[List[Dict[str, str]]] = None,
 ) -> tuple[str, Dict[str, Any]]:
-    """
-    Mode 2: Chat + RAG (enable_rag=True, enable_web_search=False)
-    LLM chat with knowledge base retrieval.
+    """Mode 2: Chat + RAG (enable_rag=True, enable_web_search=False).
 
-    Transient LLM errors (404, 5xx, timeouts) trigger a pipeline-level
-    retry before falling back to pure chat mode.  Permanent errors
-    (auth, bad request) skip the retry and fall back immediately.
+    When *history* is provided the search query is rewritten to be
+    self-contained (resolving pronouns / omitted subjects), and the
+    final answer is generated with conversation context.
     """
     sources = {}
     paths, paths_display = _resolve_rag_paths(kb_name)
@@ -716,6 +798,15 @@ async def _chat_rag(
         response = "Please specify search paths for RAG search."
         return response, sources
 
+    # Multi-turn: rewrite the query so it is self-contained for retrieval
+    search_query = message
+    if history:
+        envs: Dict[str, Any] = get_envs()
+        rewrite_llm = OpenAIChat(
+            api_key=envs["api_key"], base_url=envs["base_url"], model=envs["model_name"],
+        )
+        search_query = await _rewrite_query_with_context(message, history, rewrite_llm)
+
     last_error: Optional[Exception] = None
 
     for attempt in range(_RAG_PIPELINE_MAX_RETRIES + 1):
@@ -723,10 +814,10 @@ async def _chat_rag(
             search_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
             await search_log_callback("info", f"📂 Parsed search paths: {paths}", "\n", False)
 
-            logger.info("[MODE 2] RAG search with query: %s, paths: %s", message, paths)
+            logger.info("[MODE 2] RAG search with query: %s, paths: %s", search_query, paths)
 
             search_result, llm_usages, references = await _run_rag_search(
-                message, paths, search_mode, search_log_callback,
+                search_query, paths, search_mode, search_log_callback,
             )
 
             search_engine = get_search_instance()
@@ -781,51 +872,43 @@ async def _chat_rag(
                 "message": "⚠️ Falling back to pure chat mode..."
             }), websocket)
 
-            response, sources = await _chat_only(message, websocket, manager)
+            response, sources = await _chat_only(message, websocket, manager, history=history)
             return response, sources
 
     # Should not be reached, but handle defensively
-    response, sources = await _chat_only(message, websocket, manager)
+    response, sources = await _chat_only(message, websocket, manager, history=history)
     return response, sources
 
 
 async def _chat_web_search(
     message: str,
     websocket: WebSocket,
-    manager: ChatConnectionManager
+    manager: ChatConnectionManager,
+    *,
+    history: Optional[List[Dict[str, str]]] = None,
 ) -> tuple[str, Dict[str, Any]]:
-    """
-    Mode 3: Chat + Web Search (enable_rag=False, enable_web_search=True)
-    LLM chat with web search augmentation (currently mock)
-    """
+    """Mode 3: Chat + Web Search (enable_rag=False, enable_web_search=True)."""
     await manager.send_personal_message(json.dumps({
         "type": "status",
         "stage": "web_search",
         "message": "🌐 Searching the web..."
     }), websocket)
-    
-    # Perform mock web search
+
     web_results = await _perform_web_search(message, websocket, manager)
-    
-    # Check if web search returned valid results
+
     if not web_results or not web_results.get("sources"):
-        # Fallback to chat only
         await manager.send_personal_message(json.dumps({
             "type": "status",
             "stage": "fallback",
             "message": "⚠️ Web search did not return results, falling back to pure chat mode..."
         }), websocket)
-        
-        print(f"[MODE 3] Web search failed, falling back to chat only")
-        response, sources = await _chat_only(message, websocket, manager)
-        return response, sources
-    
-    # Generate response enhanced with web search results
+        logger.info("[MODE 3] Web search failed, falling back to chat only")
+        return await _chat_only(message, websocket, manager, history=history)
+
     web_context = "\n\nBased on web search results:\n"
     for source in web_results["sources"]:
         web_context += f"- {source['title']}: {source['snippet']}\n"
-    
-    # Use LLM to generate response with web context
+
     await manager.send_personal_message(json.dumps({
         "type": "status",
         "stage": "generating",
@@ -835,29 +918,24 @@ async def _chat_web_search(
     envs: Dict[str, Any] = get_envs()
     llm_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
     llm = OpenAIChat(
-        api_key=envs["api_key"],
-        base_url=envs["base_url"],
-        model=envs["model_name"],
-        log_callback=llm_log_callback
+        api_key=envs["api_key"], base_url=envs["base_url"],
+        model=envs["model_name"], log_callback=llm_log_callback,
     )
-    
+
     messages = [
         {"role": "system", "content": "You are a helpful AI assistant. Use the provided web search results to answer the user's question accurately."},
-        {"role": "user", "content": f"{message}\n\nWeb search context:\n{web_context}"}
+        *(history or []),
+        {"role": "user", "content": f"{message}\n\nWeb search context:\n{web_context}"},
     ]
-    
+
     llm_response = await llm.achat(messages=messages, stream=True)
-    
-    # Record LLM usage for monitoring (always record call, even if usage is empty)
+
     usage_data = llm_response.usage if llm_response.usage else {}
     llm_usage_tracker.record_usage(
-        model=llm_response.model or envs["model_name"],
-        usage=usage_data
+        model=llm_response.model or envs["model_name"], usage=usage_data,
     )
-    
-    sources = {"web": web_results["sources"]}
-    
-    return llm_response.content, sources
+
+    return llm_response.content, {"web": web_results["sources"]}
 
 
 async def _chat_rag_web_search(
@@ -866,11 +944,10 @@ async def _chat_rag_web_search(
     websocket: WebSocket,
     manager: ChatConnectionManager,
     search_mode: str = "FAST",
+    *,
+    history: Optional[List[Dict[str, str]]] = None,
 ) -> tuple[str, Dict[str, Any]]:
-    """
-    Mode 4: Chat + RAG + Web Search (enable_rag=True, enable_web_search=True)
-    LLM chat with both knowledge base retrieval and web search
-    """
+    """Mode 4: Chat + RAG + Web Search (enable_rag=True, enable_web_search=True)."""
     sources = {}
     paths, paths_display = _resolve_rag_paths(kb_name)
     if not paths:
@@ -881,7 +958,15 @@ async def _chat_rag_web_search(
         response = "Please specify search paths for RAG search."
         return response, sources
 
-    # Step 1: Perform RAG search (with pipeline-level retry for transient errors)
+    # Multi-turn: rewrite query for retrieval
+    search_query = message
+    if history:
+        envs_rw: Dict[str, Any] = get_envs()
+        rewrite_llm = OpenAIChat(
+            api_key=envs_rw["api_key"], base_url=envs_rw["base_url"], model=envs_rw["model_name"],
+        )
+        search_query = await _rewrite_query_with_context(message, history, rewrite_llm)
+
     rag_result = None
 
     for attempt in range(_RAG_PIPELINE_MAX_RETRIES + 1):
@@ -889,10 +974,10 @@ async def _chat_rag_web_search(
             search_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
             await search_log_callback("info", f"📂 RAG search paths: {paths}", "\n", False)
 
-            logger.info("[MODE 4] RAG search with query: %s, paths: %s", message, paths)
+            logger.info("[MODE 4] RAG search with query: %s, paths: %s", search_query, paths)
 
             rag_result, llm_usages, references = await _run_rag_search(
-                message, paths, search_mode, search_log_callback,
+                search_query, paths, search_mode, search_log_callback,
             )
 
             search_engine = get_search_instance()
@@ -1041,37 +1126,40 @@ async def chat_websocket(websocket: WebSocket):
             history_storage.save_message(session_id, user_message)
             
             # ============================================================
+            # Build conversation history for multi-turn support
+            # ============================================================
+            chat_history = _build_chat_history(session_id)
+
+            # ============================================================
             # Route to appropriate chat mode based on feature flags
             # ============================================================
             response = ""
             sources = {}
-            
+
             if enable_rag and enable_web_search:
-                # Mode 4: Chat + RAG + Web Search
-                print(f"[MODE 4] Chat + RAG + Web Search")
+                logger.info("[MODE 4] Chat + RAG + Web Search")
                 response, sources = await _chat_rag_web_search(
-                    message, kb_name, websocket, manager, search_mode=search_mode
+                    message, kb_name, websocket, manager,
+                    search_mode=search_mode, history=chat_history,
                 )
-                
+
             elif enable_rag and not enable_web_search:
-                # Mode 2: Chat + RAG
-                print(f"[MODE 2] Chat + RAG")
+                logger.info("[MODE 2] Chat + RAG")
                 response, sources = await _chat_rag(
-                    message, kb_name, websocket, manager, search_mode=search_mode
+                    message, kb_name, websocket, manager,
+                    search_mode=search_mode, history=chat_history,
                 )
-                    
+
             elif not enable_rag and enable_web_search:
-                # Mode 3: Chat + Web Search only
-                print(f"[MODE 3] Chat + Web Search only")
+                logger.info("[MODE 3] Chat + Web Search only")
                 response, sources = await _chat_web_search(
-                    message, websocket, manager
+                    message, websocket, manager, history=chat_history,
                 )
-                
+
             else:
-                # Mode 1: Pure chat (no RAG, no web search)
-                print(f"[MODE 1] Pure chat mode")
+                logger.info("[MODE 1] Pure chat mode")
                 response, sources = await _chat_only(
-                    message, websocket, manager
+                    message, websocket, manager, history=chat_history,
                 )
             
             # ============================================================

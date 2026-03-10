@@ -853,7 +853,7 @@ class AgenticSearch(BaseSearch):
         *,
         mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = "FAST",
         max_loops: int = 10,
-        max_token_budget: int = 64000,
+        max_token_budget: int = 128000,
         max_depth: Optional[int] = 8,
         top_k_files: int = 3,
         enable_dir_scan: bool = True,
@@ -861,6 +861,7 @@ class AgenticSearch(BaseSearch):
         exclude: Optional[List[str]] = None,
         return_context: bool = False,
         spec_stale_hours: float = 72.0,
+        chat_history: Optional[List[Dict[str, str]]] = None,
     ) -> Union[str, SearchContext, List[Dict[str, Any]]]:
         """Perform intelligent search with multi-mode support.
 
@@ -963,7 +964,7 @@ class AgenticSearch(BaseSearch):
 
         # ---- Chat intent short-circuit (rule-based, no LLM cost) ----
         if mode != "FILENAME_ONLY" and self._is_chat_query(query):
-            answer, cluster, ctx = await self._respond_chat(query)
+            answer, cluster, ctx = await self._respond_chat(query, chat_history=chat_history)
             if return_context:
                 ctx.answer = answer
                 return ctx
@@ -1018,7 +1019,7 @@ class AgenticSearch(BaseSearch):
         paths: List[str],
         *,
         max_loops: int = 10,
-        max_token_budget: int = 64000,
+        max_token_budget: int = 128000,
         max_depth: Optional[int] = 5,
         top_k_files: int = 3,
         enable_dir_scan: bool = True,
@@ -1270,20 +1271,23 @@ class AgenticSearch(BaseSearch):
         return bool(_CHAT_QUERY_RE.match(query.strip()))
 
     async def _respond_chat(
-        self, query: str, context: Optional[SearchContext] = None,
+        self,
+        query: str,
+        context: Optional[SearchContext] = None,
+        *,
+        chat_history: Optional[List[Dict[str, str]]] = None,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """Generate a direct conversational response (single LLM call, no retrieval)."""
         await self._logger.info(
             f"[search] Chat intent detected — responding directly: '{query[:60]}'"
         )
         ctx = context or SearchContext()
-        resp = await self.llm.achat(
-            messages=[
-                {"role": "system", "content": _CHAT_RESPONSE_SYSTEM},
-                {"role": "user", "content": query},
-            ],
-            stream=False,
-        )
+        messages = [
+            {"role": "system", "content": _CHAT_RESPONSE_SYSTEM},
+            *(chat_history or []),
+            {"role": "user", "content": query},
+        ]
+        resp = await self.llm.achat(messages=messages, stream=False)
         self.llm_usages.append(resp.usage)
         if resp.usage and isinstance(resp.usage, dict):
             ctx.add_llm_tokens(

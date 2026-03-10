@@ -323,6 +323,41 @@ class HistoryStorage:
             logger.error(f"Failed to delete session {session_id}: {e}")
             return False
 
+    def get_recent_messages(
+        self, session_id: str, limit: int = 20,
+    ) -> List[Dict[str, str]]:
+        """Return the most recent messages in OpenAI chat format.
+
+        Only ``role`` and ``content`` are included — suitable for direct
+        injection into an LLM messages list.
+
+        Args:
+            session_id: Session to query.
+            limit: Maximum number of messages to return.
+
+        Returns:
+            List of ``{"role": ..., "content": ...}`` dicts, ordered
+            chronologically (oldest first).
+        """
+        try:
+            rows = self.db.fetch_all(
+                """
+                SELECT role, content FROM (
+                    SELECT role, content, timestamp
+                    FROM chat_messages
+                    WHERE session_id = ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                ) sub
+                ORDER BY timestamp ASC
+                """,
+                [session_id, limit],
+            )
+            return [{"role": r[0], "content": r[1]} for r in rows]
+        except Exception as e:
+            logger.warning(f"Failed to get recent messages for {session_id}: {e}")
+            return []
+
     def get_session_count(self) -> int:
         """Get total number of sessions"""
         return self.db.get_table_count("chat_sessions")

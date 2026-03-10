@@ -138,6 +138,8 @@ class EnvironmentVariables(BaseModel):
     LLM_API_KEY: Optional[str] = None
     LLM_MODEL_NAME: Optional[str] = None
     GREP_CONCURRENT_LIMIT: Optional[int] = None
+    CHAT_HISTORY_MAX_TURNS: Optional[int] = None
+    CHAT_HISTORY_MAX_TOKENS: Optional[int] = None
 
 class SaveSettingsRequest(BaseModel):
     ui: Optional[UISettings] = None
@@ -192,7 +194,19 @@ def get_current_env_variables() -> Dict[str, Any]:
             "default": _DEFAULT_GREP_CONCURRENT_LIMIT,
             "description": "Maximum concurrent grep requests",
             "category": "system"
-        }
+        },
+        "CHAT_HISTORY_MAX_TURNS": {
+            "value": os.getenv("CHAT_HISTORY_MAX_TURNS", "10"),
+            "default": "10",
+            "description": "Maximum conversation turns to include as context",
+            "category": "chat"
+        },
+        "CHAT_HISTORY_MAX_TOKENS": {
+            "value": os.getenv("CHAT_HISTORY_MAX_TOKENS", "8000"),
+            "default": "8000",
+            "description": "Maximum token budget for conversation history",
+            "category": "chat"
+        },
     }
 
 # === API Endpoints ===

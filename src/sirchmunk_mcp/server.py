@@ -55,7 +55,7 @@ def create_server(config: Config) -> FastMCP:
         max_depth: int = 5,
         top_k_files: int = 3,
         max_loops: int = 10,
-        max_token_budget: int = 64000,
+        max_token_budget: int = 128000,
         enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,

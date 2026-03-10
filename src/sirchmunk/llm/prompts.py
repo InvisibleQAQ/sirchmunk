@@ -249,6 +249,18 @@ based strictly on the document content.
 """
 
 
+QUERY_REWRITE = """Given the conversation history and the latest user message, rewrite the user message into a standalone search query that captures the full intent without relying on prior context. If the message is already self-contained, return it unchanged.
+
+### Conversation History
+{history}
+
+### Latest User Message
+{message}
+
+### Output
+Return ONLY the rewritten query, nothing else. Keep the same language as the user message."""
+
+
 FAST_QUERY_ANALYSIS = """Classify the user query and, if it is a document/file search query, extract search terms at two granularity levels for a ripgrep file search.
 
 ### User Query
