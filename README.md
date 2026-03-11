@@ -151,6 +151,15 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 ## 🎉 News
 
+* 🚀 **Mar 12, 2026**: Sirchmunk v0.0.6
+  - **Multi-turn conversation**: Context management with LLM query rewriting; configs `CHAT_HISTORY_MAX_TURNS` / `CHAT_HISTORY_MAX_TOKENS`; default search token budget 128K
+  - **Document summarization & cross-lingual retrieval**: Summarization pipeline (chunk/merge/rerank), cross-lingual keyword extraction, chat-history relevance filtering
+  - **Docker**: `SIRCHMUNK_SEARCH_PATHS` env support; updated entrypoint; document-processing dependencies
+  - **OpenAI client**: `_ProviderProfile` for multi-provider management; auto-detect from `base_url`; unified streaming; `thinking_content` support
+
+<details>
+<summary><b>Older releases (v0.0.2 – v0.0.5)</b></summary>
+
 * 🚀 **Mar 5, 2026**: Sirchmunk v0.0.5
   - **Breaking Change**: Unified Search API: Streamlined search() interface with a new SearchContext object and simplified parameter control (return_context).
   - **Robust RAG Chat**: Significantly improved conversational reliability through new retry mechanisms and granular exception handling.
@@ -177,6 +186,8 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
   - **Knowledge Reuse**: Semantic similarity-based cluster retrieval for faster searches via embedding vectors.
 
 * 🎉🎉 Jan 22, 2026: Introducing **Sirchmunk**: Initial Release v0.0.1 Now Available!
+
+</details>
 
 
 ---
@@ -441,12 +452,12 @@ Pre-built Docker images are available on Alibaba Cloud Container Registry:
 
 | Region | Image |
 |---|---|
-| US West | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
-| China Beijing | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
+| US West | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6` |
+| China Beijing | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6` |
 
 ```bash
 # Pull the image
-docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4
+docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6
 
 # Start the service
 docker run -d \
@@ -459,10 +470,22 @@ docker run -d \
   -e UI_THEME=light \
   -e UI_LANGUAGE=en \
   -e SIRCHMUNK_VERBOSE=false \
+  -e SIRCHMUNK_SEARCH_PATHS=/mnt/docs \
   -v /path/to/your_work_path:/data/sirchmunk \
   -v /path/to/your/docs:/mnt/docs:ro \
-  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4
+  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6
 ```
+
+
+<details>
+<summary><b>Previous Releases</b></summary>
+
+| Version | Region | Image |
+|---|---|---|
+| v0.0.4 | US West | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
+| v0.0.4 | China Beijing | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
+
+</details>
 
 Open http://localhost:8584 to access the WebUI, or call the API directly:
 
@@ -749,10 +772,12 @@ if (data.success) {
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `query` | `string` | *required* | Search query or question |
-| `paths` | `string[]` | *required* | Directories or files to search (min 1) |
+| `paths` | `string[]` | *required* | Directories or files to search (min 1); falls back to `SIRCHMUNK_SEARCH_PATHS` if unset |
 | `mode` | `string` | `"FAST"` | `FAST`, `DEEP`, or `FILENAME_ONLY` |
+| `enable_dir_scan` | `bool` | `true` | Enable directory scanning (FAST/DEEP) for file discovery |
 | `max_depth` | `int` | `null` | Maximum directory depth |
 | `top_k_files` | `int` | `null` | Number of top files to return |
+| `max_token_budget` | `int` | `null` | LLM token budget (DEEP mode, default 128K) |
 | `keyword_levels` | `int` | `null` | Keyword granularity levels |
 | `include_patterns` | `string[]` | `null` | File glob patterns to include |
 | `exclude_patterns` | `string[]` | `null` | File glob patterns to exclude |
@@ -833,6 +858,7 @@ You can query them using DuckDB or the `KnowledgeManager` API.
 - [x] Knowledge structuring & persistence
 - [x] Real-time chat with RAG
 - [x] Web UI support
+- [x] Multi-turn conversation with context management
 - [ ] Web search integration
 - [ ] Multi-modal support (images, videos)
 - [ ] Distributed search across nodes

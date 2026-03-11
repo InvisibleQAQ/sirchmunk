@@ -148,6 +148,15 @@
 
 ## 🎉 News
 
+* 🚀 **2026年3月12日**: Sirchmunk v0.0.6
+  - **多轮对话**：上下文管理与 LLM 查询重写；配置项 `CHAT_HISTORY_MAX_TURNS` / `CHAT_HISTORY_MAX_TOKENS`；搜索默认 token 预算 128K
+  - **文档摘要与跨语言检索**：摘要流水线（分块/合并/重排）、跨语言关键词提取、聊天历史相关性过滤
+  - **Docker**：支持 `SIRCHMUNK_SEARCH_PATHS` 环境变量；更新 entrypoint；文档处理依赖
+  - **OpenAI 客户端**：`_ProviderProfile` 多提供商管理；按 `base_url` 自动检测；统一流式处理；支持 `thinking_content`
+
+<details>
+<summary><b>历史版本（v0.0.2 – v0.0.5）</b></summary>
+
 * 🚀 **2026.3.5**: **Sirchmunk v0.0.5 发布**
   - **破坏性变更**：统一搜索 API：重构 search() 接口的返回类型，引入 SearchContext 对象并简化返回参数控制，API 调用更简洁。
   - **高可用 RAG 对话**：引入重试机制与细粒度异常处理，大幅提升了 RAG 聊天在复杂网络环境下的稳定性。
@@ -175,6 +184,8 @@
   - **知识复用**：基于语义相似度的知识聚类检索，通过 embedding 向量加速搜索。
 
 * 🎉🎉 2026.1.22: **Sirchmunk** 初始版本 v0.0.1 现已发布！
+
+</details>
 
 ---
 
@@ -440,12 +451,12 @@ python scripts/stop_web.py
 
 | 区域 | 镜像 |
 |---|---|
-| 美西 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
-| 北京 | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
+| 美西 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6` |
+| 北京 | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6` |
 
 ```bash
 # 拉取镜像（根据地理位置选择最近的 Registry）
-docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4
+docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6
 
 # 启动服务
 docker run -d \
@@ -458,10 +469,22 @@ docker run -d \
   -e UI_THEME=light \
   -e UI_LANGUAGE=en \
   -e SIRCHMUNK_VERBOSE=false \
+  -e SIRCHMUNK_SEARCH_PATHS=/mnt/docs \
   -v /path/to/your_work_path:/data/sirchmunk \
   -v /path/to/your/docs:/mnt/docs:ro \
-  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4
+  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6
 ```
+
+
+<details>
+<summary><b>历史版本</b></summary>
+
+| 版本 | 区域 | 镜像 |
+|---|---|---|
+| v0.0.4 | 美西 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
+| v0.0.4 | 北京 | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
+
+</details>
 
 打开 http://localhost:8584 访问 WebUI，或直接调用 API：
 
@@ -748,14 +771,16 @@ if (data.success) {
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `query` | `string` | *必填* | 搜索查询或问题 |
-| `paths` | `string[]` | *必填* | 搜索的目录或文件（至少 1 个） |
+| `paths` | `string[]` | *必填* | 搜索的目录或文件（至少 1 个）；未设置时回退到 `SIRCHMUNK_SEARCH_PATHS` |
 | `mode` | `string` | `"FAST"` | `FAST`、`DEEP` 或 `FILENAME_ONLY` |
+| `enable_dir_scan` | `bool` | `true` | 是否启用目录扫描（FAST/DEEP）以发现文件 |
 | `max_depth` | `int` | `null` | 最大目录深度 |
 | `top_k_files` | `int` | `null` | 返回的文件数量 |
+| `max_token_budget` | `int` | `null` | LLM token 预算（DEEP 模式，默认 128K） |
 | `keyword_levels` | `int` | `null` | 关键词粒度层级 |
 | `include_patterns` | `string[]` | `null` | 文件 glob 匹配模式（包含） |
 | `exclude_patterns` | `string[]` | `null` | 文件 glob 匹配模式（排除） |
-| `return_context` | `bool` | `false` | 返回完整的 SearchContext 对象（含 KnowledgeCluster 和遥测数据） |
+| `return_context` | `bool` | `false` | 返回完整 SearchContext（含 KnowledgeCluster 和遥测数据） |
 
 > **注意：** `FILENAME_ONLY` 模式无需 LLM API Key。`FAST` 和 `DEEP` 模式需要配置 LLM。
 
@@ -830,6 +855,7 @@ result = await search.search(
 - [x] 知识结构化与持久化
 - [x] 基于 RAG 的实时对话
 - [x] Web UI 支持
+- [x] 支持多轮对话
 - [ ] Web 搜索集成
 - [ ] 多模态支持（图片、视频）
 - [ ] 分布式跨节点检索

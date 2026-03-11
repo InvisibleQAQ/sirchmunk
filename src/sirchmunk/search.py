@@ -149,10 +149,14 @@ class AgenticSearch(BaseSearch):
         if reuse_knowledge:
             try:
                 from sirchmunk.utils.embedding_util import EmbeddingUtil
-                
-                self.embedding_client = EmbeddingUtil(
-                    cache_dir=str(self.work_path / ".cache" / "models")
+
+                embedding_cache = os.getenv("EMBEDDING_CACHE_DIR")
+                cache_dir = (
+                    embedding_cache
+                    if embedding_cache
+                    else str(self.work_path / ".cache" / "models")
                 )
+                self.embedding_client = EmbeddingUtil(cache_dir=cache_dir)
                 self.embedding_client.start_loading()
                 _loguru_logger.info(
                     "Embedding client created, background model loading started"
