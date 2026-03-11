@@ -1,17 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
 import logging
+import random
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import openai
 from openai import AsyncOpenAI, OpenAI
 
 from sirchmunk.utils import LogCallback, create_logger
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -31,32 +29,96 @@ _RETRYABLE_ERRORS = (
 
 _DEFAULT_MAX_RETRIES = 3
 _DEFAULT_BASE_DELAY = 1.0   # seconds
-_DEFAULT_MAX_DELAY = 10.0   # seconds
+_DEFAULT_MAX_DELAY = 30.0   # seconds
+
+
+# ---------------------------------------------------------------------------
+# Provider capability profiles
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _ProviderProfile:
+    """Capability flags for a known LLM API provider.
+
+    Attributes:
+        name: Human-readable provider identifier.
+        stream_options: Whether ``stream_options: {include_usage: true}`` is
+            accepted.  Providers that reject unknown top-level params should
+            set this to ``False``.
+        thinking_param: ``extra_body`` key to toggle reasoning / thinking mode
+            (e.g. ``"enable_thinking"``).  ``None`` when unsupported.
+        thinking_content_field: Attribute name on the streaming ``delta`` (and
+            non-streaming ``message``) that carries reasoning output.
+            ``None`` when the provider does not expose thinking text.
+    """
+    name: str
+    stream_options: bool = True
+    thinking_param: Optional[str] = None
+    thinking_content_field: Optional[str] = None
+
+
+_PROVIDERS: Dict[str, _ProviderProfile] = {
+    "openai":      _ProviderProfile("openai"),
+    "azure":       _ProviderProfile("azure"),
+    "deepseek":    _ProviderProfile("deepseek",    thinking_param="enable_thinking", thinking_content_field="reasoning_content"),
+    "dashscope":   _ProviderProfile("dashscope",   thinking_param="enable_thinking", thinking_content_field="reasoning_content"),
+    "siliconflow": _ProviderProfile("siliconflow",  thinking_param="enable_thinking", thinking_content_field="reasoning_content"),
+    "volcengine":  _ProviderProfile("volcengine",   thinking_param="enable_thinking", thinking_content_field="reasoning_content"),
+    "gemini":      _ProviderProfile("gemini",       thinking_param="reasoning_effort"),
+    "zhipu":       _ProviderProfile("zhipu",        stream_options=False),
+    "baichuan":    _ProviderProfile("baichuan",     stream_options=False),
+    "moonshot":    _ProviderProfile("moonshot"),
+    "mistral":     _ProviderProfile("mistral"),
+    "yi":          _ProviderProfile("yi"),
+    "together":    _ProviderProfile("together"),
+    "groq":        _ProviderProfile("groq"),
+    "cohere":      _ProviderProfile("cohere"),
+    "minimax":     _ProviderProfile("minimax"),
+}
+
+# URL substring → provider name.  More specific patterns must precede less
+# specific ones (e.g. ``openai.azure.com`` before ``openai.com``).
+_URL_PATTERNS = [
+    ("openai.azure.com",  "azure"),
+    ("openai.com",        "openai"),
+    ("deepseek.com",      "deepseek"),
+    ("dashscope",         "dashscope"),
+    ("bigmodel.cn",       "zhipu"),
+    ("moonshot.cn",       "moonshot"),
+    ("mistral.ai",        "mistral"),
+    ("googleapis.com",    "gemini"),
+    ("lingyiwanwu.com",   "yi"),
+    ("01.ai",             "yi"),
+    ("siliconflow",       "siliconflow"),
+    ("volces.com",        "volcengine"),
+    ("together.xyz",      "together"),
+    ("groq.com",          "groq"),
+    ("cohere",            "cohere"),
+    ("baichuan-ai.com",   "baichuan"),
+    ("minimax",           "minimax"),
+]
+
+_DEFAULT_PROFILE = _ProviderProfile("generic")
 
 
 @dataclass
 class OpenAIChatResponse:
-    """
-    Data class representing the response from the OpenAI Chat API.
-    """
+    """Structured response from an OpenAI-compatible chat completion API."""
+
     content: str
     role: str = "assistant"
     usage: Dict[str, int] = field(default_factory=dict)
-    model: str = None
-    finish_reason: str = None
+    model: Optional[str] = None
+    finish_reason: Optional[str] = None
     logprobs: Any = None
+    thinking_content: Optional[str] = None
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.content
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Convert the response to a dictionary.
-
-        Returns:
-            Dict[str, Any]: The response as a dictionary.
-        """
-        return {
+        """Convert the response to a dictionary."""
+        result: Dict[str, Any] = {
             "content": self.content,
             "role": self.role,
             "usage": self.usage,
@@ -64,11 +126,48 @@ class OpenAIChatResponse:
             "finish_reason": self.finish_reason,
             "logprobs": self.logprobs,
         }
+        if self.thinking_content:
+            result["thinking_content"] = self.thinking_content
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Stream accumulator — deduplicates logic between sync / async paths
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _StreamAccumulator:
+    """Mutable accumulator updated chunk-by-chunk during streaming.
+
+    Using ``list`` + ``join`` for O(n) string assembly instead of
+    repeated ``+=`` concatenation which is O(n²).
+    """
+    content_parts: List[str] = field(default_factory=list)
+    thinking_parts: List[str] = field(default_factory=list)
+    role: str = "assistant"
+    usage: Dict[str, int] = field(default_factory=dict)
+    finish_reason: Optional[str] = None
+    model: str = ""
+
+    def to_response(self) -> OpenAIChatResponse:
+        """Build the final immutable response from accumulated state."""
+        return OpenAIChatResponse(
+            content="".join(self.content_parts),
+            role=self.role,
+            usage=self.usage,
+            model=self.model,
+            finish_reason=self.finish_reason,
+            thinking_content="".join(self.thinking_parts) or None,
+        )
 
 
 class OpenAIChat:
-    """
-    A client for interacting with OpenAI's chat completion API.
+    """Unified client for OpenAI-compatible chat completion APIs.
+
+    Supports all major LLM providers (OpenAI, DeepSeek, DashScope/Qwen,
+    Gemini, Zhipu, Moonshot, Mistral, etc.) through a single interface.
+    Provider-specific capabilities (thinking mode, stream options) are
+    automatically negotiated via :class:`_ProviderProfile`.
     """
 
     def __init__(
@@ -80,31 +179,28 @@ class OpenAIChat:
             max_retries: int = _DEFAULT_MAX_RETRIES,
             retry_base_delay: float = _DEFAULT_BASE_DELAY,
             retry_max_delay: float = _DEFAULT_MAX_DELAY,
+            provider: Optional[str] = None,
             **kwargs,
     ):
-        """
-        Initialize the OpenAIChat client.
+        """Initialize the chat client.
 
         Args:
-            api_key (str): The API key for OpenAI.
-            base_url (str): The base URL for the OpenAI API.
-            model (str): The model to use for chat completions.
-            log_callback (LogCallback): Optional callback for logging.
-            max_retries: Maximum number of retries for transient API errors.
+            api_key: API key for the LLM provider.
+            base_url: Base URL for the API endpoint (OpenAI-compatible).
+            model: Model identifier for chat completions.
+            log_callback: Optional callback for streaming log output.
+            max_retries: Maximum retries for transient API errors.
             retry_base_delay: Initial backoff delay in seconds (doubled each retry).
             retry_max_delay: Upper bound on backoff delay in seconds.
-            **kwargs: Additional keyword arguments passed to the OpenAI client create method.
+            provider: Explicit provider name (e.g. ``"deepseek"``, ``"dashscope"``).
+                Overrides automatic URL-based detection.  Useful when the
+                ``base_url`` points to a proxy / gateway that hides the real
+                provider.
+            **kwargs: Extra keyword arguments forwarded to the API ``create`` call.
         """
         self.base_url = base_url
-        self._client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-        )
-
-        self._async_client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url,
-        )
+        self._client = OpenAI(api_key=api_key, base_url=base_url)
+        self._async_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
         self._model = model
         self._kwargs = kwargs
@@ -112,24 +208,31 @@ class OpenAIChat:
         self._retry_base_delay = retry_base_delay
         self._retry_max_delay = retry_max_delay
 
+        if provider:
+            self._provider = _PROVIDERS.get(provider, _DEFAULT_PROFILE)
+        else:
+            self._provider = self._detect_provider(base_url)
+
         self._logger = create_logger(log_callback=log_callback, enable_async=False)
         self._logger_async = create_logger(log_callback=log_callback, enable_async=True)
 
-    def _detect_provider(self) -> str:
-        url = (self.base_url or "").lower()
+    # ------------------------------------------------------------------
+    # Provider detection & request building
+    # ------------------------------------------------------------------
 
-        if "openai.com" in url:
-            return "openai"
-        elif "anthropic.com" in url:
-            return "anthropic"
-        elif "googleapis.com" in url:
-            return "gemini"
-        elif "deepseek.com" in url:
-            return "deepseek"
-        # Add more provider detections as needed
-        
-        return "openai" # default to OpenAI if unknown
-    
+    @staticmethod
+    def _detect_provider(base_url: str) -> _ProviderProfile:
+        """Detect the LLM provider from *base_url* and return its profile.
+
+        Falls back to ``_DEFAULT_PROFILE`` (safe generic defaults) when the
+        URL does not match any known provider.
+        """
+        url = (base_url or "").lower()
+        for pattern, name in _URL_PATTERNS:
+            if pattern in url:
+                return _PROVIDERS.get(name, _DEFAULT_PROFILE)
+        return _DEFAULT_PROFILE
+
     def _build_request_kwargs(
             self,
             stream: bool,
@@ -138,36 +241,137 @@ class OpenAIChat:
     ) -> Dict[str, Any]:
         """Merge instance-level and call-level kwargs for the API request.
 
-        Precedence (highest wins): call-level kwargs > instance-level self._kwargs.
-        ``extra_body`` dicts are deep-merged so that fields from both levels coexist.
+        Precedence (highest wins): call-level kwargs > instance-level ``_kwargs``.
+        ``extra_body`` dicts are deep-merged so fields from both levels coexist.
+
+        Thinking parameters are **only** injected when the detected provider
+        profile declares support (``thinking_param is not None``), preventing
+        ``400 Bad Request`` errors on providers that reject unknown fields.
         """
         request_kwargs = {**self._kwargs, **kwargs}
-
-        provider = self._detect_provider()
+        profile = self._provider
 
         extra_body = {
             **(self._kwargs.get("extra_body") or {}),
             **(kwargs.get("extra_body") or {}),
         }
 
-        # Add enable_thinking except for OpenAI
-        if enable_thinking is not None and provider not in ("openai", "anthropic"):
-            if provider == "gemini":
+        if enable_thinking is not None and profile.thinking_param:
+            if profile.thinking_param == "reasoning_effort":
                 if enable_thinking:
                     extra_body["reasoning_effort"] = "high"
             else:
-                extra_body["enable_thinking"] = enable_thinking
+                extra_body[profile.thinking_param] = enable_thinking
+
         if extra_body:
             request_kwargs["extra_body"] = extra_body
 
-        if stream and "stream_options" not in request_kwargs:
+        if stream and profile.stream_options and "stream_options" not in request_kwargs:
             request_kwargs["stream_options"] = {"include_usage": True}
 
         return request_kwargs
 
+    # ------------------------------------------------------------------
+    # Response parsing helpers (shared by sync & async paths)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _safe_model_dump(usage_obj: Any) -> Dict[str, int]:
+        """Convert a usage object to a plain dict.
+
+        Handles Pydantic v2 models (``.model_dump()``), Pydantic v1
+        (``.dict()``), raw dicts, and arbitrary objects gracefully.
+        """
+        if usage_obj is None:
+            return {}
+        if isinstance(usage_obj, dict):
+            return usage_obj
+        for method in ("model_dump", "dict"):
+            fn = getattr(usage_obj, method, None)
+            if callable(fn):
+                try:
+                    return fn()
+                except Exception:
+                    pass
+        return vars(usage_obj) if hasattr(usage_obj, "__dict__") else {}
+
+    def _process_stream_chunk(
+            self,
+            chunk: Any,
+            acc: _StreamAccumulator,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Update *acc* with a single stream chunk.
+
+        Returns ``(role_delta, content_delta)`` — either may be ``None``.
+        The caller is responsible for logging these deltas (sync or async).
+        """
+        if chunk.usage:
+            acc.usage = self._safe_model_dump(chunk.usage)
+        if chunk.model:
+            acc.model = chunk.model
+        if not chunk.choices:
+            return None, None
+
+        delta = chunk.choices[0].delta
+        role_delta: Optional[str] = None
+        content_delta: Optional[str] = None
+
+        if delta.role:
+            acc.role = delta.role
+            role_delta = delta.role
+
+        thinking_field = self._provider.thinking_content_field
+        if thinking_field:
+            tc = getattr(delta, thinking_field, None)
+            if tc:
+                acc.thinking_parts.append(tc)
+
+        if delta.content:
+            acc.content_parts.append(delta.content)
+            content_delta = delta.content
+
+        if chunk.choices[0].finish_reason:
+            acc.finish_reason = chunk.choices[0].finish_reason
+
+        return role_delta, content_delta
+
+    def _parse_non_stream_response(self, resp: Any) -> OpenAIChatResponse:
+        """Parse a complete (non-streaming) API response into a response object.
+
+        Includes a guard against empty ``choices`` which some providers
+        return on malformed requests or internal errors.
+        """
+        usage = self._safe_model_dump(resp.usage)
+
+        if not resp.choices:
+            logger.warning("[LLM] API returned empty choices list")
+            return OpenAIChatResponse(
+                content="",
+                model=resp.model or self._model,
+                usage=usage,
+            )
+
+        message = resp.choices[0].message
+        thinking_field = self._provider.thinking_content_field
+        thinking = ""
+        if thinking_field:
+            thinking = getattr(message, thinking_field, "") or ""
+
+        return OpenAIChatResponse(
+            content=message.content or "",
+            role=message.role,
+            usage=usage,
+            model=resp.model or self._model,
+            finish_reason=resp.choices[0].finish_reason,
+            thinking_content=thinking or None,
+        )
+
+    # ------------------------------------------------------------------
+    # Retry infrastructure
+    # ------------------------------------------------------------------
+
     def _backoff_delay(self, attempt: int) -> float:
         """Compute exponential backoff with jitter for retry *attempt* (0-based)."""
-        import random
         delay = min(self._retry_base_delay * (2 ** attempt), self._retry_max_delay)
         return delay * (0.5 + random.random() * 0.5)
 
@@ -232,56 +436,21 @@ class OpenAIChat:
             model=self._model, messages=messages, stream=stream, **request_kwargs
         )
 
-        res_content: str = ""
-        role: str = "assistant"
-        usage: Dict[str, int] = {}
-        finish_reason: str = None
-        response_model: str = self._model
+        if not stream:
+            result = self._parse_non_stream_response(resp)
+            self._logger.info(f"[role={result.role}] {result.content}")
+            return result
 
-        if stream:
-            for chunk in resp:
-                if chunk.usage:
-                    usage = chunk.usage.model_dump()
+        acc = _StreamAccumulator(model=self._model)
+        for chunk in resp:
+            role_delta, content_delta = self._process_stream_chunk(chunk, acc)
+            if role_delta:
+                self._logger.info(f"[role={role_delta}] ", end="", flush=True)
+            if content_delta:
+                self._logger.info(content_delta, end="", flush=True)
+        self._logger.info("", end="\n", flush=True)
 
-                if chunk.model:
-                    response_model = chunk.model
-
-                if not chunk.choices:
-                    continue
-
-                delta = chunk.choices[0].delta
-
-                if delta.role:
-                    role = delta.role
-                    self._logger.info(f"[role={delta.role}] ", end="", flush=True)
-
-                if delta.content:
-                    self._logger.info(delta.content, end="", flush=True)
-                    res_content += delta.content
-
-                if chunk.choices[0].finish_reason:
-                    finish_reason = chunk.choices[0].finish_reason
-
-            self._logger.info("", end="\n", flush=True)
-
-        else:
-            message = resp.choices[0].message
-            res_content = message.content or ""
-            role = message.role
-            finish_reason = resp.choices[0].finish_reason
-            response_model = resp.model
-            if resp.usage:
-                usage = resp.usage.model_dump()
-
-            self._logger.info(f"[role={role}] {res_content}")
-
-        return OpenAIChatResponse(
-            content=res_content,
-            role=role,
-            usage=usage,
-            model=response_model,
-            finish_reason=finish_reason
-        )
+        return acc.to_response()
 
     async def achat(
             self,
@@ -338,53 +507,18 @@ class OpenAIChat:
             model=self._model, messages=messages, stream=stream, **request_kwargs
         )
 
-        res_content: str = ""
-        role: str = "assistant"
-        usage: Dict[str, int] = {}
-        finish_reason: str = None
-        response_model: str = self._model
+        if not stream:
+            result = self._parse_non_stream_response(resp)
+            await self._logger_async.info(f"[role={result.role}] {result.content}")
+            return result
 
-        if stream:
-            async for chunk in resp:
-                if chunk.usage:
-                    usage = chunk.usage.model_dump()
+        acc = _StreamAccumulator(model=self._model)
+        async for chunk in resp:
+            role_delta, content_delta = self._process_stream_chunk(chunk, acc)
+            if role_delta:
+                await self._logger_async.info(f"[role={role_delta}] ", end="", flush=True)
+            if content_delta:
+                await self._logger_async.info(content_delta, end="", flush=True)
+        await self._logger_async.info("", end="\n", flush=True)
 
-                if chunk.model:
-                    response_model = chunk.model
-
-                if not chunk.choices:
-                    continue
-
-                delta = chunk.choices[0].delta
-
-                if delta.role:
-                    role = delta.role
-                    await self._logger_async.info(f"[role={delta.role}] ", end="", flush=True)
-
-                if delta.content:
-                    await self._logger_async.info(delta.content, end="", flush=True)
-                    res_content += delta.content
-
-                if chunk.choices[0].finish_reason:
-                    finish_reason = chunk.choices[0].finish_reason
-
-            await self._logger_async.info("", end="\n", flush=True)
-
-        else:
-            message = resp.choices[0].message
-            res_content = message.content or ""
-            role = message.role
-            finish_reason = resp.choices[0].finish_reason
-            response_model = resp.model
-            if resp.usage:
-                usage = resp.usage.model_dump()
-
-            await self._logger_async.info(f"[role={role}] {res_content}")
-
-        return OpenAIChatResponse(
-            content=res_content,
-            role=role,
-            usage=usage,
-            model=response_model,
-            finish_reason=finish_reason
-        )
+        return acc.to_response()
