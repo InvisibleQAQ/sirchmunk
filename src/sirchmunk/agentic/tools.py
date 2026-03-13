@@ -268,11 +268,30 @@ class KeywordSearchTool(BaseTool):
 
         context.add_search(" ".join(keywords))
 
-        # Strategy 1: per-keyword literal search (safe for metacharacters,
-        # avoids the `-F` + `|` bug where rga treats `|` literally)
-        results = await self._do_search_per_term(keywords, literal=True, regex=False)
+        # Progressive relaxation: compound phrases first (high precision),
+        # then individual terms only if phrases yield too few results.
+        phrases = [k for k in keywords if " " in k.strip()]
+        singles = [k for k in keywords if " " not in k.strip()]
 
-        # Strategy 2: escaped-regex OR search (single rga call, handles
+        results: List[Dict[str, Any]] = []
+
+        # Phase A: search compound phrases first (e.g. "Tivoli Gardens")
+        if phrases:
+            results = await self._do_search_per_term(phrases, literal=True, regex=False)
+
+        # Phase B: add singles only when phrase hits are insufficient
+        if len(results) < 3 and singles:
+            extra = await self._do_search_per_term(singles, literal=True, regex=False)
+            if extra:
+                results = self._retriever.merge_results(
+                    results + extra, limit=self._max_results * 2,
+                )
+
+        # Phase C: if nothing found at all, try all keywords together
+        if not results:
+            results = await self._do_search_per_term(keywords, literal=True, regex=False)
+
+        # Phase D: escaped-regex OR search (single rga call, handles
         # adapters that only work in regex mode — e.g. some PDF/DOCX)
         if not results:
             logger.info("[keyword_search] Literal per-term empty, trying escaped regex OR")
@@ -309,13 +328,15 @@ class KeywordSearchTool(BaseTool):
 
         # Approximate token count (~4 chars per token)
         approx_tokens = total_chars // 4
-        discovered_paths = list(deduped.keys())
+        # Only report the top-N files (same as snippet output) to avoid
+        # flooding downstream phases with thousands of low-relevance paths.
+        discovered_paths = list(deduped.keys())[: self._max_results]
         context.add_log(
             tool_name=self.name,
             tokens=approx_tokens,
             metadata={
                 "keywords": keywords,
-                "files_found": len(discovered_paths),
+                "files_found": len(deduped),
                 "files_discovered": discovered_paths,
             },
         )

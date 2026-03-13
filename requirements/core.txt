@@ -19,3 +19,4 @@ python-docx
 openpyxl
 python-pptx
 charset-normalizer
+bm25s

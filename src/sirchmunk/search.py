@@ -903,7 +903,7 @@ class AgenticSearch(BaseSearch):
         paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
         *,
         mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = "FAST",
-        max_loops: int = 10,
+        max_loops: int = 5,
         max_token_budget: int = 128000,
         max_depth: Optional[int] = 5,
         top_k_files: int = 5,
@@ -980,7 +980,7 @@ class AgenticSearch(BaseSearch):
             paths: Directories / files to search.  Falls back to
                 ``self.paths`` or the current working directory.
             mode: Search mode — ``"DEEP"``, ``"FAST"``, or ``"FILENAME_ONLY"``.
-            max_loops: Maximum ReAct iterations (DEEP mode, default: 10).
+            max_loops: Maximum ReAct iterations (DEEP mode, default: 5).
             max_token_budget: LLM token budget (DEEP mode, default: 128000).
             max_depth: Maximum directory depth for file search (default: 5).
                 Used in both FILENAME_ONLY and DEEP modes.
@@ -1072,7 +1072,7 @@ class AgenticSearch(BaseSearch):
         query: str,
         paths: List[str],
         *,
-        max_loops: int = 10,
+        max_loops: int = 5,
         max_token_budget: int = 128000,
         max_depth: Optional[int] = 5,
         top_k_files: int = 5,
@@ -1195,12 +1195,38 @@ class AgenticSearch(BaseSearch):
         )
         await self._logger.info(f"[Phase 3] Merged {len(merged_files)} unique candidate files")
 
+        # BM25 rerank: when candidates far exceed top_k_files, use BM25
+        # scoring to pick the most query-relevant files before the
+        # expensive Monte Carlo evidence extraction.
+        if len(merged_files) > top_k_files * 2:
+            reranked = await asyncio.get_event_loop().run_in_executor(
+                None,
+                self._bm25_rerank_files,
+                query, merged_files, top_k_files * 2,
+            )
+            if reranked is not None:
+                await self._logger.info(
+                    f"[Phase 3] BM25 reranked {len(merged_files)} -> {len(reranked)} files"
+                )
+                merged_files = reranked
+
         cluster: Optional[KnowledgeCluster] = None
         if merged_files:
             cluster = await self._build_cluster(
                 query=query, file_paths=merged_files,
                 query_keywords=query_keywords, top_k_files=top_k_files,
             )
+
+        # Sync file paths into context so callers can see what was read.
+        # _build_cluster delegates to knowledge_base.build() which reads
+        # files internally but doesn't populate context.read_file_ids.
+        for fp in merged_files[:top_k_files]:
+            context.mark_file_read(fp)
+        if cluster:
+            for ev in getattr(cluster, "evidences", []):
+                fp = str(getattr(ev, "file_or_url", ""))
+                if fp:
+                    context.mark_file_read(fp)
 
         # ==============================================================
         # Phase 4: Generate answer — cluster summary or ReAct refinement
@@ -2157,6 +2183,45 @@ class AgenticSearch(BaseSearch):
     # Phase 2 retrievers
     # ------------------------------------------------------------------
 
+    # High-frequency English words with near-zero discriminative power in
+    # large encyclopaedic corpora.  Kept compact — only words that cause
+    # catastrophic recall explosion (>1000 files) in a Wikipedia-scale corpus.
+    _HIGH_FREQ_STOPWORDS: set = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+        "should", "may", "might", "can", "could", "must",
+        "and", "or", "but", "if", "of", "at", "by", "for", "with", "about",
+        "to", "from", "in", "on", "into", "through", "during", "before",
+        "after", "above", "below", "between", "out", "off", "over", "under",
+        "not", "no", "nor", "so", "too", "very", "just", "also",
+        "it", "its", "he", "she", "they", "them", "his", "her", "their",
+        "this", "that", "these", "those", "what", "which", "who", "whom",
+        "how", "when", "where", "why",
+        "all", "each", "every", "both", "few", "more", "most", "other",
+        "some", "such", "only", "own", "same", "than", "then",
+        "first", "last", "new", "old", "one", "two", "three",
+        "known", "used", "made", "many", "much", "well", "part",
+        "based", "found", "located", "born", "died", "became", "called",
+        "named", "published", "founded", "including", "according",
+    }
+
+    @staticmethod
+    def _filter_keywords(keywords: List[str], stopwords: set) -> List[str]:
+        """Remove high-frequency words that cause recall explosion.
+
+        Keeps multi-word phrases intact (they have higher discriminative
+        power). Only filters single-word keywords that appear in the
+        stopword set.
+        """
+        filtered = []
+        for kw in keywords:
+            words = kw.strip().split()
+            if len(words) > 1:
+                filtered.append(kw)
+            elif words and words[0].lower() not in stopwords:
+                filtered.append(kw)
+        return filtered
+
     async def _retrieve_by_keywords(
         self,
         keywords: List[str],
@@ -2167,9 +2232,17 @@ class AgenticSearch(BaseSearch):
     ) -> List[str]:
         """Run keyword search via rga and return discovered file paths.
 
-        Each keyword is searched concurrently (literal per-term strategy).
+        Filters out high-frequency words before searching to avoid
+        recall explosion on large corpora.
         """
         from sirchmunk.agentic.tools import KeywordSearchTool
+
+        filtered = self._filter_keywords(keywords, self._HIGH_FREQ_STOPWORDS)
+        if not filtered:
+            await self._logger.warning(
+                f"[Retrieve:Keywords] All keywords filtered as high-freq: {keywords}"
+            )
+            filtered = keywords[:2]
 
         tool = KeywordSearchTool(
             retriever=self.grep_retriever,
@@ -2179,8 +2252,8 @@ class AgenticSearch(BaseSearch):
             include=include,
             exclude=exclude,
         )
-        ctx = SearchContext()  # lightweight context for this probe
-        result_text, meta = await tool.execute(context=ctx, keywords=keywords)
+        ctx = SearchContext()
+        result_text, meta = await tool.execute(context=ctx, keywords=filtered)
 
         # Extract discovered file paths from the tool's context logs
         discovered: List[str] = []
@@ -2274,6 +2347,96 @@ class AgenticSearch(BaseSearch):
 
         return merged
 
+    @staticmethod
+    def _bm25_rerank_files(
+        query: str,
+        file_paths: List[str],
+        top_k: int = 10,
+    ) -> Optional[List[str]]:
+        """Use BM25 to rerank candidate files by query relevance.
+
+        Reads first 2000 chars of each file as document representation,
+        scores them against the query using bm25s, and returns the
+        top-k most relevant file paths.  Falls back to None on error
+        (caller should keep the original list).
+        """
+        try:
+            import bm25s
+        except ImportError:
+            return None
+
+        from pathlib import Path as _P
+
+        docs: List[str] = []
+        valid_paths: List[str] = []
+        for fp in file_paths:
+            try:
+                text = _P(fp).read_text(encoding="utf-8", errors="ignore")[:2000]
+                if text.strip():
+                    docs.append(text)
+                    valid_paths.append(fp)
+            except Exception:
+                continue
+
+        if len(docs) < 2:
+            return None
+
+        try:
+            corpus_tokens = bm25s.tokenize(docs, stopwords="en")
+            retriever = bm25s.BM25()
+            retriever.index(corpus_tokens)
+
+            query_tokens = bm25s.tokenize([query], stopwords="en")
+            k = min(top_k, len(docs))
+            results, scores = retriever.retrieve(query_tokens, k=k)
+
+            reranked: List[str] = []
+            for idx in results[0]:
+                if 0 <= idx < len(valid_paths):
+                    reranked.append(valid_paths[idx])
+            return reranked if reranked else None
+        except Exception:
+            return None
+
+    # Large-file threshold (chars): files above this size trigger
+    # keyword-guided snippet extraction before Monte Carlo sampling.
+    _SNIPPET_EXTRACTION_THRESHOLD = 30_000
+
+    @staticmethod
+    def _extract_keyword_snippets(
+        file_path: str,
+        keywords: Dict[str, float],
+        max_snippet_chars: int = 20_000,
+    ) -> Optional[str]:
+        """Extract keyword-relevant lines from a large file.
+
+        For wiki-style files (one JSON article per line), only keeps lines
+        that contain at least one keyword.  Returns None when the file is
+        small enough to process whole or when no keyword matches.
+        """
+        try:
+            from pathlib import Path as _P
+            raw = _P(file_path).read_text(encoding="utf-8", errors="ignore")
+            if len(raw) <= AgenticSearch._SNIPPET_EXTRACTION_THRESHOLD:
+                return None
+
+            kw_lower = [k.lower() for k in keywords]
+            matched_lines = []
+            total_chars = 0
+            for line in raw.splitlines():
+                ll = line.lower()
+                if any(k in ll for k in kw_lower):
+                    matched_lines.append(line)
+                    total_chars += len(line)
+                    if total_chars >= max_snippet_chars:
+                        break
+
+            if not matched_lines:
+                return None
+            return "\n".join(matched_lines)
+        except Exception:
+            return None
+
     async def _build_cluster(
         self,
         query: str,
@@ -2284,9 +2447,11 @@ class AgenticSearch(BaseSearch):
     ) -> Optional[KnowledgeCluster]:
         """Build a KnowledgeCluster via knowledge_base.build().
 
-        Constructs the Request wrapper and delegates to the knowledge
-        base for parallel Monte Carlo evidence sampling.
+        For very large files (>30 KB), pre-extracts keyword-matching
+        snippets to reduce token waste in Monte Carlo sampling.
         """
+        import tempfile
+
         try:
             request = Request(
                 messages=[
@@ -2296,7 +2461,26 @@ class AgenticSearch(BaseSearch):
                     ),
                 ],
             )
-            retrieved_infos = [{"path": fp} for fp in file_paths]
+
+            # Pre-filter: for oversized files, write keyword-matched
+            # snippets to a temp file so the Monte Carlo sampler sees
+            # only relevant content instead of the entire 90 KB wiki dump.
+            effective_paths: List[str] = []
+            temp_files: List[str] = []
+            for fp in file_paths:
+                snippet_text = self._extract_keyword_snippets(fp, query_keywords)
+                if snippet_text:
+                    tf = tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".txt", delete=False, encoding="utf-8",
+                    )
+                    tf.write(snippet_text)
+                    tf.close()
+                    effective_paths.append(tf.name)
+                    temp_files.append(tf.name)
+                else:
+                    effective_paths.append(fp)
+
+            retrieved_infos = [{"path": fp} for fp in effective_paths]
 
             cluster = await self.knowledge_base.build(
                 request=request,
@@ -2309,7 +2493,21 @@ class AgenticSearch(BaseSearch):
             self.llm_usages.extend(self.knowledge_base.llm_usages)
             self.knowledge_base.llm_usages.clear()
 
+            # Clean up temp files
+            for tf_path in temp_files:
+                try:
+                    os.remove(tf_path)
+                except OSError:
+                    pass
+
             if cluster:
+                # Restore original file paths in evidence units
+                for ev in getattr(cluster, "evidences", []):
+                    for orig_fp, eff_fp in zip(file_paths, effective_paths):
+                        if str(getattr(ev, "file_or_url", "")) == eff_fp and eff_fp != orig_fp:
+                            ev.file_or_url = Path(orig_fp)
+                            break
+
                 await self._logger.success(
                     f"[Phase 3] KnowledgeCluster built: {cluster.name} "
                     f"({len(cluster.evidences)} evidence units)"

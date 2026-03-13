@@ -81,27 +81,35 @@ class MonteCarloEvidenceSampling:
         self.doc_len = len(doc_content)
         self.verbose = verbose
 
-        self.max_rounds = 3
-        # Size of each probe sampling window
-        self.probe_window = 500
-        # Size of the final expanded context
-        self.roi_window = 2000
+        # Adaptive configuration: for smaller documents (already
+        # keyword-filtered), use fewer rounds and larger windows
+        # to save LLM calls while maintaining recall.
+        if self.doc_len <= 5_000:
+            self.max_rounds = 1
+            self.probe_window = min(1500, self.doc_len)
+            self.roi_window = self.doc_len
+            self.fuzz_candidates_num = 3
+            self.random_exploration_num = 1
+            self.samples_per_round = 2
+        elif self.doc_len <= 20_000:
+            self.max_rounds = 2
+            self.probe_window = 800
+            self.roi_window = 2500
+            self.fuzz_candidates_num = 4
+            self.random_exploration_num = 1
+            self.samples_per_round = 3
+        else:
+            self.max_rounds = 3
+            self.probe_window = 500
+            self.roi_window = 2000
+            self.fuzz_candidates_num = 5
+            self.random_exploration_num = 2
+            self.samples_per_round = 5
 
-        # ---Sampling Configuration--- #
-        # Number of anchors from Fuzz
-        self.fuzz_candidates_num = 5
-        # Number of random points for exploration
-        self.random_exploration_num = 2
-        # Samples per round for Gaussian sampling
-        self.samples_per_round = 5
-        # Top K samples to keep as seeds for next round
         self.top_k_seeds = 2
-
         self.visited_starts: Set[int] = set()
         
-        # Create bound logger with callback - returns AsyncLogger instance
         self._log = create_logger(log_callback=log_callback)
-
         self.llm_usages: List[Dict[str, Any]] = []
 
     def _get_content(self, start: int) -> Tuple[int, int, str]:
@@ -398,8 +406,6 @@ class MonteCarloEvidenceSampling:
 
             if r == 1:
                 # === Strategy: Fuzz Anchors + Random Supplement ===
-                # 1. Get Fuzz Anchors (Exploitation)
-                # Note: Now async to support log callback
                 fuzz_samples = await self._get_fuzzy_anchors(
                     query=query,
                     keywords=list(keywords.keys()),
@@ -407,17 +413,24 @@ class MonteCarloEvidenceSampling:
                 )
                 current_samples.extend(fuzz_samples)
 
-                # 2. Supplement with Random Sampling (Exploration)
+                # Only add random exploration when fuzz anchors are weak or absent
+                best_fuzz = max((s.fuzz_score for s in fuzz_samples), default=0)
                 needed_random = self.random_exploration_num
                 if len(fuzz_samples) == 0:
-                    needed_random += 3  # Downgrade to random mode
+                    needed_random += 3
+                elif best_fuzz >= 70.0:
+                    needed_random = 0  # strong anchors, skip random noise
 
-                random_samples = self._sample_stratified_supplement(needed_random)
-                current_samples.extend(random_samples)
+                if needed_random > 0:
+                    random_samples = self._sample_stratified_supplement(needed_random)
+                    current_samples.extend(random_samples)
+                else:
+                    random_samples = []
 
                 if self.verbose:
                     await self._log.info(
-                        f"Sampling Distribution: Fuzz Anchors={len(fuzz_samples)}, Random Exploration={len(random_samples)}"
+                        f"Sampling Distribution: Fuzz Anchors={len(fuzz_samples)} "
+                        f"(best={best_fuzz:.0f}), Random Exploration={len(random_samples)}"
                     )
 
             else:
@@ -455,11 +468,22 @@ class MonteCarloEvidenceSampling:
             all_candidates.sort(key=lambda x: x.score, reverse=True)
             top_seeds = all_candidates[: self.top_k_seeds]
 
-            # Early stopping check
-            if top_seeds and top_seeds[0].score >= confidence_threshold:
+            # Early stopping: stop when best score meets confidence threshold,
+            # or when round 1 produces a "good enough" result (score >= 7)
+            # to avoid expensive Gaussian refinement rounds.
+            best_score_so_far = top_seeds[0].score if top_seeds else 0.0
+            if best_score_so_far >= confidence_threshold:
                 if self.verbose:
                     await self._log.info(
-                        f"High confidence target found (Score >= {confidence_threshold}), stopping early."
+                        f"High confidence target found (Score={best_score_so_far:.1f} "
+                        f">= {confidence_threshold}), stopping early."
+                    )
+                break
+            if r == 1 and best_score_so_far >= 7.0 and len(all_candidates) >= 2:
+                if self.verbose:
+                    await self._log.info(
+                        f"Good enough evidence after round 1 (Score={best_score_so_far:.1f}), "
+                        f"skipping Gaussian refinement."
                     )
                 break
 

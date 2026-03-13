@@ -130,7 +130,7 @@ class ReActSearchAgent:
         self,
         llm: OpenAIChat,
         tool_registry: ToolRegistry,
-        max_loops: int = 10,
+        max_loops: int = 5,
         max_token_budget: int = 64000,
         log_callback: LogCallback = None,
     ) -> None:
