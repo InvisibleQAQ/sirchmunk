@@ -66,10 +66,20 @@ class FeedbackMemory(MemoryStore):
 
     def _ensure_columns(self) -> None:
         """Add columns that were introduced after initial table creation."""
+        try:
+            existing = {
+                c["column_name"]
+                for c in self._db.get_table_info("signals")
+            }
+        except Exception:
+            existing = set()
+
         for col, dtype in [
             ("answer_text", "VARCHAR DEFAULT ''"),
             ("files_discovered_json", "VARCHAR DEFAULT '[]'"),
         ]:
+            if col in existing:
+                continue
             try:
                 self._db.execute(
                     f"ALTER TABLE signals ADD COLUMN {col} {dtype}"

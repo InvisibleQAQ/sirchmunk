@@ -845,6 +845,17 @@ class AgenticSearch(BaseSearch):
 
         return keyword_sets
 
+    _TEMPLATE_PLACEHOLDERS = frozenset({
+        "keyword1", "keyword2", "keyword3",
+        "translated_keyword1", "translated_keyword2", "translated_keyword3",
+        "idf_value",
+    })
+
+    @classmethod
+    def _is_placeholder(cls, term: str) -> bool:
+        """True if *term* is a prompt-template placeholder, not a real keyword."""
+        return term.lower().strip('"') in cls._TEMPLATE_PLACEHOLDERS
+
     @staticmethod
     def _extract_alt_keywords(llm_resp: str) -> Dict[str, float]:
         """Extract cross-lingual keywords from ``<KEYWORDS_ALT>`` block."""
@@ -855,15 +866,57 @@ class AgenticSearch(BaseSearch):
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, dict):
-                return {k: float(v) for k, v in parsed.items() if isinstance(k, str)}
+                return {
+                    k: float(v) for k, v in parsed.items()
+                    if isinstance(k, str) and not AgenticSearch._is_placeholder(k)
+                }
         except (json.JSONDecodeError, TypeError, ValueError):
             try:
                 parsed = ast.literal_eval(raw)
                 if isinstance(parsed, dict):
-                    return {k: float(v) for k, v in parsed.items() if isinstance(k, str)}
+                    return {
+                        k: float(v) for k, v in parsed.items()
+                        if isinstance(k, str) and not AgenticSearch._is_placeholder(k)
+                    }
             except Exception:
                 pass
         return {}
+
+    @staticmethod
+    def _fallback_query_keywords(query: str) -> Dict[str, float]:
+        """Heuristic keyword extraction when LLM extraction fails.
+
+        Extracts capitalized named entities and non-stop content words
+        directly from the query.  Avoids the expensive ReAct fallback
+        for every query when the LLM prompt format is incompatible.
+        """
+        import re as _re
+        _STOP = frozenset({
+            "the", "a", "an", "is", "are", "was", "were", "be", "been",
+            "have", "has", "had", "do", "does", "did", "will", "would",
+            "can", "could", "may", "might", "shall", "should", "must",
+            "of", "in", "to", "for", "with", "on", "at", "from", "by",
+            "about", "as", "into", "through", "during", "before", "after",
+            "and", "but", "or", "not", "so", "yet", "both", "also",
+            "what", "which", "who", "where", "when", "how", "that",
+            "this", "it", "its", "than", "between", "out",
+        })
+        kw: Dict[str, float] = {}
+
+        named = _re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", query)
+        for name in named:
+            if name.lower() not in _STOP:
+                kw[name] = 7.0
+
+        words = query.split()
+        for w in words:
+            clean = _re.sub(r"[^\w]", "", w)
+            if not clean or len(clean) < 3 or clean.lower() in _STOP:
+                continue
+            if clean not in kw:
+                kw[clean] = 5.0
+
+        return kw
 
     # ------------------------------------------------------------------
     # Agentic (ReAct) infrastructure — lazy initialisation
@@ -2238,6 +2291,7 @@ class AgenticSearch(BaseSearch):
 
         Also extracts cross-lingual alternative keywords from the
         ``<KEYWORDS_ALT>`` block and merges them into the result list.
+        Falls back to heuristic extraction if LLM output is unparseable.
 
         Returns:
             Tuple of (keyword_idf_dict, keyword_list).
@@ -2256,6 +2310,12 @@ class AgenticSearch(BaseSearch):
             kw_response.content, num_levels=2,
         )
 
+        # Filter out template placeholders from all keyword sets
+        keyword_sets = [
+            {k: v for k, v in ks.items() if not self._is_placeholder(k)}
+            for ks in keyword_sets
+        ]
+
         alt_keywords = self._extract_alt_keywords(kw_response.content)
         if alt_keywords:
             await self._logger.info(f"[Probe:Keywords] Cross-lingual alt: {list(alt_keywords.keys())}")
@@ -2269,6 +2329,14 @@ class AgenticSearch(BaseSearch):
 
         if alt_keywords:
             return alt_keywords, list(alt_keywords.keys())
+
+        # Heuristic fallback: extract keywords directly from the query
+        # to avoid falling through to slow ReAct for every question.
+        fallback = self._fallback_query_keywords(query)
+        if fallback:
+            kw_list = list(fallback.keys())
+            await self._logger.info(f"[Probe:Keywords] Heuristic fallback: {kw_list}")
+            return fallback, kw_list
 
         return {}, []
 
