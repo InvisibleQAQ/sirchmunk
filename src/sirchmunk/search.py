@@ -215,7 +215,10 @@ class AgenticSearch(BaseSearch):
             # 4. Self-evolving retrieval memory
             try:
                 from sirchmunk.memory import RetrievalMemory
-                self._memory = RetrievalMemory(work_path=str(self.work_path))
+                self._memory = RetrievalMemory(
+                    work_path=str(self.work_path),
+                    embedding_util=self.embedding_client,
+                )
             except Exception as exc:
                 _loguru_logger.info(f"[warmup] Retrieval memory not available: {exc}")
 
@@ -1073,7 +1076,9 @@ class AgenticSearch(BaseSearch):
                 return ctx
             return msg
 
-        # ---- Memory: strategy hint (zero-LLM, ~0 ms) ----
+        # ---- Memory: strategy hint + similar-query transfer (zero-LLM) ----
+        _memory_extra_files: List[str] = []
+        _memory_extra_keywords: List[str] = []
         if self._memory and mode != "FILENAME_ONLY":
             try:
                 hint = self._memory.suggest_strategy(query)
@@ -1086,6 +1091,14 @@ class AgenticSearch(BaseSearch):
                         max_loops = hint.max_loops
                     if hint.enable_dir_scan is not None:
                         enable_dir_scan = hint.enable_dir_scan
+            except Exception:
+                pass
+            try:
+                sim_hints = self._memory.get_similar_query_hints(query, top_k=3)
+                for sh in sim_hints:
+                    if sh.confidence >= 0.5:
+                        _memory_extra_files.extend(sh.useful_files[:5])
+                        _memory_extra_keywords.extend(sh.keywords[:5])
             except Exception:
                 pass
 
@@ -1223,6 +1236,24 @@ class AgenticSearch(BaseSearch):
                 query_keywords = self._memory.expand_keywords(query_keywords)
             except Exception:
                 pass
+            try:
+                clean_kws = self._memory.filter_noise_keywords(
+                    list(query_keywords.keys())
+                )
+                if clean_kws:
+                    query_keywords = {
+                        k: v for k, v in query_keywords.items()
+                        if k in clean_kws
+                    }
+                    initial_keywords = [
+                        k for k in initial_keywords if k in clean_kws
+                    ]
+            except Exception:
+                pass
+            # Merge similar-query keywords from memory hints
+            for mk in _memory_extra_keywords:
+                if mk and mk not in query_keywords:
+                    query_keywords[mk] = 0.3
 
         await self._logger.info(
             f"[Phase 1] Results: keywords={len(initial_keywords)}, "
@@ -1279,18 +1310,20 @@ class AgenticSearch(BaseSearch):
         memory_paths: List[str] = []
         if self._memory and query_keywords:
             try:
-                entities = [
-                    k for k in query_keywords
-                    if k and len(k) > 1 and k[0].isupper()
-                ]
+                entities = self._memory.extract_entities(
+                    list(query_keywords.keys())
+                )
                 memory_paths = self._memory.get_entity_paths(entities)
             except Exception:
                 pass
 
+        # Merge similar-query file hints from memory
+        all_extra = list(set(memory_paths + _memory_extra_files))
+
         merged_files = self._merge_file_paths(
             keyword_files=keyword_files,
             dir_scan_files=dir_scan_files,
-            knowledge_hits=knowledge_hits + memory_paths,
+            knowledge_hits=knowledge_hits + all_extra,
         )
         await self._logger.info(f"[Phase 3] Merged {len(merged_files)} unique candidate files")
 
@@ -1298,6 +1331,14 @@ class AgenticSearch(BaseSearch):
         if self._memory and merged_files:
             try:
                 merged_files = self._memory.filter_dead_paths(merged_files)
+            except Exception:
+                pass
+
+        # Memory: boost hot paths during BM25 reranking
+        _path_boost: Dict[str, float] = {}
+        if self._memory and merged_files:
+            try:
+                _path_boost = self._memory.get_path_scores(merged_files)
             except Exception:
                 pass
 
@@ -1416,21 +1457,29 @@ class AgenticSearch(BaseSearch):
                        if context.start_time.tzinfo is None
                        else context.start_time)
                 ).total_seconds()
+                _discovered = list(set(
+                    keyword_files + dir_scan_files + all_extra
+                ))
                 signal = FeedbackSignal(
                     query=query,
                     mode="DEEP",
                     answer_found=bool(answer and answer.strip()),
+                    answer_text=(answer or "")[:2000],
                     cluster_confidence=(
                         getattr(cluster, "confidence", 0.0)
                         if cluster else 0.0
                     ),
                     react_loops=context.loop_count,
                     files_read_count=len(context.read_file_ids),
+                    files_useful_count=len(
+                        context.read_file_ids
+                    ) if (answer and answer.strip()) else 0,
                     total_tokens=context.total_llm_tokens,
                     latency_sec=elapsed,
                     keywords_used=list(query_keywords.keys()) if query_keywords else [],
                     paths_searched=paths,
                     files_read=list(context.read_file_ids),
+                    files_discovered=_discovered,
                 )
                 asyncio.ensure_future(self._memory.record_feedback(signal))
             except Exception:
@@ -1935,12 +1984,17 @@ class AgenticSearch(BaseSearch):
                     query=query,
                     mode="FAST",
                     answer_found=bool(answer and answer.strip()),
+                    answer_text=(answer or "")[:2000],
                     files_read_count=len(context.read_file_ids),
+                    files_useful_count=len(
+                        context.read_file_ids
+                    ) if (answer and answer.strip()) else 0,
                     total_tokens=context.total_llm_tokens,
                     latency_sec=elapsed,
                     keywords_used=keywords_used,
                     paths_searched=paths,
                     files_read=list(context.read_file_ids),
+                    files_discovered=[file_path] if file_path else [],
                 )
                 asyncio.ensure_future(self._memory.record_feedback(signal))
             except Exception:

@@ -38,12 +38,14 @@ class FeedbackMemory(MemoryStore):
 
     def initialize(self) -> None:
         if self._db.table_exists("signals"):
+            self._ensure_columns()
             return
         self._db.create_table("signals", {
             "id": "VARCHAR PRIMARY KEY",
             "signal_type": "VARCHAR NOT NULL",
             "query": "VARCHAR NOT NULL",
             "answer_found": "BOOLEAN DEFAULT FALSE",
+            "answer_text": "VARCHAR DEFAULT ''",
             "cluster_confidence": "FLOAT DEFAULT 0.0",
             "react_loops": "INTEGER DEFAULT 0",
             "files_read_count": "INTEGER DEFAULT 0",
@@ -54,12 +56,26 @@ class FeedbackMemory(MemoryStore):
             "keywords_json": "VARCHAR DEFAULT '[]'",
             "paths_json": "VARCHAR DEFAULT '[]'",
             "files_read_json": "VARCHAR DEFAULT '[]'",
+            "files_discovered_json": "VARCHAR DEFAULT '[]'",
             "user_verdict": "VARCHAR",
             "em_score": "FLOAT",
             "f1_score": "FLOAT",
             "llm_judge_verdict": "VARCHAR",
             "timestamp": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         })
+
+    def _ensure_columns(self) -> None:
+        """Add columns that were introduced after initial table creation."""
+        for col, dtype in [
+            ("answer_text", "VARCHAR DEFAULT ''"),
+            ("files_discovered_json", "VARCHAR DEFAULT '[]'"),
+        ]:
+            try:
+                self._db.execute(
+                    f"ALTER TABLE signals ADD COLUMN {col} {dtype}"
+                )
+            except Exception:
+                pass
 
     def decay(self, now: Optional[datetime] = None) -> int:
         return 0
@@ -114,6 +130,7 @@ class FeedbackMemory(MemoryStore):
                 "signal_type": signal.signal_type,
                 "query": signal.query,
                 "answer_found": signal.answer_found,
+                "answer_text": (signal.answer_text or "")[:2000],
                 "cluster_confidence": signal.cluster_confidence,
                 "react_loops": signal.react_loops,
                 "files_read_count": signal.files_read_count,
@@ -130,6 +147,9 @@ class FeedbackMemory(MemoryStore):
                 "files_read_json": json.dumps(
                     signal.files_read, ensure_ascii=False
                 ),
+                "files_discovered_json": json.dumps(
+                    signal.files_discovered, ensure_ascii=False
+                ),
                 "user_verdict": signal.user_verdict,
                 "em_score": signal.em_score,
                 "f1_score": signal.f1_score,
@@ -138,6 +158,37 @@ class FeedbackMemory(MemoryStore):
             })
         except Exception as exc:
             logger.debug(f"FeedbackMemory: record failed: {exc}")
+
+    def inject_evaluation(
+        self,
+        query: str,
+        em_score: float,
+        f1_score: float,
+        llm_judge_verdict: Optional[str] = None,
+    ) -> bool:
+        """Back-fill evaluation scores on the most recent signal for *query*.
+
+        Returns True if a row was updated.
+        """
+        try:
+            row = self._db.fetch_one(
+                "SELECT id FROM signals WHERE query = ? "
+                "ORDER BY timestamp DESC LIMIT 1",
+                [query],
+            )
+            if not row:
+                return False
+            updates: Dict[str, Any] = {
+                "em_score": em_score,
+                "f1_score": f1_score,
+            }
+            if llm_judge_verdict is not None:
+                updates["llm_judge_verdict"] = llm_judge_verdict
+            self._db.update_data("signals", updates, "id = ?", [row[0]])
+            return True
+        except Exception as exc:
+            logger.debug(f"FeedbackMemory: inject_evaluation failed: {exc}")
+            return False
 
     def recent_signals(
         self,

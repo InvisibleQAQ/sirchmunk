@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -209,7 +210,8 @@ class PatternMemory(MemoryStore):
 
         Supports both English and Chinese queries.
 
-        Returns dict with ``query_type``, ``complexity``, ``entity_types``.
+        Returns dict with ``query_type``, ``complexity``, ``entity_types``,
+        ``entity_count``, and ``hop_hint``.
         """
         q_lower = query.lower().strip()
         words = q_lower.split()
@@ -257,42 +259,86 @@ class PatternMemory(MemoryStore):
             else:
                 complexity = "complex"
 
-        # --- Entity types ---
+        # --- Entity types + entity count ---
         entity_types: List[str] = []
-        if re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", query):
+        entity_count = 0
+
+        en_named = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", query)
+        if en_named:
             entity_types.append("named_entity")
+            entity_count += len(en_named)
+
         if re.search(r"\b\d{4}\b", query):
             entity_types.append("date")
+            entity_count += len(re.findall(r"\b\d{4}\b", query))
+
         if re.search(r"\b(?:city|country|state|river|mountain)\b", q_lower):
             entity_types.append("location")
-        if has_cjk and re.search(
-            r"[\u4e00-\u9fff]{2,}(?:市|省|县|国|河|山|湖)", query,
-        ):
-            entity_types.append("location")
+
+        if has_cjk:
+            cjk_entities = re.findall(
+                r"[\u4e00-\u9fff]{2,}(?:市|省|县|国|河|山|湖)", query,
+            )
+            if cjk_entities:
+                if "location" not in entity_types:
+                    entity_types.append("location")
+                entity_count += len(cjk_entities)
+            cjk_names = re.findall(r"《[^》]+》", query)
+            if cjk_names:
+                entity_types.append("title")
+                entity_count += len(cjk_names)
+
+        # Bucket entity_count for stable hashing
+        ec_bucket = min(entity_count, 3)
+
+        # --- Hop hint ---
+        hop_hint = "single"
+        if query_type == "comparison" or entity_count >= 2:
+            hop_hint = "multi"
+        elif query_type == "bridge":
+            hop_hint = "multi" if entity_count >= 1 else "single"
 
         return {
             "query_type": query_type,
             "complexity": complexity,
             "entity_types": entity_types,
+            "entity_count": ec_bucket,
+            "hop_hint": hop_hint,
         }
 
     # ── Public API ────────────────────────────────────────────────────
 
     def suggest_strategy(self, query: str) -> Optional[StrategyHint]:
-        """Return a strategy hint if a confident pattern exists."""
+        """Return a strategy hint via Thompson Sampling.
+
+        When the exact pattern has enough samples, the hint confidence
+        is drawn from the Beta(alpha, beta) posterior — balancing
+        exploration and exploitation.  If the exact pattern is unseen,
+        a soft-match fallback searches for the nearest pattern.
+        """
         features = self.classify_query(query)
         pid = compute_pattern_id(
             features["query_type"],
             features["complexity"],
             features["entity_types"],
+            entity_count=features.get("entity_count", 0),
+            hop_hint=features.get("hop_hint", "single"),
         )
         with self._lock:
             pattern = self._patterns.get(pid)
+            if not pattern:
+                pattern = self._soft_match(features)
 
         if not pattern:
             return None
-        if (pattern.sample_count < self._MIN_SAMPLES_FOR_CONFIDENT
-                or pattern.success_rate < self._MIN_SUCCESS_RATE):
+        if pattern.sample_count < self._MIN_SAMPLES_FOR_CONFIDENT:
+            return None
+
+        # Thompson Sampling: draw from Beta posterior
+        sampled = random.betavariate(
+            max(pattern.alpha, 0.01), max(pattern.beta_param, 0.01),
+        )
+        if sampled < self._MIN_SUCCESS_RATE:
             return None
 
         return StrategyHint(
@@ -301,27 +347,66 @@ class PatternMemory(MemoryStore):
             max_loops=pattern.optimal_params.get("max_loops"),
             enable_dir_scan=pattern.optimal_params.get("enable_dir_scan"),
             keyword_strategy=pattern.optimal_params.get("keyword_strategy"),
-            confidence=pattern.success_rate,
-            source_pattern_id=pid,
+            confidence=sampled,
+            source_pattern_id=pattern.pattern_id,
         )
+
+    def _soft_match(self, features: Dict[str, Any]) -> Optional[QueryPattern]:
+        """Find the nearest pattern when exact pid is absent.
+
+        Uses feature-level overlap (Jaccard on entity_types + exact match
+        on query_type and complexity).  Returns the best match only when
+        it has sufficient samples.
+        """
+        target_et = set(features.get("entity_types", []))
+        best: Optional[Tuple[float, QueryPattern]] = None
+        for p in self._patterns.values():
+            if p.sample_count < self._MIN_SAMPLES_FOR_CONFIDENT:
+                continue
+            score = 0.0
+            if p.query_type == features["query_type"]:
+                score += 0.4
+            if p.complexity == features["complexity"]:
+                score += 0.2
+            if p.hop_hint == features.get("hop_hint", "single"):
+                score += 0.1
+            pet = set(p.entity_types)
+            if target_et or pet:
+                jaccard = len(target_et & pet) / max(len(target_et | pet), 1)
+                score += 0.3 * jaccard
+            else:
+                score += 0.3
+            if best is None or score > best[0]:
+                best = (score, p)
+        if best and best[0] >= 0.6:
+            return best[1]
+        return None
 
     def record_outcome(
         self,
         query: str,
-        success: bool,
+        confidence: float,
         mode: str,
         params: Dict[str, Any],
         latency: float = 0.0,
         tokens: int = 0,
     ) -> None:
-        """Record a search outcome to update pattern statistics."""
+        """Record a search outcome with continuous *confidence* (0-1).
+
+        The old binary ``success`` is replaced by a gradient signal:
+        ``confidence >= 0.5`` counts as a success for rate tracking,
+        and the Beta distribution is updated proportionally.
+        """
         features = self.classify_query(query)
         pid = compute_pattern_id(
             features["query_type"],
             features["complexity"],
             features["entity_types"],
+            entity_count=features.get("entity_count", 0),
+            hop_hint=features.get("hop_hint", "single"),
         )
         now = datetime.now(timezone.utc).isoformat()
+        success = confidence >= 0.5
 
         with self._lock:
             pattern = self._patterns.get(pid)
@@ -331,6 +416,8 @@ class PatternMemory(MemoryStore):
                     query_type=features["query_type"],
                     entity_types=features["entity_types"],
                     complexity=features["complexity"],
+                    entity_count=features.get("entity_count", 0),
+                    hop_hint=features.get("hop_hint", "single"),
                     optimal_mode=mode,
                     optimal_params=params,
                     created_at=now,
@@ -345,12 +432,16 @@ class PatternMemory(MemoryStore):
                 pattern.success_count / max(pattern.sample_count, 1)
             )
 
-            alpha = self._EMA_ALPHA
+            # Thompson Sampling: update Beta posterior
+            pattern.alpha += confidence
+            pattern.beta_param += (1.0 - confidence)
+
+            ema = self._EMA_ALPHA
             pattern.avg_latency = (
-                alpha * latency + (1 - alpha) * pattern.avg_latency
+                ema * latency + (1 - ema) * pattern.avg_latency
             )
             pattern.avg_tokens = int(
-                alpha * tokens + (1 - alpha) * pattern.avg_tokens
+                ema * tokens + (1 - ema) * pattern.avg_tokens
             )
 
             if success and pattern.success_rate >= 0.5:
@@ -373,6 +464,8 @@ class PatternMemory(MemoryStore):
             features["query_type"],
             features["complexity"],
             features["entity_types"],
+            entity_count=features.get("entity_count", 0),
+            hop_hint=features.get("hop_hint", "single"),
         )
         now = datetime.now(timezone.utc).isoformat()
         tid = f"{pid}_chain"
@@ -404,6 +497,8 @@ class PatternMemory(MemoryStore):
             features["query_type"],
             features["complexity"],
             features["entity_types"],
+            entity_count=features.get("entity_count", 0),
+            hop_hint=features.get("hop_hint", "single"),
         )
         tid = f"{pid}_chain"
 
@@ -414,3 +509,73 @@ class PatternMemory(MemoryStore):
                     and chain.success_count / chain.total_count >= 0.4):
                 return chain.steps
         return None
+
+    # ── Warmup seeding ────────────────────────────────────────────────
+
+    _DEFAULT_STRATEGIES: List[Dict[str, Any]] = [
+        {
+            "query_type": "factual", "complexity": "simple",
+            "entity_types": ["named_entity"], "entity_count": 1,
+            "hop_hint": "single",
+            "mode": "DEEP", "params": {"max_loops": 3, "top_k_files": 5},
+        },
+        {
+            "query_type": "bridge", "complexity": "moderate",
+            "entity_types": ["named_entity"], "entity_count": 2,
+            "hop_hint": "multi",
+            "mode": "DEEP", "params": {"max_loops": 5, "top_k_files": 5},
+        },
+        {
+            "query_type": "comparison", "complexity": "moderate",
+            "entity_types": ["named_entity"], "entity_count": 2,
+            "hop_hint": "multi",
+            "mode": "DEEP", "params": {"max_loops": 5, "top_k_files": 5},
+        },
+        {
+            "query_type": "factual", "complexity": "moderate",
+            "entity_types": ["named_entity"], "entity_count": 1,
+            "hop_hint": "single",
+            "mode": "DEEP", "params": {"max_loops": 4, "top_k_files": 5},
+        },
+        {
+            "query_type": "definition", "complexity": "simple",
+            "entity_types": [], "entity_count": 0,
+            "hop_hint": "single",
+            "mode": "FAST", "params": {"max_loops": 2, "top_k_files": 3},
+        },
+    ]
+
+    def seed_defaults(self) -> int:
+        """Insert default strategy patterns if absent (idempotent).
+
+        Returns the number of newly inserted patterns.
+        """
+        seeded = 0
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            for spec in self._DEFAULT_STRATEGIES:
+                pid = compute_pattern_id(
+                    spec["query_type"], spec["complexity"],
+                    spec["entity_types"],
+                    entity_count=spec.get("entity_count", 0),
+                    hop_hint=spec.get("hop_hint", "single"),
+                )
+                if pid in self._patterns:
+                    continue
+                self._patterns[pid] = QueryPattern(
+                    pattern_id=pid,
+                    query_type=spec["query_type"],
+                    complexity=spec["complexity"],
+                    entity_types=spec["entity_types"],
+                    entity_count=spec.get("entity_count", 0),
+                    hop_hint=spec.get("hop_hint", "single"),
+                    optimal_mode=spec["mode"],
+                    optimal_params=spec["params"],
+                    created_at=now,
+                    updated_at=now,
+                )
+                seeded += 1
+        if seeded:
+            self._mark_dirty()
+            logger.debug(f"PatternMemory: seeded {seeded} default patterns")
+        return seeded

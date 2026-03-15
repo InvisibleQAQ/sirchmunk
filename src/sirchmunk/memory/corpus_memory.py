@@ -7,8 +7,10 @@ keyword expansion rules (synonyms, aliases, hypernyms).
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,6 +20,18 @@ from loguru import logger
 
 from .base import MemoryStore
 from .schemas import SemanticBridgeEntry, SemanticExpansion
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_EN_ENTITY_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b")
+_CJK_ENTITY_RE = re.compile(
+    r"[\u4e00-\u9fff]{2,}(?:市|省|县|国|河|山|湖|大学|学院|公司|集团)"
+    r"|《[^》]+》"
+)
+_EN_STOP = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "it", "its", "and",
+    "or", "but", "not", "no", "for", "this", "that", "how", "what",
+    "who", "where", "when", "which", "than", "also", "both", "from",
+})
 
 try:
     from sirchmunk.storage.duckdb import DuckDBManager
@@ -312,3 +326,58 @@ class CorpusMemory(MemoryStore):
                 ))
             entry.updated_at = now
         self._save_bridge()
+
+    # ── Keyword co-occurrence mining ─────────────────────────────────
+
+    def record_keyword_cooccurrence(
+        self,
+        keywords: List[str],
+        success: bool = True,
+    ) -> int:
+        """Mine pairwise co-occurrence from a successful keyword set.
+
+        For every pair (k_i, k_j) in *keywords*, records a weak semantic
+        bridge with relation ``cooccurrence``.  Returns the count of pairs
+        recorded.
+        """
+        filtered = [
+            k for k in keywords
+            if k and len(k) > 1 and k.lower() not in _EN_STOP
+        ]
+        if len(filtered) < 2:
+            return 0
+        count = 0
+        for a, b in itertools.combinations(filtered[:10], 2):
+            if a.lower() == b.lower():
+                continue
+            self.record_semantic_bridge(
+                a, b, relation="cooccurrence", success=success,
+            )
+            count += 1
+        return count
+
+    # ── Entity extraction (language-agnostic) ─────────────────────────
+
+    @staticmethod
+    def extract_entities(keywords: List[str]) -> List[str]:
+        """Extract entities from a keyword list (supports CJK + English).
+
+        Replaces the naive ``k[0].isupper()`` check with proper regex
+        patterns for English named entities and CJK entity suffixes.
+        """
+        entities: List[str] = []
+        seen: set = set()
+        for kw in keywords:
+            if not kw or len(kw) <= 1:
+                continue
+            kw_lower = kw.lower()
+            if kw_lower in _EN_STOP or kw_lower in seen:
+                continue
+            if _CJK_RE.search(kw):
+                entities.append(kw)
+                seen.add(kw_lower)
+                continue
+            if _EN_ENTITY_RE.match(kw) or (len(kw) > 2 and kw[0].isupper()):
+                entities.append(kw)
+                seen.add(kw_lower)
+        return entities[:30]

@@ -1,15 +1,18 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """RetrievalMemory — unified orchestrator for all memory layers.
 
-Creates, initialises, and coordinates the five memory stores.  Provides
-a high-level API consumed by :class:`AgenticSearch`:
+Creates, initialises, and coordinates the five memory stores plus the
+optional ``QuerySimilarityIndex``.  Provides a high-level API consumed
+by :class:`AgenticSearch`:
 
 *  **Lookup** (sync, ~0 ms): ``suggest_strategy``, ``expand_keywords``,
    ``get_entity_paths``, ``filter_noise_keywords``, ``filter_dead_paths``,
-   ``get_path_scores``.
+   ``get_path_scores``, ``get_chain_hint``, ``get_similar_query_hints``.
 *  **Record** (async): ``record_feedback`` — stores the raw signal in
    ``FeedbackMemory`` then dispatches incremental updates to the other
-   four layers.
+   layers using a *gradient confidence* (0-1) instead of binary success.
+*  **Inject** (sync): ``inject_evaluation`` — back-fills EM/F1 scores
+   and re-dispatches gradient updates.
 *  **Maintenance** (sync): ``decay_all``, ``cleanup_all``, ``stats``.
 
 Storage layout::
@@ -19,6 +22,7 @@ Storage layout::
     │   ├── query_patterns.json
     │   └── reasoning_chains.json
     ├── semantic_bridge.json
+    ├── query_similarity.json
     ├── corpus.duckdb
     └── feedback.duckdb
 """
@@ -37,8 +41,10 @@ from .failure_memory import FailureMemory
 from .feedback import FeedbackMemory
 from .path_memory import PathMemory
 from .pattern_memory import PatternMemory
+from .query_similarity import QuerySimilarityIndex
 from .schemas import (
     FeedbackSignal,
+    SimilarQueryHint,
     StrategyHint,
     compute_params_hash,
     compute_pattern_id,
@@ -46,14 +52,23 @@ from .schemas import (
 
 
 class RetrievalMemory:
-    """Unified facade over the five retrieval-memory layers.
+    """Unified facade over the retrieval-memory layers.
 
     Designed for graceful degradation: if any individual store fails to
     initialise, the others still function.  All lookup methods return
     safe defaults on error so the search pipeline is never blocked.
+
+    Parameters
+    ----------
+    embedding_util : optional
+        ``EmbeddingUtil`` instance for query-similarity embeddings.
+        When ``None``, ``QuerySimilarityIndex`` falls back to BM25.
+    tokenizer : optional
+        ``TokenizerUtil`` instance for BM25 tokenisation inside the
+        similarity index.
     """
 
-    _MAINTENANCE_INTERVAL = 50  # run decay/cleanup every N feedbacks
+    _MAINTENANCE_INTERVAL = 50
 
     def __init__(
         self,
@@ -61,11 +76,15 @@ class RetrievalMemory:
         llm: Optional[Any] = None,
         sync_interval: int = 120,
         sync_threshold: int = 200,
+        embedding_util: Any = None,
+        tokenizer: Any = None,
     ):
         self._work_path = Path(work_path).expanduser().resolve()
         self._memory_dir = self._work_path / "memory"
         self._memory_dir.mkdir(parents=True, exist_ok=True)
         self._llm = llm
+        self._embedding_util = embedding_util
+        self._tokenizer = tokenizer
 
         # ── Create backing stores ─────────────────────────────────────
         from sirchmunk.storage.duckdb import DuckDBManager
@@ -91,6 +110,11 @@ class RetrievalMemory:
         self._path_memory = PathMemory(db=self._corpus_db)
         self._failure_memory = FailureMemory(db=self._corpus_db)
         self._feedback_memory = FeedbackMemory(db=self._feedback_db)
+        self._query_similarity = QuerySimilarityIndex(
+            index_file=self._memory_dir / "query_similarity.json",
+            embedding_util=embedding_util,
+            tokenizer=tokenizer,
+        )
 
         self._stores: List[MemoryStore] = [
             self._pattern_memory,
@@ -109,12 +133,34 @@ class RetrievalMemory:
                     f"RetrievalMemory: {store.name} init failed: {exc}"
                 )
 
+        # ── Warmup: seed default patterns + noise keywords ────────────
+        try:
+            self._pattern_memory.seed_defaults()
+        except Exception:
+            pass
+        try:
+            self._failure_memory.seed_noise_keywords()
+        except Exception:
+            pass
+
         self._feedback_count = 0
 
         logger.info(
             f"RetrievalMemory initialised at {self._memory_dir} "
             f"({len(self._stores)} layers)"
         )
+
+    # ── Embedding util setter (for deferred warm-up) ──────────────────
+
+    def set_embedding_util(self, embedding_util: Any) -> None:
+        """Inject embedding util after background warm-up completes."""
+        self._embedding_util = embedding_util
+        self._query_similarity._embedding_util = embedding_util
+
+    def set_tokenizer(self, tokenizer: Any) -> None:
+        """Inject tokenizer after background warm-up completes."""
+        self._tokenizer = tokenizer
+        self._query_similarity._tokenizer = tokenizer
 
     # ================================================================
     #  Lookup API  (sync, called on the hot path)
@@ -175,6 +221,24 @@ class RetrievalMemory:
         except Exception:
             return None
 
+    def get_similar_query_hints(
+        self,
+        query: str,
+        top_k: int = 3,
+        min_similarity: float = 0.55,
+    ) -> List[SimilarQueryHint]:
+        """QuerySimilarityIndex → hints from similar historical queries."""
+        try:
+            return self._query_similarity.find_similar(
+                query, top_k=top_k, min_similarity=min_similarity,
+            )
+        except Exception:
+            return []
+
+    def extract_entities(self, keywords: List[str]) -> List[str]:
+        """Delegate to CorpusMemory's improved entity extractor."""
+        return CorpusMemory.extract_entities(keywords)
+
     # ================================================================
     #  Recording API  (async, called after search completes)
     # ================================================================
@@ -196,7 +260,7 @@ class RetrievalMemory:
     def _dispatch_feedback(self, signal: FeedbackSignal) -> None:
         """Synchronous dispatcher — called inside an executor thread."""
         self._feedback_count += 1
-        success = self._is_success(signal)
+        confidence = self._compute_confidence(signal)
 
         # 1. Raw signal storage
         try:
@@ -204,7 +268,7 @@ class RetrievalMemory:
         except Exception:
             pass
 
-        # 2. PatternMemory — strategy outcome
+        # 2. PatternMemory — strategy outcome (gradient)
         try:
             params = {
                 "mode": signal.mode,
@@ -213,7 +277,7 @@ class RetrievalMemory:
             }
             self._pattern_memory.record_outcome(
                 query=signal.query,
-                success=success,
+                confidence=confidence,
                 mode=signal.mode,
                 params=params,
                 latency=signal.latency_sec,
@@ -222,59 +286,82 @@ class RetrievalMemory:
         except Exception:
             pass
 
-        # 3. CorpusMemory — entity → path mappings from successful reads
-        if signal.files_read and success:
-            try:
-                entities = [
-                    k for k in signal.keywords_used
-                    if k and len(k) > 1 and k[0].isupper()
-                ]
+        # 3. CorpusMemory — entity → path mappings (improved extraction)
+        try:
+            entities = CorpusMemory.extract_entities(signal.keywords_used)
+            if entities and signal.files_read:
                 for entity in entities[:20]:
                     for fp in signal.files_read[:20]:
                         self._corpus_memory.record_entity_path(
-                            entity, fp, success=True,
+                            entity, fp, success=(confidence >= 0.5),
                         )
-            except Exception:
-                pass
-
-        # 4. PathMemory — per-path retrieval stats
-        try:
-            for fp in signal.files_read[:50]:
-                self._path_memory.record_retrieval(fp, useful=success)
         except Exception:
             pass
 
-        # 5. FailureMemory — noise keywords + dead paths + failed strategies
-        try:
-            if not success:
-                for kw in signal.keywords_used[:20]:
-                    files_found = len(signal.files_discovered)
-                    self._failure_memory.record_keyword_result(
-                        kw, files_found=files_found, useful=False,
-                    )
-                for fp in signal.files_read[:50]:
-                    self._failure_memory.record_path_result(fp, useful=False)
+        # 4. CorpusMemory — keyword co-occurrence + semantic bridge
+        if confidence >= 0.5 and signal.keywords_used:
+            try:
+                self._corpus_memory.record_keyword_cooccurrence(
+                    signal.keywords_used, success=True,
+                )
+            except Exception:
+                pass
 
+        # 5. PathMemory — per-path retrieval stats
+        try:
+            useful_set = set(signal.files_discovered or [])
+            for fp in signal.files_read[:50]:
+                self._path_memory.record_retrieval(
+                    fp, useful=(fp in useful_set or confidence >= 0.5),
+                )
+        except Exception:
+            pass
+
+        # 6. FailureMemory — noise keywords + dead paths + failed strategies
+        try:
+            actual_files_found = len(signal.files_discovered or [])
+            for kw in signal.keywords_used[:20]:
+                self._failure_memory.record_keyword_result(
+                    kw, files_found=actual_files_found,
+                    useful=(confidence >= 0.5),
+                )
+            for fp in signal.files_read[:50]:
+                self._failure_memory.record_path_result(
+                    fp, useful=(confidence >= 0.5),
+                )
+
+            if confidence < 0.3:
                 features = PatternMemory.classify_query(signal.query)
                 pid = compute_pattern_id(
                     features["query_type"],
                     features["complexity"],
                     features["entity_types"],
+                    entity_count=features.get("entity_count", 0),
+                    hop_hint=features.get("hop_hint", "single"),
                 )
                 ph = compute_params_hash({"mode": signal.mode})
                 self._failure_memory.record_strategy_failure(pid, ph)
-            else:
-                actual_files_found = len(signal.files_discovered)
-                for kw in signal.keywords_used[:20]:
-                    self._failure_memory.record_keyword_result(
-                        kw, files_found=actual_files_found, useful=True,
-                    )
-                for fp in signal.files_read[:50]:
-                    self._failure_memory.record_path_result(fp, useful=True)
         except Exception:
             pass
 
-        # 6. Periodic maintenance (every N feedbacks)
+        # 7. QuerySimilarityIndex — record for future similarity lookup
+        try:
+            self._query_similarity.record(
+                query=signal.query,
+                confidence=confidence,
+                mode=signal.mode,
+                keywords=signal.keywords_used,
+                useful_files=(
+                    signal.files_discovered
+                    if signal.files_discovered
+                    else signal.files_read
+                ),
+                answer_snippet=(signal.answer_text or "")[:300],
+            )
+        except Exception:
+            pass
+
+        # 8. Periodic maintenance
         if self._feedback_count % self._MAINTENANCE_INTERVAL == 0:
             try:
                 self.decay_all()
@@ -283,17 +370,82 @@ class RetrievalMemory:
                 pass
 
     @staticmethod
-    def _is_success(signal: FeedbackSignal) -> bool:
-        """Determine whether the search was successful."""
-        if signal.user_verdict == "thumbs_up":
-            return True
+    def _compute_confidence(signal: FeedbackSignal) -> float:
+        """Compute a continuous confidence score (0-1) from a feedback signal.
+
+        Priority order:
+        1. Explicit EM/F1 scores (when injected by benchmark evaluation).
+        2. LLM judge verdict.
+        3. User verdict.
+        4. Heuristic based on ``answer_found`` and ``cluster_confidence``.
+        """
+        if signal.em_score is not None and signal.f1_score is not None:
+            return 0.5 * signal.em_score + 0.5 * min(signal.f1_score, 1.0)
+
+        if signal.f1_score is not None:
+            return min(signal.f1_score, 1.0)
+        if signal.em_score is not None:
+            return float(signal.em_score)
+
         if signal.llm_judge_verdict == "CORRECT":
-            return True
-        if signal.em_score is not None and signal.em_score > 0:
-            return True
-        if signal.f1_score is not None and signal.f1_score > 0.5:
-            return True
-        return signal.answer_found
+            return 0.9
+        if signal.llm_judge_verdict == "INCORRECT":
+            return 0.1
+        if signal.user_verdict == "thumbs_up":
+            return 0.95
+        if signal.user_verdict == "thumbs_down":
+            return 0.05
+
+        if signal.answer_found:
+            base = 0.5
+            if signal.cluster_confidence > 0:
+                base = max(base, min(signal.cluster_confidence, 0.9))
+            return base
+
+        return 0.2
+
+    # ================================================================
+    #  Evaluation injection (for benchmark harnesses)
+    # ================================================================
+
+    def inject_evaluation(
+        self,
+        query: str,
+        em_score: float,
+        f1_score: float,
+        llm_judge_verdict: Optional[str] = None,
+    ) -> None:
+        """Back-fill EM/F1 on the most recent signal and re-dispatch.
+
+        Called by benchmark harnesses *after* the search completes and
+        ground-truth evaluation is available.
+        """
+        try:
+            self._feedback_memory.inject_evaluation(
+                query, em_score, f1_score, llm_judge_verdict,
+            )
+        except Exception:
+            pass
+
+        # Re-compute confidence and update PatternMemory with better signal
+        try:
+            conf = 0.5 * em_score + 0.5 * min(f1_score, 1.0)
+            features = PatternMemory.classify_query(query)
+            pid = compute_pattern_id(
+                features["query_type"],
+                features["complexity"],
+                features["entity_types"],
+                entity_count=features.get("entity_count", 0),
+                hop_hint=features.get("hop_hint", "single"),
+            )
+            self._pattern_memory.record_outcome(
+                query=query,
+                confidence=conf,
+                mode="DEEP",
+                params={"max_loops": 5, "top_k_files": 5},
+            )
+        except Exception:
+            pass
 
     # ================================================================
     #  Maintenance API
@@ -329,6 +481,10 @@ class RetrievalMemory:
                 combined[store.name] = store.stats()
             except Exception:
                 combined[store.name] = {"error": "unavailable"}
+        try:
+            combined["QuerySimilarity"] = self._query_similarity.stats()
+        except Exception:
+            combined["QuerySimilarity"] = {"error": "unavailable"}
         return combined
 
     def close(self) -> None:
@@ -338,6 +494,10 @@ class RetrievalMemory:
                 store.close()
             except Exception:
                 pass
+        try:
+            self._query_similarity.close()
+        except Exception:
+            pass
         for db in (self._corpus_db, self._feedback_db):
             try:
                 db.close()

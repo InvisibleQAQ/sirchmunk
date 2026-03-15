@@ -134,6 +134,54 @@ class FailureMemory(MemoryStore):
             except Exception:
                 pass
 
+    # ── Seeding ────────────────────────────────────────────────────────
+
+    _DEFAULT_NOISE_WORDS = frozenset({
+        "the", "a", "an", "is", "are", "was", "were", "be", "been",
+        "being", "have", "has", "had", "do", "does", "did", "will",
+        "would", "shall", "should", "may", "might", "must", "can",
+        "could", "of", "in", "to", "for", "with", "on", "at", "from",
+        "by", "about", "as", "into", "through", "during", "before",
+        "after", "above", "below", "between", "under", "again",
+        "further", "then", "once", "and", "but", "or", "nor", "not",
+        "so", "yet", "both", "either", "neither", "each", "every",
+        "all", "any", "few", "more", "most", "other", "some", "such",
+        "no", "only", "own", "same", "than", "too", "very", "just",
+        "because", "also", "however", "although", "though", "while",
+        # Common CJK stop words
+        "的", "了", "是", "在", "有", "和", "与", "及", "或", "也",
+        "都", "就", "不", "但", "而", "这", "那", "它", "他", "她",
+        "吗", "呢", "吧", "啊", "哪", "什么", "怎么", "为什么",
+    })
+
+    def seed_noise_keywords(self) -> int:
+        """Pre-fill noise_keywords with common stop words (idempotent).
+
+        Returns the number of newly inserted keywords.
+        """
+        inserted = 0
+        for word in self._DEFAULT_NOISE_WORDS:
+            try:
+                existing = self._db.fetch_one(
+                    "SELECT keyword FROM noise_keywords WHERE keyword = ?",
+                    [word],
+                )
+                if not existing:
+                    self._db.insert_data("noise_keywords", {
+                        "keyword": word,
+                        "avg_files_found": 9999.0,
+                        "avg_useful_ratio": 0.0,
+                        "sample_count": self._NOISE_MIN_SAMPLES,
+                        "recommendation": "skip",
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    inserted += 1
+            except Exception:
+                pass
+        if inserted:
+            logger.debug(f"FailureMemory: seeded {inserted} noise keywords")
+        return inserted
+
     # ── Noise keywords ────────────────────────────────────────────────
 
     def filter_noise_keywords(self, keywords: List[str]) -> List[str]:

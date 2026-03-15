@@ -18,6 +18,11 @@ Usage::
 """
 
 from .manager import RetrievalMemory
-from .schemas import FeedbackSignal, StrategyHint
+from .schemas import FeedbackSignal, SimilarQueryHint, StrategyHint
 
-__all__ = ["RetrievalMemory", "FeedbackSignal", "StrategyHint"]
+__all__ = [
+    "RetrievalMemory",
+    "FeedbackSignal",
+    "SimilarQueryHint",
+    "StrategyHint",
+]

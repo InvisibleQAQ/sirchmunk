@@ -36,12 +36,20 @@ class StrategyHint:
 
 @dataclass
 class QueryPattern:
-    """Learned mapping: query feature signature → optimal strategy params."""
+    """Learned mapping: query feature signature → optimal strategy params.
+
+    Thompson Sampling fields (*alpha*, *beta*) model the Beta distribution
+    over the success probability for this pattern.  Each observed outcome
+    shifts the distribution:  ``alpha += confidence`` on success,
+    ``beta += (1 - confidence)`` on failure.
+    """
 
     pattern_id: str
     query_type: str = "factual"
     entity_types: List[str] = field(default_factory=list)
     complexity: str = "moderate"
+    entity_count: int = 0
+    hop_hint: str = "single"
     optimal_mode: str = "DEEP"
     optimal_params: Dict[str, Any] = field(default_factory=dict)
     sample_count: int = 0
@@ -49,6 +57,9 @@ class QueryPattern:
     success_rate: float = 0.0
     avg_latency: float = 0.0
     avg_tokens: int = 0
+    # Thompson Sampling Beta-distribution priors
+    alpha: float = 1.0
+    beta_param: float = 1.0
     created_at: str = ""
     updated_at: str = ""
 
@@ -165,6 +176,22 @@ class FeedbackSignal:
 
 
 # ────────────────────────────────────────────────────────────────────
+#  Similar query hint (output of QuerySimilarityIndex lookup)
+# ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class SimilarQueryHint:
+    """Hints transferred from a semantically similar historical query."""
+
+    query: str
+    similarity: float = 0.0
+    confidence: float = 0.0
+    mode: Optional[str] = None
+    keywords: List[str] = field(default_factory=list)
+    useful_files: List[str] = field(default_factory=list)
+
+
+# ────────────────────────────────────────────────────────────────────
 #  Utility helpers
 # ────────────────────────────────────────────────────────────────────
 
@@ -172,11 +199,24 @@ def compute_pattern_id(
     query_type: str,
     complexity: str,
     entity_types: List[str],
+    *,
+    entity_count: int = 0,
+    hop_hint: str = "single",
 ) -> str:
-    """Deterministic ID from query feature signature."""
+    """Deterministic ID from query feature signature.
+
+    The *entity_count* and *hop_hint* parameters add finer granularity
+    while remaining backward-compatible (default values produce the
+    same hash as the old 3-field version when callers omit them).
+    """
     key = json.dumps(
-        {"type": query_type, "complexity": complexity,
-         "entities": sorted(entity_types)},
+        {
+            "type": query_type,
+            "complexity": complexity,
+            "entities": sorted(entity_types),
+            "entity_count": entity_count,
+            "hop_hint": hop_hint,
+        },
         sort_keys=True,
     )
     return hashlib.sha256(key.encode()).hexdigest()[:16]
