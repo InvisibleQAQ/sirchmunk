@@ -1,32 +1,35 @@
-"""HotpotQA evaluation metrics.
+"""HotpotQA evaluation metrics aligned with the official leaderboard.
 
-Adapted from the official evaluation script:
-https://github.com/hotpotqa/hotpot/blob/master/hotpot_evaluate_v1.py
+Implements the six core metrics from Yang et al. (2018) §5.2, Table 4:
+  - Ans  (EM, F1): Answer exact match and token-level F1
+  - Sup  (EM, F1): Supporting-fact set-level EM and F1
+  - Joint(EM, F1): Combined answer × supporting-fact metrics
 
-Metrics implemented:
-  - Answer EM / F1 (standard HotpotQA, Yang et al. 2018 §5.2)
-  - Contain-Match Accuracy (LinearRAG-style, Zhuang et al. 2025 §4.1)
-  - Evidence Recall (title-level: fraction of gold SP titles in retrieved
-    article titles — proxy for retrieval quality)
+Joint metrics follow the paper's definition:
+  P_joint = P_ans × P_sup,  R_joint = R_ans × R_sup
+  Joint_F1 = 2 × P_joint × R_joint / (P_joint + R_joint)
+  Joint_EM = 1 iff Ans_EM = 1 AND Sup_EM = 1
 
-Note on SP EM/F1 and Joint EM/F1:
-  The official HotpotQA metrics include Supporting Facts EM/F1 computed on
-  predicted vs. gold sets of (title, sent_id) pairs, and Joint metrics that
-  combine answer and SP scores. AgenticSearch is a black-box RAG system that
-  outputs answers only (no explicit supporting fact predictions), so we
-  cannot compute these metrics directly. We report Evidence Recall at the
-  document-title level as the closest retrieval quality proxy.
-  Ref: Yang et al. (2018) Table 4, Eq. for Joint F1.
+Additional (non-leaderboard) metrics retained for diagnostic purposes:
+  - Contain-Match Accuracy (LinearRAG-style bidirectional substring match)
+  - Evidence Recall (title-level SP coverage proxy)
+
+Reference: https://github.com/hotpotqa/hotpot/blob/master/hotpot_evaluate_v1.py
+Paper:     https://arxiv.org/pdf/1809.09600
 """
 
 import re
 import string
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Tuple
 
+
+# ---------------------------------------------------------------------------
+# Answer-level helpers
+# ---------------------------------------------------------------------------
 
 def normalize_answer(s: str) -> str:
-    """Lower text, remove articles/punctuation/extra whitespace."""
+    """Lower text, remove articles / punctuation / extra whitespace."""
     def remove_articles(text):
         return re.sub(r"\b(a|an|the)\b", " ", text)
 
@@ -43,79 +46,154 @@ def exact_match_score(prediction: str, ground_truth: str) -> int:
     return int(normalize_answer(prediction) == normalize_answer(ground_truth))
 
 
-def f1_score(prediction: str, ground_truth: str) -> float:
-    pred_tokens = normalize_answer(prediction).split()
-    gt_tokens = normalize_answer(ground_truth).split()
+def f1_score(prediction: str, ground_truth: str) -> Tuple[float, float, float]:
+    """Token-level F1 with yes/no/noanswer special-casing.
+
+    Returns (f1, precision, recall) — all three are needed for Joint metrics.
+
+    Per the official HotpotQA eval script, if either the prediction or the
+    ground truth is one of {yes, no, noanswer} and they don't match after
+    normalisation, return (0, 0, 0).
+    """
+    ZERO = (0.0, 0.0, 0.0)
+    norm_pred = normalize_answer(prediction)
+    norm_gt = normalize_answer(ground_truth)
+
+    _SPECIAL = {"yes", "no", "noanswer"}
+    if norm_pred in _SPECIAL and norm_pred != norm_gt:
+        return ZERO
+    if norm_gt in _SPECIAL and norm_pred != norm_gt:
+        return ZERO
+
+    pred_tokens = norm_pred.split()
+    gt_tokens = norm_gt.split()
     if not pred_tokens or not gt_tokens:
-        return 0.0
+        return ZERO
+
     common = Counter(pred_tokens) & Counter(gt_tokens)
     num_same = sum(common.values())
     if num_same == 0:
-        return 0.0
+        return ZERO
+
     precision = num_same / len(pred_tokens)
     recall = num_same / len(gt_tokens)
-    return 2 * precision * recall / (precision + recall)
+    f1 = 2 * precision * recall / (precision + recall)
+    return f1, precision, recall
 
 
 def contain_match_score(prediction: str, ground_truth: str) -> int:
-    """Bidirectional Contain-Match: 1 if normalized gold appears in prediction
-    OR normalized prediction appears in gold.
-
-    Bidirectional matching handles cases where the prediction is more
-    specific (e.g. pred="August 15, 1843", gold="15 August 1843") or
-    the gold is more verbose.
-    """
-    np = normalize_answer(prediction)
+    """Bidirectional Contain-Match (LinearRAG-style)."""
+    np_ = normalize_answer(prediction)
     ng = normalize_answer(ground_truth)
-    if not np or not ng:
+    if not np_ or not ng:
         return 0
-    return int(ng in np or np in ng)
+    return int(ng in np_ or np_ in ng)
 
+
+# ---------------------------------------------------------------------------
+# Supporting-fact helpers
+# ---------------------------------------------------------------------------
+
+def _to_sp_set(sp_list) -> Set[Tuple[str, int]]:
+    """Normalise supporting-fact data into a set of (title, sent_id) tuples.
+
+    Accepts:
+      - list of [title, sent_id] pairs  (official JSON format)
+      - dict with parallel "title" / "sent_id" arrays  (parquet format)
+    """
+    if isinstance(sp_list, dict):
+        titles = sp_list.get("title", [])
+        sids = sp_list.get("sent_id", [])
+        return set(zip(titles, sids))
+    if isinstance(sp_list, (list, tuple)):
+        return {(t, int(s)) for t, s in sp_list}
+    return set()
+
+
+def sp_prec_recall_f1(
+    predicted_sp: Set[Tuple[str, int]],
+    gold_sp: Set[Tuple[str, int]],
+) -> Tuple[float, float, float, float]:
+    """Set-level EM, precision, recall, F1 for supporting facts.
+
+    Returns (sp_em, sp_prec, sp_recall, sp_f1).
+    """
+    if not predicted_sp and not gold_sp:
+        return 1.0, 1.0, 1.0, 1.0
+
+    sp_em = 1.0 if predicted_sp == gold_sp else 0.0
+
+    tp = len(predicted_sp & gold_sp)
+    prec = tp / len(predicted_sp) if predicted_sp else 0.0
+    recall = tp / len(gold_sp) if gold_sp else 0.0
+    f1 = (2 * prec * recall / (prec + recall)) if (prec + recall) > 0 else 0.0
+
+    return sp_em, prec, recall, f1
+
+
+# ---------------------------------------------------------------------------
+# Title-level evidence recall (diagnostic, non-leaderboard)
+# ---------------------------------------------------------------------------
 
 def _normalize_title(t: str) -> str:
-    """Lowercase, strip punctuation and whitespace for fuzzy title matching."""
     return re.sub(r"[^a-z0-9 ]", "", t.lower()).strip()
 
 
 def _evidence_recall(
     retrieved_titles: List[str],
-    supporting_facts: Dict[str, Any],
+    supporting_facts,
 ) -> float:
-    """Fraction of gold supporting-fact titles found among retrieved article titles.
-
-    Uses normalized matching to handle minor formatting differences
-    (e.g. "Tivoli Gardens" vs "tivoli gardens").
-    """
-    sf_titles = supporting_facts.get("title", [])
+    """Fraction of gold SP titles found among retrieved article titles."""
+    if isinstance(supporting_facts, dict):
+        sf_titles = supporting_facts.get("title", [])
+    elif isinstance(supporting_facts, (list, tuple)):
+        sf_titles = [pair[0] for pair in supporting_facts]
+    else:
+        return 0.0
     if not sf_titles:
         return 0.0
     unique_gold: Set[str] = set(sf_titles)
     norm_retrieved: Set[str] = {_normalize_title(t) for t in retrieved_titles}
-
-    found = 0
-    for gold_title in unique_gold:
-        if _normalize_title(gold_title) in norm_retrieved:
-            found += 1
+    found = sum(
+        1 for g in unique_gold if _normalize_title(g) in norm_retrieved
+    )
     return found / len(unique_gold)
 
+
+# ---------------------------------------------------------------------------
+# Aggregate evaluation
+# ---------------------------------------------------------------------------
 
 def evaluate_predictions(
     results: List[Dict[str, Any]],
     samples: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Compute Answer EM/F1, Contain-Match Acc, and Evidence Recall.
+    """Compute all leaderboard metrics plus diagnostic metrics.
 
-    Provides breakdown by question type (bridge/comparison) and
-    difficulty level (easy/medium/hard).
+    Leaderboard (per-sample, then averaged):
+      - Ans EM / F1
+      - Sup EM / F1
+      - Joint EM / F1
+
+    Diagnostic:
+      - Contain-Match Accuracy
+      - Evidence Recall (title-level)
+
+    Returns dict with keys: overall, by_type, by_level, per_sample.
     """
     sample_map = {s["_id"]: s for s in samples}
 
-    metric_keys = ["em", "f1", "contain", "ev_recall"]
-    overall = {k: [] for k in metric_keys}
+    METRIC_KEYS = [
+        "ans_em", "ans_f1", "ans_prec", "ans_recall",
+        "sp_em", "sp_f1", "sp_prec", "sp_recall",
+        "joint_em", "joint_f1", "joint_prec", "joint_recall",
+        "contain", "ev_recall",
+    ]
+    overall: Dict[str, list] = {k: [] for k in METRIC_KEYS}
     by_type: Dict[str, Dict[str, list]] = defaultdict(
-        lambda: {k: [] for k in metric_keys})
+        lambda: {k: [] for k in METRIC_KEYS})
     by_level: Dict[str, Dict[str, list]] = defaultdict(
-        lambda: {k: [] for k in metric_keys})
+        lambda: {k: [] for k in METRIC_KEYS})
     per_sample: List[Dict[str, Any]] = []
 
     for r in results:
@@ -128,59 +206,70 @@ def evaluate_predictions(
         if not gold:
             continue
 
-        em = exact_match_score(pred, gold)
-        f1 = f1_score(pred, gold)
-        contain = contain_match_score(pred, gold)
-        q_type = sample.get("type", "unknown")
-        q_level = sample.get("level", "unknown")
+        # --- Answer metrics ---
+        ans_em = exact_match_score(pred, gold)
+        ans_f1, ans_prec, ans_recall = f1_score(pred, gold)
 
+        # --- Supporting-fact metrics ---
+        gold_sp = _to_sp_set(sample.get("supporting_facts", {}))
+        pred_sp = _to_sp_set(r.get("predicted_sp", []))
+        sp_em, sp_prec, sp_recall, sp_f1 = sp_prec_recall_f1(pred_sp, gold_sp)
+
+        # --- Joint metrics (paper §5.2) ---
+        joint_prec = ans_prec * sp_prec
+        joint_recall = ans_recall * sp_recall
+        joint_f1 = (
+            (2 * joint_prec * joint_recall / (joint_prec + joint_recall))
+            if (joint_prec + joint_recall) > 0 else 0.0
+        )
+        joint_em = float(ans_em and sp_em)
+
+        # --- Diagnostic metrics ---
+        contain = contain_match_score(pred, gold)
         retrieved_titles = r.get("retrieved_titles", [])
         sf = sample.get("supporting_facts", {})
         ev_recall = _evidence_recall(retrieved_titles, sf)
 
+        q_type = sample.get("type", "unknown")
+        q_level = sample.get("level", "unknown")
+
+        row = {
+            "ans_em": ans_em, "ans_f1": ans_f1,
+            "ans_prec": ans_prec, "ans_recall": ans_recall,
+            "sp_em": sp_em, "sp_f1": sp_f1,
+            "sp_prec": sp_prec, "sp_recall": sp_recall,
+            "joint_em": joint_em, "joint_f1": joint_f1,
+            "joint_prec": joint_prec, "joint_recall": joint_recall,
+            "contain": contain, "ev_recall": ev_recall,
+        }
+
         for bucket in [overall, by_type[q_type], by_level[q_level]]:
-            bucket["em"].append(em)
-            bucket["f1"].append(f1)
-            bucket["contain"].append(contain)
-            bucket["ev_recall"].append(ev_recall)
+            for k in METRIC_KEYS:
+                bucket[k].append(row[k])
 
         per_sample.append({
             "_id": qid,
-            "em": em,
-            "f1": round(f1, 4),
-            "contain": contain,
-            "ev_recall": round(ev_recall, 4),
-            "type": q_type,
-            "level": q_level,
+            "question": r.get("question", ""),
             "gold": gold,
             "pred": pred,
-            "question": r.get("question", ""),
+            "type": q_type,
+            "level": q_level,
+            **{k: round(v, 4) if isinstance(v, float) else v
+               for k, v in row.items()},
         })
 
-    def _avg(vals):
-        return sum(vals) / len(vals) if vals else 0.0
-
-    def _bucket(d):
+    def _agg(bucket: Dict[str, list]) -> Dict[str, Any]:
+        """Aggregate a metric bucket into averages."""
+        count = len(bucket["ans_em"]) if bucket["ans_em"] else 0
+        if count == 0:
+            return {k: 0.0 for k in METRIC_KEYS} | {"count": 0}
         return {
-            k: {
-                "ans_em": _avg(v["em"]),
-                "ans_f1": _avg(v["f1"]),
-                "contain_acc": _avg(v["contain"]),
-                "ev_recall": _avg(v["ev_recall"]),
-                "count": len(v["em"]),
-            }
-            for k, v in d.items()
-        }
+            k: sum(bucket[k]) / count for k in METRIC_KEYS
+        } | {"count": count}
 
     return {
-        "overall": {
-            "ans_em": _avg(overall["em"]),
-            "ans_f1": _avg(overall["f1"]),
-            "contain_acc": _avg(overall["contain"]),
-            "ev_recall": _avg(overall["ev_recall"]),
-            "count": len(overall["em"]),
-        },
-        "by_type": _bucket(by_type),
-        "by_level": _bucket(by_level),
+        "overall": _agg(overall),
+        "by_type": {t: _agg(v) for t, v in by_type.items()},
+        "by_level": {lv: _agg(v) for lv, v in by_level.items()},
         "per_sample": per_sample,
     }

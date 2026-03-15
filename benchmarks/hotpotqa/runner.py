@@ -7,14 +7,16 @@ retrieval + reasoning + generation.
 When extract_answer=True, a lightweight LLM call converts the verbose
 AgenticSearch briefing into a short factoid answer suitable for EM/F1.
 
-After search, article titles are extracted from read wiki files for
-evidence recall computation.
+After search, article titles and supporting-fact predictions are
+extracted from wiki files read during the search.  Predicted SP follows
+the (title, sent_id) format of the official evaluation so that
+Sup EM/F1 and Joint EM/F1 can be computed.
 """
 
 import asyncio
 import json as json_mod
 import time
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Tuple
 
 from config import ExperimentConfig
 
@@ -41,15 +43,11 @@ def _normalize_prediction(pred: str) -> str:
     """
     import re
     s = pred.strip()
-    # Remove markdown bold/italic
     s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
     s = re.sub(r"\*(.+?)\*", r"\1", s)
-    # Remove surrounding quotes
     if len(s) >= 2 and s[0] in ('"', "'", "\u201c") and s[-1] in ('"', "'", "\u201d"):
         s = s[1:-1].strip()
-    # Remove trailing period / colon
     s = s.rstrip(".:")
-    # Remove common LLM wrapper phrases
     for prefix in [
         "The answer is ", "The short answer is ",
         "Answer: ", "Short answer: ",
@@ -79,13 +77,26 @@ async def _extract_short_answer(
         return verbose
 
 
-def _extract_titles_from_files(files_read: List[str]) -> Set[str]:
-    """Parse wiki corpus files to extract article titles from read files.
+def _extract_titles_and_sp(
+    files_read: List[str],
+) -> Tuple[Set[str], List[List]]:
+    """Parse wiki JSONL files to extract article titles and predicted SP.
 
-    Each wiki file contains JSON lines (one per article). Extracts all
-    article titles from the files that AgenticSearch opened during search.
+    Each wiki file contains JSON lines (one per article).  For every
+    article in the files that AgenticSearch opened, we extract:
+      1. The article title  (for Evidence Recall)
+      2. All first-paragraph (title, sent_id) pairs  (for Sup EM/F1)
+
+    HotpotQA wiki format per line:
+      {"id": "...", "title": "...", "text": [["s0", "s1", ...]], ...}
+    or:
+      {"id": "...", "title": "...", "text": ["s0", "s1", ...], ...}
+
+    Returns (titles_set, predicted_sp_list).
     """
     titles: Set[str] = set()
+    predicted_sp: List[List] = []
+
     for fpath in files_read:
         try:
             with open(fpath) as f:
@@ -95,14 +106,25 @@ def _extract_titles_from_files(files_read: List[str]) -> Set[str]:
                         continue
                     try:
                         obj = json_mod.loads(line)
-                        t = obj.get("title")
-                        if t:
-                            titles.add(t)
-                    except (json_mod.JSONDecodeError, TypeError):
+                        title = obj.get("title")
+                        if not title:
+                            continue
+                        titles.add(title)
+                        text = obj.get("text")
+                        if not text:
+                            continue
+                        # text is either [["s0","s1",...]] or ["s0","s1",...]
+                        if text and isinstance(text[0], list):
+                            sentences = text[0]
+                        else:
+                            sentences = text
+                        for sid in range(len(sentences)):
+                            predicted_sp.append([title, sid])
+                    except (json_mod.JSONDecodeError, TypeError, IndexError):
                         continue
         except (FileNotFoundError, PermissionError):
             continue
-    return titles
+    return titles, predicted_sp
 
 
 async def run_single(
@@ -123,6 +145,7 @@ async def run_single(
         answer = ""
         telemetry: Dict[str, Any] = {}
         retrieved_titles: List[str] = []
+        predicted_sp: List[List] = []
 
         try:
             result = await searcher.search(
@@ -146,9 +169,7 @@ async def run_single(
                     if fp and fp not in files_read:
                         files_read.append(fp)
 
-            # Supplement from keyword search retrieval logs —
-            # KeywordSearchTool logs files_discovered but doesn't
-            # call mark_file_read, so we collect them here.
+            # Supplement from keyword search retrieval logs
             _seen = set(files_read)
             for log_entry in (getattr(result, "retrieval_logs", None) or []):
                 meta = getattr(log_entry, "metadata", None) or {}
@@ -164,7 +185,7 @@ async def run_single(
                 "llm_calls": len(getattr(result, "llm_usages", None) or []),
             }
 
-            titles = _extract_titles_from_files(files_read)
+            titles, predicted_sp = _extract_titles_and_sp(files_read)
             retrieved_titles = list(titles)
 
             if cfg.extract_answer and raw_answer:
@@ -190,6 +211,7 @@ async def run_single(
         "elapsed": round(elapsed, 2),
         "telemetry": telemetry,
         "retrieved_titles": retrieved_titles,
+        "predicted_sp": predicted_sp,
         "error": error,
     }
 
@@ -220,11 +242,12 @@ async def run_batch(
         status = "OK" if not r["error"] else f"ERR: {r['error'][:60]}"
         t = r.get("telemetry", {})
         n_titles = len(r.get("retrieved_titles", []))
+        n_sp = len(r.get("predicted_sp", []))
         extract_tag = " [ext]" if r.get("prediction") != r.get("raw_prediction") else ""
         print(f"  [{completed}/{total}] {r['_id']}  "
               f"{r['elapsed']:.1f}s  tok={t.get('total_tokens', 0)}  "
               f"loops={t.get('loop_count', 0)}  titles={n_titles}  "
-              f"{status}{extract_tag}")
+              f"sp={n_sp}  {status}{extract_tag}")
         return r
 
     tasks = [_tracked(s) for s in samples]
