@@ -2817,6 +2817,18 @@ class AgenticSearch(BaseSearch):
             if cluster:
                 if not cluster.search_results:
                     cluster.search_results = list(discovered)
+                # When the evidence pipeline failed to find relevant content
+                # (e.g. due to JSON parse errors in scoring) but ReAct already
+                # produced a high-quality answer by reading the same files,
+                # use the ReAct answer as the authoritative cluster content.
+                any_found = any(
+                    getattr(ev, "is_found", False)
+                    for ev in (cluster.evidences or [])
+                )
+                if not any_found and answer and len(answer) > len(cluster.content or ""):
+                    cluster.content = answer
+                    cluster.name = query[:60]
+                    cluster.description = [f"Search result for: {query}"]
                 return cluster
 
         # Fallback: lightweight cluster from answer text

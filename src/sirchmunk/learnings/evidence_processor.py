@@ -3,6 +3,7 @@ import asyncio
 import json
 import math
 import random
+import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Set, Tuple
 
@@ -297,6 +298,8 @@ class MonteCarloEvidenceSampling:
 
         return samples
 
+    _SCORE_RE = re.compile(r'"score"\s*:\s*(\d+(?:\.\d+)?)')
+
     async def _evaluate_sample_async(
         self, sample: SampleWindow, query: str
     ) -> SampleWindow:
@@ -314,7 +317,17 @@ class MonteCarloEvidenceSampling:
             self.llm_usages.append(resp_obj.usage)
 
             clean_resp = resp.replace("```json", "").replace("```", "").strip()
-            data = json.loads(clean_resp)
+            try:
+                data = json.loads(clean_resp)
+            except json.JSONDecodeError:
+                # LLM responses often contain unescaped quotes inside the
+                # "reasoning" value (e.g. Chinese book-title quotes).
+                # Fall back to regex extraction for the critical "score" field.
+                m = self._SCORE_RE.search(clean_resp)
+                if m:
+                    data = {"score": float(m.group(1)), "reasoning": ""}
+                else:
+                    raise
             sample.score = float(data.get("score", 0))
             sample.reasoning = data.get("reasoning", "")
         except Exception as e:
