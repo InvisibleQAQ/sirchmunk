@@ -1,10 +1,15 @@
-# HotpotQA Fullwiki Benchmark for AgenticSearch
+# HotpotQA Fullwiki Benchmark for Sirchmunk
 
 End-to-end RAG evaluation on the **HotpotQA Fullwiki** setting ([Yang et al., 2018](https://arxiv.org/pdf/1809.09600)).
 Tests the full **retrieval → reasoning → generation** pipeline against a global Wikipedia corpus (~5.3M article abstracts).
 
-Experimental settings aligned with [LinearRAG](https://arxiv.org/pdf/2510.10114) (Zhuang et al., 2025):
-1000 questions from validation set, top-k=5, Contain-Match + GPT-Eval metrics.
+**Leaderboard-aligned metrics** (Yang et al., 2018 §5.2, Table 4):
+- **Ans** (EM, F1): Answer exact match and token-level F1
+- **Sup** (EM, F1): Supporting-fact set-level EM and F1
+- **Joint** (EM, F1): Combined answer × supporting-fact metrics
+
+Additional diagnostic metrics aligned with [LinearRAG](https://arxiv.org/pdf/2510.10114) (Zhuang et al., 2025):
+Contain-Match Accuracy, GPT-Eval Accuracy, Evidence Recall.
 
 ## Data
 
@@ -66,34 +71,51 @@ python run_benchmark.py
 
 # Use a different env file (e.g. for another experiment)
 python run_benchmark.py --env /path/to/.env.hotpotqa
+
+# Resume from a previous results file (checkpoint/resume)
+python run_benchmark.py --resume output/results_fullwiki_validation_*.json
 ```
+
+### Checkpoint / Resume
+
+For long-running evaluations, use `--resume` to continue from a previous run:
+- Already-evaluated questions are loaded from the checkpoint file and skipped
+- New results are merged with cached results
+- A fresh report is generated with all samples
+- Intermediate checkpoints are saved automatically during evaluation
 
 Examples of .env.hotpotqa: set `HOTPOT_LIMIT=20` for a quick test, `HOTPOT_LIMIT=0` for full validation set, `HOTPOT_MODE=FAST`, `HOTPOT_WIKI_CORPUS_DIR=/path/to/enwiki-abstracts`, `HOTPOT_EXTRACT_ANSWER=false`, `HOTPOT_ENABLE_GPT_EVAL=false`, etc. See ".env.hotpotqa Keys" below.
 
 ## Metrics
 
-### Primary (LinearRAG-aligned)
+### Leaderboard Metrics (Official HotpotQA)
+
+Fully aligned with the official HotpotQA evaluation (Yang et al., 2018 §5.2, Table 4):
 
 | Metric | Description |
 |--------|-------------|
-| **Contain-Match Acc** | 1 if normalized gold answer appears in normalized prediction (LinearRAG §4.1) |
-| **GPT-Eval Acc** | LLM judges if prediction matches gold answer (LinearRAG §4.1) |
+| **Ans EM** | Answer exact match (normalized) |
+| **Ans F1** | Answer token-level F1 |
+| **Sup EM** | Supporting-fact set-level exact match |
+| **Sup F1** | Supporting-fact set-level F1 |
+| **Joint EM** | 1 iff Ans EM = 1 AND Sup EM = 1 |
+| **Joint F1** | Combined F1: P_joint = P_ans × P_sup, R_joint = R_ans × R_sup |
 
-### Standard HotpotQA
+### Supporting Facts Prediction
+
+AgenticSearch now extracts predicted supporting facts from retrieved wiki files:
+- Each wiki file contains JSON lines (one per article)
+- For every article in files read during search, we extract `(title, sent_id)` pairs
+- These predictions are compared against gold supporting facts for Sup EM/F1
+- Joint metrics combine answer and supporting-fact scores per the paper's definition
+
+### Diagnostic Metrics (LinearRAG-aligned)
 
 | Metric | Description |
 |--------|-------------|
-| **Answer EM** | Exact match (normalized) against gold answer |
-| **Answer F1** | Token-level F1 against gold answer |
-| **Evidence Recall** | Fraction of gold supporting-fact document titles found in retrieved articles |
-
-### Note on SP EM/F1 and Joint EM/F1
-
-The official HotpotQA evaluation (Table 4 in [Yang et al., 2018](https://arxiv.org/pdf/1809.09600))
-includes Supporting Facts EM/F1 (predicted vs. gold sets of `(title, sent_id)` pairs) and
-Joint EM/F1 (combining answer and SP scores). These require explicit supporting fact
-predictions, which AgenticSearch (as a black-box RAG system) does not output. We report
-**Evidence Recall** at the document-title level as a retrieval quality proxy.
+| **Contain-Match Acc** | 1 if normalized gold answer appears in normalized prediction (bidirectional) |
+| **GPT-Eval Acc** | LLM judges semantic equivalence between prediction and gold |
+| **Evidence Recall** | Fraction of gold SP titles found in retrieved articles |
 
 ### Efficiency
 
@@ -104,6 +126,7 @@ predictions, which AgenticSearch (as a black-box RAG system) does not output. We
 | **Avg Loops** | Mean ReAct iterations (hops) per query |
 | **Avg Files Read** | Mean wiki corpus files opened per query |
 | **Avg Titles Retr** | Mean article titles in retrieved files |
+| **Avg SP Predictions** | Mean supporting-fact (title, sent_id) pairs predicted |
 
 ### Fine-grained Breakdown
 
@@ -120,10 +143,10 @@ checks semantic equivalence.
 ```
 config.py        — ExperimentConfig (parse-only, no hardcoded defaults)
 data_loader.py   — Load parquet, validate wiki corpus
-runner.py        — AgenticSearch against global wiki corpus, answer extraction
-evaluate.py      — Answer EM/F1 + Contain-Match + Evidence Recall
+runner.py        — AgenticSearch against global wiki corpus, answer + SP extraction
+evaluate.py      — Full leaderboard metrics (Ans/Sup/Joint EM/F1) + diagnostics
 llm_judge.py     — LLM Judge (borderline) + GPT-Eval (all samples)
-run_benchmark.py — CLI entry point, full report generation
+run_benchmark.py — CLI entry point, checkpoint/resume, professional report
 ```
 
 ## How AgenticSearch.search() Works in Fullwiki
@@ -161,16 +184,55 @@ This benchmark follows the experimental setup from
 | Questions | 1000 from validation set |
 | Retrieval | top-k=5 |
 | Primary metrics | Contain-Match Acc, GPT-Eval Acc |
-| Standard metrics | Answer EM, Answer F1 |
+| Leaderboard metrics | Ans EM/F1, Sup EM/F1, Joint EM/F1 |
 
 LinearRAG reports **64.30%** Contain-Acc and **66.50%** GPT-Acc on HotpotQA
 (Table 1), which serves as the comparison baseline for AgenticSearch.
 
+## Sample Report Output
+
+```
+==============================================================================
+  HOTPOTQA FULLWIKI EVALUATION REPORT
+==============================================================================
+
+  Leaderboard Metrics
+               N  │  Ans EM  Ans F1 │  Sup EM  Sup F1 │  Jnt EM  Jnt F1
+  ──────────── ───────┼──────── ────────┼──────── ────────┼──────── ───────
+  Overall        50  │  32.00   45.67 │  12.00   38.45 │   8.00   21.34
+
+  By Question Type
+               N  │  Ans EM  Ans F1 │  Sup EM  Sup F1 │  Jnt EM  Jnt F1
+  ──────────── ───────┼──────── ────────┼──────── ────────┼──────── ───────
+  bridge          35  │  34.29   47.12 │  14.29   40.23 │  11.43   24.56
+  comparison      15  │  26.67   42.33 │   6.67   34.12 │   0.00   13.78
+
+  Diagnostic Metrics
+               N  │ Cont-Acc Ev Recall
+  ──────────── ───────┼───────── ─────────
+  Overall        50  │   58.00     72.34
+
+  GPT-Eval Accuracy:   62.00%  (N=50)
+
+  Efficiency
+  ────────────────────────────────────────
+    Avg latency:            8.45 s/query
+    Avg tokens:             4523 /query
+    Avg loops (hops):        2.3
+    Avg files read:         12.4
+    Avg titles retrieved:   89
+    Avg SP predictions:     356
+    Total wall time:       423.5 s
+    Errors:                   0 / 50
+```
+
 ## Output
 
 Results and reports are saved to `output/`:
-- `results_*.json` — per-question predictions + telemetry + retrieved_titles
-- `report_*.json` — aggregated metrics, GPT-Eval, LLM judge, efficiency
+- `results_*.json` — per-question predictions + telemetry + retrieved_titles + predicted_sp
+- `report_*.json` — leaderboard metrics (Ans/Sup/Joint), diagnostic metrics, efficiency
+- `checkpoint_*.json` — intermediate results for crash recovery
+- `logs/benchmark_*.log` — full console output with timestamps
 
 ## .env.hotpotqa Keys
 
