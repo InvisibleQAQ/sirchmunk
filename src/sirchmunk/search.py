@@ -89,6 +89,7 @@ class AgenticSearch(BaseSearch):
         verbose: bool = True,
         log_callback: LogCallback = None,
         reuse_knowledge: bool = True,
+        enable_memory: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -156,7 +157,10 @@ class AgenticSearch(BaseSearch):
         self._warmup_event = threading.Event()
         _warmup_thread = threading.Thread(
             target=self._warmup_bg,
-            kwargs={"reuse_knowledge": reuse_knowledge},
+            kwargs={
+                "reuse_knowledge": reuse_knowledge,
+                "enable_memory": enable_memory,
+            },
             daemon=True,
             name="sirchmunk-warmup",
         )
@@ -166,7 +170,7 @@ class AgenticSearch(BaseSearch):
     # Background warm-up
     # ------------------------------------------------------------------
 
-    def _warmup_bg(self, *, reuse_knowledge: bool) -> None:
+    def _warmup_bg(self, *, reuse_knowledge: bool, enable_memory: bool = False) -> None:
         """Background thread: initialise heavy components without blocking __init__."""
         try:
             # 1. KnowledgeStorage — DuckDB + Parquet load
@@ -212,15 +216,19 @@ class AgenticSearch(BaseSearch):
             except Exception as exc:
                 _loguru_logger.warning(f"[warmup] Dependency check failed: {exc}")
 
-            # 4. Self-evolving retrieval memory
-            try:
-                from sirchmunk.memory import RetrievalMemory
-                self._memory = RetrievalMemory(
-                    work_path=str(self.work_path),
-                    embedding_util=self.embedding_client,
-                )
-            except Exception as exc:
-                _loguru_logger.info(f"[warmup] Retrieval memory not available: {exc}")
+            # 4. Self-evolving retrieval memory (opt-in)
+            if enable_memory:
+                try:
+                    from sirchmunk.memory import RetrievalMemory
+                    self._memory = RetrievalMemory(
+                        work_path=str(self.work_path),
+                        embedding_util=self.embedding_client,
+                    )
+                    _loguru_logger.info("[warmup] Retrieval memory enabled and initialised")
+                except Exception as exc:
+                    _loguru_logger.info(f"[warmup] Retrieval memory not available: {exc}")
+            else:
+                _loguru_logger.info("[warmup] Retrieval memory disabled")
 
         except Exception as exc:
             _loguru_logger.error(f"[warmup] Unexpected error: {exc}")
@@ -1132,10 +1140,13 @@ class AgenticSearch(BaseSearch):
         # ---- Memory: strategy hint + similar-query transfer (zero-LLM) ----
         _memory_extra_files: List[str] = []
         _memory_extra_keywords: List[str] = []
+        _MEMORY_CONFIDENCE_THRESHOLD = 0.7
+        _MEMORY_MAX_EXTRA_FILES = 5
+        _MEMORY_MAX_EXTRA_KEYWORDS = 8
         if self._memory and mode != "FILENAME_ONLY":
             try:
                 hint = self._memory.suggest_strategy(query)
-                if hint and hint.confidence >= 0.5:
+                if hint and hint.confidence >= _MEMORY_CONFIDENCE_THRESHOLD:
                     if hint.mode:
                         mode = hint.mode
                     if hint.top_k_files is not None:
@@ -1149,9 +1160,11 @@ class AgenticSearch(BaseSearch):
             try:
                 sim_hints = self._memory.get_similar_query_hints(query, top_k=3)
                 for sh in sim_hints:
-                    if sh.confidence >= 0.5:
-                        _memory_extra_files.extend(sh.useful_files[:5])
-                        _memory_extra_keywords.extend(sh.keywords[:5])
+                    if sh.confidence >= _MEMORY_CONFIDENCE_THRESHOLD:
+                        _memory_extra_files.extend(sh.useful_files[:3])
+                        _memory_extra_keywords.extend(sh.keywords[:3])
+                _memory_extra_files = _memory_extra_files[:_MEMORY_MAX_EXTRA_FILES]
+                _memory_extra_keywords = _memory_extra_keywords[:_MEMORY_MAX_EXTRA_KEYWORDS]
             except Exception:
                 pass
 
@@ -1446,7 +1459,13 @@ class AgenticSearch(BaseSearch):
         # Preserve Phase 3 file marks before possible context reassignment
         _phase3_read_files = set(context.read_file_ids)
 
-        if cluster and cluster.content:
+        _has_quality_evidence = (
+            cluster
+            and cluster.content
+            and self._is_evidence_meaningful(cluster.content)
+        )
+
+        if _has_quality_evidence:
             await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
             answer, should_save = await self._summarise_cluster(
                 query, cluster, enable_thinking=enable_thinking,
@@ -1454,42 +1473,30 @@ class AgenticSearch(BaseSearch):
             if not cluster.search_results:
                 cluster.search_results = list(merged_files)
         else:
-            # Try to recover partial evidence from snippets/summaries
-            # before falling back to the expensive ReAct loop.
-            _assembled = self._assemble_evidence_snippets(cluster) if cluster else ""
-            if _assembled:
-                cluster.content = _assembled
+            if cluster and cluster.content and not _has_quality_evidence:
                 await self._logger.info(
-                    "[Phase 4] Assembled partial evidence from snippets, generating summary"
+                    "[Phase 4] Cluster content present but low quality, falling through to ReAct"
                 )
-                answer, should_save = await self._summarise_cluster(
-                    query, cluster, enable_thinking=enable_thinking,
-                )
-                if not cluster.search_results:
-                    cluster.search_results = list(merged_files)
-            else:
-                await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
-                answer, context = await self._react_refinement(
-                    query=query, paths=paths,
-                    initial_keywords=initial_keywords, spec_context=spec_context,
-                    enable_dir_scan=enable_dir_scan,
-                    max_loops=max_loops, max_token_budget=max_token_budget,
-                    max_depth=max_depth, include=include, exclude=exclude,
-                    enable_thinking=enable_thinking,
-                )
+            await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
+            answer, context = await self._react_refinement(
+                query=query, paths=paths,
+                initial_keywords=initial_keywords, spec_context=spec_context,
+                enable_dir_scan=enable_dir_scan,
+                max_loops=max_loops, max_token_budget=max_token_budget,
+                max_depth=max_depth, include=include, exclude=exclude,
+                enable_thinking=enable_thinking,
+            )
 
-                # Merge Phase 3 file marks into the new ReAct context
-                # so callers always see what was retrieved in Phase 2-3.
-                for fp in _phase3_read_files:
-                    context.mark_file_read(fp)
+            for fp in _phase3_read_files:
+                context.mark_file_read(fp)
 
-                if not cluster:
-                    cluster = await self._build_cluster_from_context(
-                        query=query, answer=answer, context=context,
-                        query_keywords=query_keywords, top_k_files=top_k_files,
-                    )
-                elif answer and not cluster.content:
-                    cluster.content = answer
+            if not cluster:
+                cluster = await self._build_cluster_from_context(
+                    query=query, answer=answer, context=context,
+                    query_keywords=query_keywords, top_k_files=top_k_files,
+                )
+            elif answer and not cluster.content:
+                cluster.content = answer
 
         # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
@@ -2311,41 +2318,42 @@ class AgenticSearch(BaseSearch):
             Tuple of (keyword_idf_dict, keyword_list).
         """
         await self._logger.info("[Probe:Keywords] Extracting keywords...")
-        dynamic_prompt = generate_keyword_extraction_prompt(num_levels=2)
-        keyword_prompt = dynamic_prompt.format(user_input=query)
-        kw_response = await self.llm.achat(
-            messages=[{"role": "user", "content": keyword_prompt}],
-            stream=False,
-            enable_thinking=False,
-        )
-        self.llm_usages.append(kw_response.usage)
 
-        keyword_sets = self._extract_and_validate_multi_level_keywords(
-            kw_response.content, num_levels=2,
-        )
+        try:
+            dynamic_prompt = generate_keyword_extraction_prompt(num_levels=2)
+            keyword_prompt = dynamic_prompt.format(user_input=query)
+            kw_response = await self.llm.achat(
+                messages=[{"role": "user", "content": keyword_prompt}],
+                stream=False,
+                enable_thinking=False,
+            )
+            self.llm_usages.append(kw_response.usage)
 
-        # Filter out template placeholders from all keyword sets
-        keyword_sets = [
-            {k: v for k, v in ks.items() if not self._is_placeholder(k)}
-            for ks in keyword_sets
-        ]
+            keyword_sets = self._extract_and_validate_multi_level_keywords(
+                kw_response.content, num_levels=2,
+            )
 
-        alt_keywords = self._extract_alt_keywords(kw_response.content)
-        if alt_keywords:
-            await self._logger.info(f"[Probe:Keywords] Cross-lingual alt: {list(alt_keywords.keys())}")
+            keyword_sets = [
+                {k: v for k, v in ks.items() if not self._is_placeholder(k)}
+                for ks in keyword_sets
+            ]
 
-        for kw_set in keyword_sets:
-            if kw_set:
-                merged = {**kw_set, **alt_keywords}
-                kw_list = list(merged.keys())
-                await self._logger.info(f"[Probe:Keywords] Extracted: {kw_list}")
-                return merged, kw_list
+            alt_keywords = self._extract_alt_keywords(kw_response.content)
+            if alt_keywords:
+                await self._logger.info(f"[Probe:Keywords] Cross-lingual alt: {list(alt_keywords.keys())}")
 
-        if alt_keywords:
-            return alt_keywords, list(alt_keywords.keys())
+            for kw_set in keyword_sets:
+                if kw_set:
+                    merged = {**kw_set, **alt_keywords}
+                    kw_list = list(merged.keys())
+                    await self._logger.info(f"[Probe:Keywords] Extracted: {kw_list}")
+                    return merged, kw_list
 
-        # Heuristic fallback: extract keywords directly from the query
-        # to avoid falling through to slow ReAct for every question.
+            if alt_keywords:
+                return alt_keywords, list(alt_keywords.keys())
+        except Exception as exc:
+            await self._logger.info(f"[Phase 1] keywords probe failed: {exc}")
+
         fallback = self._fallback_query_keywords(query)
         if fallback:
             kw_list = list(fallback.keys())
@@ -2834,6 +2842,29 @@ class AgenticSearch(BaseSearch):
     # ------------------------------------------------------------------
     # Phase 4: Answer generation
     # ------------------------------------------------------------------
+
+    _EMPTY_EVIDENCE_PATTERNS = re.compile(
+        r"(?i)"
+        r"(?:no\s+(?:data|information|evidence|results?|relevant)\s+found)"
+        r"|(?:资料缺失)"
+        r"|(?:未找到)"
+        r"|(?:no\s+matching)"
+        r"|(?:could\s+not\s+find)"
+        r"|(?:nothing\s+(?:found|relevant))"
+        r"|(?:search\s+returned?\s+no)"
+    )
+
+    @classmethod
+    def _is_evidence_meaningful(cls, content: str) -> bool:
+        """Return True only if content has real substance, not just placeholders."""
+        if not content:
+            return False
+        stripped = content.strip()
+        if len(stripped) < 80:
+            return False
+        if cls._EMPTY_EVIDENCE_PATTERNS.search(stripped[:300]):
+            return False
+        return True
 
     @staticmethod
     def _assemble_evidence_snippets(cluster: Any) -> str:

@@ -86,6 +86,9 @@ class ExperimentConfig:
     wiki_corpus_dir: Path
     output_dir: Path
 
+    # Memory
+    enable_memory: bool
+
     # Concurrency
     max_concurrent: int
     request_delay: float
@@ -138,6 +141,7 @@ def get_config(
         "dataset_dir": dataset_dir,
         "wiki_corpus_dir": wiki_corpus_dir,
         "output_dir": output_dir,
+        "enable_memory": _bool_env(os.getenv("SIRCHMUNK_ENABLE_MEMORY"), False),
         "max_concurrent": int(os.getenv("HOTPOT_MAX_CONCURRENT", "5")),
         "request_delay": float(os.getenv("HOTPOT_REQUEST_DELAY", "0.5")),
     }

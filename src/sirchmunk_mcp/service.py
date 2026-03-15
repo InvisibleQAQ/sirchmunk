@@ -144,6 +144,7 @@ class SirchmunkService:
                 verbose=self.config.sirchmunk.verbose,
                 log_callback=_mcp_log_callback,
                 reuse_knowledge=self.config.sirchmunk.enable_cluster_reuse,
+                enable_memory=self.config.sirchmunk.enable_memory,
                 cluster_sim_threshold=self.config.sirchmunk.cluster_similarity.threshold,
                 cluster_sim_top_k=self.config.sirchmunk.cluster_similarity.top_k,
             )

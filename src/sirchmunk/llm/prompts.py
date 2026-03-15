@@ -67,7 +67,7 @@ Output {num_levels} separate JSON-like dicts within their respective tags, follo
 {output_format_example}
 
 <KEYWORDS_ALT>
-{{"translated_keyword1": idf_value, "translated_keyword2": idf_value}}
+{{{{"translated_keyword1": idf_value, "translated_keyword2": idf_value}}}}
 </KEYWORDS_ALT>
 
 ### User Query:

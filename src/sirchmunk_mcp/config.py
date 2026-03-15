@@ -115,6 +115,10 @@ class SirchmunkConfig(BaseModel):
         default=True,
         description="Enable knowledge cluster reuse with embeddings"
     )
+    enable_memory: bool = Field(
+        default=False,
+        description="Enable self-evolving retrieval memory"
+    )
     cluster_similarity: ClusterSimilarityConfig = Field(
         default_factory=ClusterSimilarityConfig
     )
@@ -252,6 +256,7 @@ class Config(BaseModel):
             paths=parsed_paths,
             verbose=os.getenv("SIRCHMUNK_VERBOSE", "true").lower() == "true",
             enable_cluster_reuse=os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true",
+            enable_memory=os.getenv("SIRCHMUNK_ENABLE_MEMORY", "false").lower() in ("1", "true", "yes"),
             cluster_similarity=ClusterSimilarityConfig(
                 threshold=float(os.getenv("CLUSTER_SIM_THRESHOLD", "0.85")),
                 top_k=int(os.getenv("CLUSTER_SIM_TOP_K", "3")),

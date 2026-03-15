@@ -458,7 +458,12 @@ async def run_batch(
         base_url=cfg.llm_base_url,
         model=cfg.llm_model,
     )
-    searcher = AgenticSearch(llm=llm, reuse_knowledge=False, verbose=False)
+    searcher = AgenticSearch(
+        llm=llm,
+        reuse_knowledge=False,
+        verbose=False,
+        enable_memory=cfg.enable_memory,
+    )
 
     semaphore = asyncio.Semaphore(cfg.max_concurrent)
     total = len(samples)

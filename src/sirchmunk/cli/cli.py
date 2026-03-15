@@ -555,10 +555,12 @@ async def _search_local(
 
     # Create search instance
     work_path = _get_default_work_path()
+    enable_memory = os.getenv("SIRCHMUNK_ENABLE_MEMORY", "false").lower() in ("1", "true", "yes")
     searcher = AgenticSearch(
         llm=llm,
         work_path=str(work_path),
         verbose=verbose,
+        enable_memory=enable_memory,
     )
 
     if not verbose:
