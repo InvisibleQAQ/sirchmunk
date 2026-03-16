@@ -143,6 +143,7 @@ class KeywordSearchTool(BaseTool):
         max_snippet_lines: int = 5,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
+        bm25_scorer: Any = None,
     ) -> None:
         self._retriever = retriever
         self._paths = paths
@@ -150,8 +151,8 @@ class KeywordSearchTool(BaseTool):
         self._max_results = max_results
         self._max_snippet_lines = max_snippet_lines
         self._include = include
-        # Merge caller-provided excludes with sensible defaults (deduped)
         self._exclude = list(set(self._DEFAULT_EXCLUDE) | set(exclude or []))
+        self._bm25_scorer = bm25_scorer
 
     @property
     def name(self) -> str:
@@ -312,6 +313,12 @@ class KeywordSearchTool(BaseTool):
                 deduped[path] = []
             deduped[path].extend(item.get("matches", []))
 
+        # BM25-rerank files when more candidates than display limit
+        if self._bm25_scorer and len(deduped) > self._max_results:
+            ranked = self._bm25_rerank_results(keywords, deduped, self._max_results)
+            if ranked is not None:
+                deduped = ranked
+
         # Format as concise snippets (low token cost).
         # Use keyword-diverse selection: group matches by _keyword tag
         # and round-robin so each keyword contributes at least one
@@ -403,6 +410,35 @@ class KeywordSearchTool(BaseTool):
 
         return selected
 
+    def _bm25_rerank_results(
+        self,
+        keywords: List[str],
+        deduped: Dict[str, List[Dict]],
+        top_k: int,
+    ) -> Optional[Dict[str, List[Dict]]]:
+        """Rerank deduplicated file results by BM25 relevance to *keywords*."""
+        file_paths = list(deduped.keys())
+        docs = []
+        for matches in deduped.values():
+            text = " ".join(
+                m.get("data", {}).get("lines", {}).get("text", "")
+                for m in matches
+            ).strip()
+            docs.append(text or " ")
+        query = " ".join(keywords)
+        try:
+            indices = self._bm25_scorer.rerank(query, docs, top_k=top_k)
+            if indices:
+                ranked: Dict[str, List[Dict]] = {}
+                for idx in indices:
+                    if 0 <= idx < len(file_paths):
+                        key = file_paths[idx]
+                        ranked[key] = deduped[key]
+                return ranked if ranked else None
+        except Exception:
+            pass
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Tool 2: File Read (medium cost — returns full file content)
@@ -413,10 +449,19 @@ class FileReadTool(BaseTool):
 
     Supports all formats via kreuzberg extraction (PDF, DOCX, XLSX, etc.).
     Tracks read files in SearchContext to prevent redundant reads.
+    For large files, optional keyword-guided extraction via BM25 ranking
+    returns only the most relevant sections.
     """
 
-    def __init__(self, max_chars_per_file: int = 30000) -> None:
+    _LARGE_FILE_THRESHOLD = 30_000
+
+    def __init__(
+        self,
+        max_chars_per_file: int = 30000,
+        bm25_scorer: Any = None,
+    ) -> None:
         self._max_chars = max_chars_per_file
+        self._bm25_scorer = bm25_scorer
 
     @property
     def name(self) -> str:
@@ -428,7 +473,9 @@ class FileReadTool(BaseTool):
             "description": (
                 "Read the full content of one or more files. Supports PDF, "
                 "DOCX, XLSX, TXT, MD, and other formats. Use this after "
-                "keyword_search identifies promising files. Higher token cost."
+                "keyword_search identifies promising files. For large files, "
+                "provide keywords to extract only the most relevant sections. "
+                "Higher token cost."
             ),
             "parameters": {
                 "type": "object",
@@ -437,6 +484,15 @@ class FileReadTool(BaseTool):
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Absolute paths of files to read.",
+                    },
+                    "keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional focus keywords for large files. When "
+                            "provided, only sections relevant to these keywords "
+                            "are returned instead of the full content."
+                        ),
                     },
                 },
                 "required": ["file_paths"],
@@ -449,6 +505,7 @@ class FileReadTool(BaseTool):
         **kwargs,
     ) -> Tuple[str, Dict[str, Any]]:
         file_paths: List[str] = kwargs.get("file_paths", [])
+        keywords: List[str] = kwargs.get("keywords", [])
         if not file_paths:
             return "No file paths provided.", {}
 
@@ -459,12 +516,10 @@ class FileReadTool(BaseTool):
         for fp in file_paths:
             fp_str = str(fp)
 
-            # Dedup: skip already-read files
             if context.is_file_read(fp_str):
                 outputs.append(f"[{fp_str}] (already read, skipped)")
                 continue
 
-            # Budget check
             if context.is_budget_exceeded():
                 outputs.append(f"[{fp_str}] (skipped — token budget exceeded)")
                 break
@@ -475,11 +530,11 @@ class FileReadTool(BaseTool):
                     outputs.append(f"[{fp_str}] File not found.")
                     continue
 
-                # Text-like files: read directly; others: use kreuzberg
                 text_extensions = {
                     ".txt", ".md", ".py", ".js", ".ts", ".json", ".yaml",
                     ".yml", ".xml", ".csv", ".log", ".rst", ".html", ".css",
                     ".sh", ".bash", ".toml", ".cfg", ".ini", ".conf",
+                    ".jsonl",
                 }
                 if path.suffix.lower() in text_extensions:
                     content = path.read_text(encoding="utf-8", errors="replace")
@@ -487,7 +542,10 @@ class FileReadTool(BaseTool):
                     extraction = await fast_extract(path)
                     content = extraction.content if extraction else ""
 
-                # Truncate if needed
+                # Focused extraction for large files when keywords provided
+                if len(content) > self._LARGE_FILE_THRESHOLD and keywords:
+                    content = self._extract_focused_content(content, keywords)
+
                 if len(content) > self._max_chars:
                     content = content[: self._max_chars] + "\n... [truncated]"
 
@@ -508,6 +566,63 @@ class FileReadTool(BaseTool):
         )
 
         return result_text, {"files_read": files_read, "tokens": approx_tokens}
+
+    def _extract_focused_content(
+        self,
+        content: str,
+        keywords: List[str],
+        max_chunks: int = 20,
+    ) -> str:
+        """Extract keyword-relevant chunks using BM25 ranking.
+
+        Splits content into line-based chunks (preserving structural
+        boundaries for JSONL and similar formats), then selects the
+        most relevant chunks via BM25 scoring.  Falls back to simple
+        keyword matching when no scorer is available.
+        """
+        lines = content.splitlines()
+        if not lines:
+            return content
+
+        # Group lines into ~1000-char chunks, keeping lines intact
+        chunks: List[str] = []
+        buf: List[str] = []
+        buf_len = 0
+        for line in lines:
+            line_len = len(line) + 1
+            if buf_len + line_len > 1000 and buf:
+                chunks.append("\n".join(buf))
+                buf = [line]
+                buf_len = line_len
+            else:
+                buf.append(line)
+                buf_len += line_len
+        if buf:
+            chunks.append("\n".join(buf))
+
+        if len(chunks) <= max_chunks:
+            return content
+
+        query = " ".join(keywords)
+
+        if self._bm25_scorer:
+            try:
+                indices = self._bm25_scorer.rerank(
+                    query, chunks, top_k=max_chunks,
+                )
+                if indices:
+                    indices.sort()
+                    return "\n\n[...]\n\n".join(chunks[i] for i in indices)
+            except Exception:
+                pass
+
+        # Fallback: keyword matching
+        kw_lower = [k.lower() for k in keywords]
+        matched = [c for c in chunks if any(k in c.lower() for k in kw_lower)]
+        if matched:
+            return "\n\n[...]\n\n".join(matched[:max_chunks])
+
+        return content[: self._max_chars]
 
 
 # ---------------------------------------------------------------------------

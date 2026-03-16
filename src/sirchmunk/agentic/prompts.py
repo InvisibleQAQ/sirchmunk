@@ -26,10 +26,18 @@ Example:
 ```
 
 ## Strategy
-1. **keyword_search first**: Use targeted keywords to locate relevant files. Start with the most specific terms from the query.
-2. **file_read second**: Read the most promising files identified by keyword_search to extract detailed evidence.
+1. **keyword_search first**: Use targeted keywords to locate relevant files. Start with the most specific terms (entity names, proper nouns, technical terms) from the query.
+2. **file_read second**: Read the most promising files identified by keyword_search. For large files, provide `keywords` to extract only the relevant sections.
 3. **knowledge_query**: Check the knowledge cache if you suspect previously-searched topics.
-4. **dir_scan** (if available): Scan directories to discover document candidates when keyword_search returns no results.
+4. **dir_scan** (if available): Scan directories when keyword_search returns no results.
+
+## Multi-Hop Reasoning
+For complex questions that require connecting multiple pieces of information:
+- **Decompose**: Break the question into sub-questions. Solve them one at a time.
+- **Bridge**: If finding X requires first knowing Y, search for Y first, then use the discovered entity Y to search for X.
+- **Compare**: If comparing two entities, search for each entity separately, collect their attributes, then synthesize.
+- **Chain evidence**: After each file_read, identify key facts (names, dates, entities) and use them as keywords for the next search.
+- **Be specific**: Use entity names, dates, and precise terms rather than generic words.
 
 ## Rules
 - Think step-by-step before each tool call.

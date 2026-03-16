@@ -930,6 +930,19 @@ class AgenticSearch(BaseSearch):
     # Agentic (ReAct) infrastructure — lazy initialisation
     # ------------------------------------------------------------------
 
+    def _get_bm25_scorer(self):
+        """Lazily create a shared BM25Scorer with the best available tokenizer."""
+        if getattr(self, "_shared_bm25_scorer", None) is not None:
+            return self._shared_bm25_scorer
+        try:
+            from sirchmunk.utils.tokenizer_util import TokenizerUtil
+            tokenizer = TokenizerUtil()
+        except Exception:
+            tokenizer = None
+        from sirchmunk.utils.bm25_util import BM25Scorer
+        self._shared_bm25_scorer = BM25Scorer(tokenizer=tokenizer)
+        return self._shared_bm25_scorer
+
     def _ensure_tool_registry(
         self,
         paths: List[str],
@@ -974,11 +987,12 @@ class AgenticSearch(BaseSearch):
             return self._tool_registry
 
         registry = ToolRegistry()
+        bm25_scorer = self._get_bm25_scorer()
 
         # Tool 1: Knowledge cache (zero cost)
         registry.register(KnowledgeQueryTool(self.knowledge_storage))
 
-        # Tool 2: Keyword search (low cost)
+        # Tool 2: Keyword search (low cost, BM25-reranked)
         registry.register(
             KeywordSearchTool(
                 retriever=self.grep_retriever,
@@ -987,11 +1001,15 @@ class AgenticSearch(BaseSearch):
                 max_results=10,
                 include=include,
                 exclude=exclude,
+                bm25_scorer=bm25_scorer,
             )
         )
 
-        # Tool 3: File read (medium cost)
-        registry.register(FileReadTool(max_chars_per_file=30000))
+        # Tool 3: File read (medium cost, keyword-focused extraction)
+        registry.register(FileReadTool(
+            max_chars_per_file=30000,
+            bm25_scorer=bm25_scorer,
+        ))
 
         # Tool 4: Directory scan (optional, medium cost)
         if enable_dir_scan:
@@ -1019,9 +1037,9 @@ class AgenticSearch(BaseSearch):
         paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
         *,
         mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = "FAST",
-        max_loops: int = 5,
+        max_loops: int = 10,
         max_token_budget: int = 128000,
-        max_depth: Optional[int] = 5,
+        max_depth: Optional[int] = 8,
         top_k_files: int = 5,
         enable_dir_scan: bool = False,
         include: Optional[List[str]] = None,
@@ -1061,7 +1079,7 @@ class AgenticSearch(BaseSearch):
         │ Step 4  LLM answer synthesis from evidence               │
         └──────────────────────────────────────────────────────────┘
 
-        DEEP architecture (phases execute as parallel as possible):
+        DEEP architecture (ReAct-first iterative retrieval):
 
         ┌──────────────────────────────────────────────────────────┐
         │ Phase 0a Direct document analysis (intent-gated,         │
@@ -1069,25 +1087,20 @@ class AgenticSearch(BaseSearch):
         ├──────────────────────────────────────────────────────────┤
         │ Phase 0  Cluster reuse check (instant, short-circuit)    │
         ├──────────────────────────────────────────────────────────┤
-        │ Phase 1  Parallel probing (all concurrent):              │
+        │ Phase 1  Parallel warm-start probing (all concurrent):   │
         │  ├─ LLM keyword extraction                               │
         │  ├─ DirectoryScanner.scan() (filesystem only, fast)      │
         │  ├─ Knowledge cache similarity search                    │
         │  └─ Spec-path cache load                                 │
         ├──────────────────────────────────────────────────────────┤
-        │ Phase 2  Parallel retrieval (depends on Phase 1):        │
-        │  ├─ keyword_search per extracted keyword (concurrent rga)│
-        │  └─ DirectoryScanner.rank() (LLM ranks candidates)      │
+        │ Phase 2  ReAct-driven iterative retrieval:               │
+        │  └─ Agent loop with warm-start keywords + tools:         │
+        │     keyword_search (BM25-reranked), file_read (focused   │
+        │     extraction), knowledge_query, dir_scan (optional)    │
         ├──────────────────────────────────────────────────────────┤
-        │ Phase 3  Merge + evidence assembly:                      │
-        │  └─ knowledge_base.build() (parallel per-file Monte      │
-        │     Carlo evidence sampling)                             │
+        │ Phase 3  Cluster construction from ReAct discoveries     │
         ├──────────────────────────────────────────────────────────┤
-        │ Phase 4  Summary / ReAct refinement:                     │
-        │  └─ If evidence sufficient → LLM summary                 │
-        │     Else → ReAct loop for adaptive follow-up             │
-        ├──────────────────────────────────────────────────────────┤
-        │ Phase 5  Persistence (concurrent, awaited):                │
+        │ Phase 4  Persistence (concurrent, quality-gated):        │
         │  ├─ Save cluster + embeddings                            │
         │  └─ Save spec-path cache                                 │
         └──────────────────────────────────────────────────────────┘
@@ -1243,7 +1256,13 @@ class AgenticSearch(BaseSearch):
         memory_extra_files: Optional[List[str]] = None,
         memory_extra_keywords: Optional[List[str]] = None,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
-        """Parallel multi-path retrieval pipeline (Phases 0a–5).
+        """ReAct-first iterative retrieval pipeline (Phases 0a–4).
+
+        Phase 0a/0 provide short-circuit paths for cached knowledge.
+        Phase 1 extracts warm-start data (keywords, dir_scan, knowledge).
+        Phase 2 drives a ReAct agent loop with enhanced tools.
+        Phase 3 constructs a knowledge cluster from ReAct discoveries.
+        Phase 4 persists quality-gated results.
 
         Returns:
             ``(answer, cluster, context)`` tuple.
@@ -1264,7 +1283,7 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         # Phase 0: Cluster reuse (instant short-circuit)
         # When reuse_knowledge=True and a similar cluster is found, we
-        # return here — Phase 5 (Persistence) is not executed for that path.
+        # return here — Phase 4 (Persistence) is not executed for that path.
         # ==============================================================
         reused = await self._try_reuse_cluster(query)
         if reused is not None:
@@ -1333,175 +1352,34 @@ class AgenticSearch(BaseSearch):
         )
 
         # ==============================================================
-        # Phase 2: Parallel retrieval — keyword search + dir_scan rank
+        # Phase 2: ReAct-driven iterative retrieval
+        # The agent receives Phase 1 warm-start data (keywords, spec
+        # context) and uses enhanced tools (BM25-reranked keyword search,
+        # keyword-focused file read) for multi-hop reasoning.
         # ==============================================================
-        await self._logger.info("[Phase 2] Parallel retrieval: rga keyword search + dir_scan LLM rank")
-        context.increment_loop()
+        await self._logger.info("[Phase 2] Launching ReAct agent for iterative retrieval")
 
-        phase2_tasks = []
-
-        if initial_keywords:
-            phase2_tasks.append(
-                self._retrieve_by_keywords(
-                    initial_keywords, paths,
-                    max_depth=max_depth, include=include, exclude=exclude,
-                )
-            )
-        else:
-            phase2_tasks.append(self._async_noop([]))
-
-        if scan_result is not None and enable_dir_scan:
-            phase2_tasks.append(
-                self._rank_dir_scan_candidates(query, scan_result)
-            )
-        else:
-            phase2_tasks.append(self._async_noop([]))
-
-        phase2_results = await asyncio.gather(*phase2_tasks, return_exceptions=True)
-
-        keyword_files = phase2_results[0] if not isinstance(phase2_results[0], Exception) else []
-        dir_scan_files = phase2_results[1] if not isinstance(phase2_results[1], Exception) else []
-
-        for i, label in enumerate(["keyword_search", "dir_scan_rank"]):
-            if isinstance(phase2_results[i], Exception):
-                await self._logger.warning(f"[Phase 2] {label} failed: {phase2_results[i]}")
-
-        await self._logger.info(
-            f"[Phase 2] Results: keyword_files={len(keyword_files)}, "
-            f"dir_scan_files={len(dir_scan_files)}"
+        answer, context = await self._react_refinement(
+            query=query, paths=paths,
+            initial_keywords=initial_keywords, spec_context=spec_context,
+            enable_dir_scan=enable_dir_scan,
+            max_loops=max_loops, max_token_budget=max_token_budget,
+            max_depth=max_depth, include=include, exclude=exclude,
+            enable_thinking=enable_thinking,
         )
 
         # ==============================================================
-        # Phase 3: Merge file paths + build KnowledgeCluster
+        # Phase 3: Cluster construction from ReAct discoveries
         # ==============================================================
-        context.increment_loop()
-
-        # Memory: supplement candidates with entity-based path lookup
-        memory_paths: List[str] = []
-        if self._memory and query_keywords:
-            try:
-                entities = self._memory.extract_entities(
-                    list(query_keywords.keys())
-                )
-                memory_paths = self._memory.get_entity_paths(entities)
-            except Exception:
-                pass
-
-        # Merge similar-query file hints from memory
-        all_extra = list(set(memory_paths + (memory_extra_files or [])))
-
-        merged_files = self._merge_file_paths(
-            keyword_files=keyword_files,
-            dir_scan_files=dir_scan_files,
-            knowledge_hits=knowledge_hits + all_extra,
-        )
-        await self._logger.info(f"[Phase 3] Merged {len(merged_files)} unique candidate files")
-
-        # Memory: filter out known dead paths
-        if self._memory and merged_files:
-            try:
-                merged_files = self._memory.filter_dead_paths(merged_files)
-            except Exception:
-                pass
-
-        # Memory: boost hot paths during BM25 reranking
-        _path_boost: Dict[str, float] = {}
-        if self._memory and merged_files:
-            try:
-                _path_boost = self._memory.get_path_scores(merged_files)
-            except Exception:
-                pass
-
-        # BM25 rerank: when candidates far exceed top_k_files, use BM25
-        # scoring to pick the most query-relevant files before the
-        # expensive Monte Carlo evidence extraction.
-        if len(merged_files) > top_k_files * 2:
-            try:
-                loop = asyncio.get_running_loop()
-                reranked = await loop.run_in_executor(
-                    None,
-                    self._bm25_rerank_files,
-                    query, merged_files, top_k_files * 2,
-                )
-            except Exception:
-                reranked = None
-            if reranked is not None:
-                await self._logger.info(
-                    f"[Phase 3] BM25 reranked {len(merged_files)} -> {len(reranked)} files"
-                )
-                merged_files = reranked
-
         cluster: Optional[KnowledgeCluster] = None
-        if merged_files:
-            cluster = await self._build_cluster(
-                query=query, file_paths=merged_files,
+        should_save: bool = False
+
+        if answer and self._is_evidence_meaningful(answer):
+            cluster = await self._build_cluster_from_context(
+                query=query, answer=answer, context=context,
                 query_keywords=query_keywords, top_k_files=top_k_files,
             )
-
-        # Sync file paths into context so callers can see what was read.
-        # _build_cluster delegates to knowledge_base.build() which reads
-        # files internally but doesn't populate context.read_file_ids.
-        for fp in merged_files[:top_k_files]:
-            context.mark_file_read(fp)
-        if cluster:
-            for ev in (getattr(cluster, "evidences", None) or []):
-                fp = str(getattr(ev, "file_or_url", ""))
-                if fp:
-                    context.mark_file_read(fp)
-
-        # ==============================================================
-        # Phase 4: Generate answer — cluster summary or ReAct refinement
-        # ==============================================================
-        context.increment_loop()
-        answer: str = ""
-        should_save: bool = True
-
-        # Preserve Phase 3 file marks before possible context reassignment
-        _phase3_read_files = set(context.read_file_ids)
-
-        _has_quality_evidence = (
-            cluster
-            and cluster.content
-            and self._is_evidence_meaningful(cluster.content)
-        )
-
-        _needs_react = not _has_quality_evidence
-
-        if _has_quality_evidence:
-            await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
-            answer, should_save = await self._summarise_cluster(
-                query, cluster, enable_thinking=enable_thinking,
-            )
-            if not cluster.search_results:
-                cluster.search_results = list(merged_files)
-
-            if not should_save or not self._is_evidence_meaningful(answer):
-                await self._logger.info(
-                    "[Phase 4] Summary indicates insufficient evidence, escalating to ReAct"
-                )
-                _needs_react = True
-
-        if _needs_react:
-            await self._logger.info("[Phase 4] Launching ReAct refinement")
-            answer, context = await self._react_refinement(
-                query=query, paths=paths,
-                initial_keywords=initial_keywords, spec_context=spec_context,
-                enable_dir_scan=enable_dir_scan,
-                max_loops=max_loops, max_token_budget=max_token_budget,
-                max_depth=max_depth, include=include, exclude=exclude,
-                enable_thinking=enable_thinking,
-            )
-
-            for fp in _phase3_read_files:
-                context.mark_file_read(fp)
-
-            if not cluster:
-                cluster = await self._build_cluster_from_context(
-                    query=query, answer=answer, context=context,
-                    query_keywords=query_keywords, top_k_files=top_k_files,
-                )
-            elif answer and not cluster.content:
-                cluster.content = answer
+            should_save = cluster is not None
 
         # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
@@ -1513,22 +1391,20 @@ class AgenticSearch(BaseSearch):
                 context.add_llm_tokens(total_tok, usage=usage)
 
         # ==============================================================
-        # Phase 5: Persistence (quality-gated)
-        # Skipped when Phase 4 quality check says the answer is low-quality
-        # or when Phase 0 reused a cluster (early-returned above).
+        # Phase 4: Persistence (quality-gated)
         # ==============================================================
-        phase5_tasks = []
+        phase4_tasks = []
         if cluster and should_save:
             self._add_query_to_cluster(cluster, query)
-            phase5_tasks.append(self._save_cluster_with_embedding(cluster))
-        elif not should_save:
-            await self._logger.info("[Phase 5] Quality gate: low-quality answer, skipping cluster save")
+            phase4_tasks.append(self._save_cluster_with_embedding(cluster))
+        else:
+            await self._logger.info("[Phase 4] Quality gate: skipping cluster save")
             cluster = None
-        phase5_tasks.append(self._save_spec_context(paths, context, scan_result=scan_result))
-        results = await asyncio.gather(*phase5_tasks, return_exceptions=True)
+        phase4_tasks.append(self._save_spec_context(paths, context, scan_result=scan_result))
+        results = await asyncio.gather(*phase4_tasks, return_exceptions=True)
         for r in results:
             if isinstance(r, Exception):
-                _loguru_logger.warning(f"[Phase 5] Persistence task failed: {r}")
+                _loguru_logger.warning(f"[Phase 4] Persistence task failed: {r}")
 
         # Memory: record feedback signal (fire-and-forget)
         if self._memory:
@@ -1540,23 +1416,23 @@ class AgenticSearch(BaseSearch):
                        if context.start_time.tzinfo is None
                        else context.start_time)
                 ).total_seconds()
-                _discovered = list(set(
-                    keyword_files + dir_scan_files + all_extra
-                ))
+                _discovered = list(context.read_file_ids)
+                for log_entry in context.retrieval_logs:
+                    if log_entry.tool_name == "keyword_search":
+                        for p in log_entry.metadata.get("files_discovered", []):
+                            if p not in _discovered:
+                                _discovered.append(p)
                 signal = FeedbackSignal(
                     query=query,
                     mode="DEEP",
                     answer_found=bool(answer and answer.strip()),
                     answer_text=(answer or "")[:2000],
                     cluster_confidence=(
-                        getattr(cluster, "confidence", 0.0)
-                        if cluster else 0.0
+                        getattr(cluster, "confidence", 0.0) if cluster else 0.0
                     ),
                     react_loops=context.loop_count,
                     files_read_count=len(context.read_file_ids),
-                    files_useful_count=len(
-                        context.read_file_ids
-                    ) if (answer and answer.strip()) else 0,
+                    files_useful_count=len(context.read_file_ids) if (answer and answer.strip()) else 0,
                     total_tokens=context.total_llm_tokens,
                     latency_sec=elapsed,
                     keywords_used=list(query_keywords.keys()) if query_keywords else [],
