@@ -1465,6 +1465,8 @@ class AgenticSearch(BaseSearch):
             and self._is_evidence_meaningful(cluster.content)
         )
 
+        _needs_react = not _has_quality_evidence
+
         if _has_quality_evidence:
             await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
             answer, should_save = await self._summarise_cluster(
@@ -1472,12 +1474,15 @@ class AgenticSearch(BaseSearch):
             )
             if not cluster.search_results:
                 cluster.search_results = list(merged_files)
-        else:
-            if cluster and cluster.content and not _has_quality_evidence:
+
+            if not should_save or not self._is_evidence_meaningful(answer):
                 await self._logger.info(
-                    "[Phase 4] Cluster content present but low quality, falling through to ReAct"
+                    "[Phase 4] Summary indicates insufficient evidence, escalating to ReAct"
                 )
-            await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
+                _needs_react = True
+
+        if _needs_react:
+            await self._logger.info("[Phase 4] Launching ReAct refinement")
             answer, context = await self._react_refinement(
                 query=query, paths=paths,
                 initial_keywords=initial_keywords, spec_context=spec_context,
@@ -2846,12 +2851,24 @@ class AgenticSearch(BaseSearch):
     _EMPTY_EVIDENCE_PATTERNS = re.compile(
         r"(?i)"
         r"(?:no\s+(?:data|information|evidence|results?|relevant)\s+found)"
-        r"|(?:资料缺失)"
-        r"|(?:未找到)"
-        r"|(?:no\s+matching)"
-        r"|(?:could\s+not\s+find)"
+        r"|(?:no\s+(?:information\s+is\s+)?available)"
+        r"|(?:could\s+not\s+(?:find|determine|identify))"
         r"|(?:nothing\s+(?:found|relevant))"
         r"|(?:search\s+returned?\s+no)"
+        r"|(?:no\s+matching)"
+        r"|(?:insufficient\s+(?:data|evidence|information))"
+        # Chinese
+        r"|(?:资料缺失)"
+        r"|(?:未找到)"
+        r"|(?:没有找到)"
+        # French
+        r"|(?:aucun[e]?\s+(?:donn[ée]e|r[ée]ponse|information|r[ée]sultat)\s+trouv[ée])"
+        r"|(?:donn[ée]es?\s+insuffisantes?)"
+        # Spanish
+        r"|(?:datos?\s+insuficientes?)"
+        r"|(?:no\s+se\s+(?:encontr[oó]|hall[oó]))"
+        # German
+        r"|(?:keine\s+(?:daten|ergebnisse|informationen)\s+gefunden)"
     )
 
     @classmethod

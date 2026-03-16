@@ -32,10 +32,12 @@ _EXTRACT_PROMPT = """\
 Given the question and a verbose response, extract ONLY the short factoid answer.
 Rules:
 - Output ONLY the answer phrase (1-10 words). No explanation.
-- If the response says it cannot find the answer, output: unknown
-- For yes/no questions, output: yes or no
+- Look for bold text, named entities, dates, numbers, or proper nouns that directly answer the question.
+- For yes/no or comparison questions, output: yes or no
 - For dates, use the format that appears in the response.
 - For person names, use the full name as it appears in the response.
+- Even if the response expresses uncertainty or says information is incomplete, extract any specific entity/fact that partially answers the question.
+- Output "unknown" ONLY if absolutely no relevant entity, date, name, or fact can be found anywhere in the response.
 
 Question: {question}
 Response:
@@ -79,6 +81,38 @@ def _normalize_prediction(pred: str) -> str:
     return s
 
 
+_BOLD_RE = re.compile(r"\*\*([^*]{2,80})\*\*")
+
+
+_BOLD_BLACKLIST = frozenset((
+    "missing", "unknown", "not found", "no data", "insufficient",
+    "not specify", "not available", "no information", "do not",
+    "query", "question", "overview", "summary", "briefing",
+    "executive", "context", "status", "result", "event",
+    "subject", "key finding", "confirmed", "note",
+    "objective", "aucun", "estado", "résultat", "dato",
+))
+
+
+def _extract_bold_entities(text: str) -> List[str]:
+    """Extract bold-text entities from markdown as candidate answers.
+
+    Filters out field labels (bold text immediately followed by ':')
+    and known non-answer keywords.
+    """
+    out = []
+    for m in _BOLD_RE.finditer(text):
+        val = m.group(1).strip()
+        val_lower = val.lower()
+        if len(val) < 2 or any(kw in val_lower for kw in _BOLD_BLACKLIST):
+            continue
+        after_pos = m.end()
+        if after_pos < len(text) and text[after_pos:after_pos + 1] == ":":
+            continue
+        out.append(val)
+    return out
+
+
 async def _extract_short_answer(
     question: str,
     verbose: str,
@@ -94,9 +128,18 @@ async def _extract_short_answer(
             messages=[{"role": "user", "content": prompt}],
             stream=False,
         )
-        return resp.content.strip()
+        answer = resp.content.strip()
     except Exception:
-        return verbose
+        answer = ""
+
+    if answer and answer.lower() != "unknown":
+        return answer
+
+    candidates = _extract_bold_entities(verbose)
+    if candidates:
+        return candidates[0]
+
+    return answer or verbose
 
 
 # ---------------------------------------------------------------------------
