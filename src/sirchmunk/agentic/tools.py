@@ -464,9 +464,61 @@ class FileReadTool(BaseTool):
         self,
         max_chars_per_file: int = 30000,
         bm25_scorer: Any = None,
+        base_paths: Optional[List[str]] = None,
     ) -> None:
         self._max_chars = max_chars_per_file
         self._bm25_scorer = bm25_scorer
+        # Base paths for relative path resolution (e.g., wiki corpus dir)
+        self._base_paths = [Path(p).resolve() for p in (base_paths or [])]
+
+    @staticmethod
+    def _normalize_path(fp: str, base_paths: Optional[List[Path]] = None) -> Optional[Path]:
+        """Normalize and resolve file path with multiple fallback strategies.
+
+        Handles:
+        - Absolute paths (returned as-is if they exist)
+        - Relative paths (resolved against base_paths)
+        - Paths with symlinks (resolved to real path)
+        - Paths with case mismatches on case-insensitive systems
+
+        Args:
+            fp: File path string to normalize.
+            base_paths: List of base directories to try for relative path resolution.
+
+        Returns:
+            Resolved Path if file exists, None otherwise.
+        """
+        # Strategy 1: Direct absolute/relative path
+        path = Path(fp)
+        if path.is_absolute():
+            if path.exists():
+                return path.resolve()
+            # Try resolving symlinks
+            try:
+                resolved = path.resolve(strict=False)
+                if resolved.exists():
+                    return resolved
+            except (OSError, RuntimeError):
+                pass
+        else:
+            # Relative path: try resolving against base_paths
+            for base in (base_paths or []):
+                candidate = base / fp
+                if candidate.exists():
+                    return candidate.resolve()
+
+        # Strategy 2: Basename matching against base_paths
+        # (handles cases where only filename is provided)
+        basename = Path(fp).name
+        if basename and base_paths:
+            for base in base_paths:
+                if base.is_dir():
+                    # Look for the file in immediate children or subdirs
+                    for candidate in base.rglob(basename):
+                        if candidate.is_file():
+                            return candidate.resolve()
+
+        return None
 
     @property
     def name(self) -> str:
@@ -521,6 +573,11 @@ class FileReadTool(BaseTool):
         for fp in file_paths:
             fp_str = str(fp)
 
+            # Normalize path with fallback strategies
+            resolved = self._normalize_path(fp_str, self._base_paths)
+            if resolved:
+                fp_str = str(resolved)
+
             if context.is_file_read(fp_str):
                 outputs.append(f"[{fp_str}] (already read, skipped)")
                 continue
@@ -532,7 +589,8 @@ class FileReadTool(BaseTool):
             try:
                 path = Path(fp_str)
                 if not path.exists():
-                    outputs.append(f"[{fp_str}] File not found.")
+                    # Log the failed path for debugging
+                    outputs.append(f"[{fp_str}] File not found. (original: {fp})")
                     continue
 
                 text_extensions = {

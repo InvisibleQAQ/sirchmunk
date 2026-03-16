@@ -224,19 +224,30 @@ Detect the language of the "Query" and respond in the same language.
 Query: "{query}"
 {snippets_block}
 
-### Output Requirement:
-Return a JSON array with one object per snippet, in the same order:
+### Output Format (STRICT - follow exactly):
+You MUST return a valid JSON array with one object per snippet, in the same order as the snippets above.
+Each object MUST have exactly these fields: "id" (integer), "score" (number 0-10), "reasoning" (string).
+
+Example for 3 snippets:
+```json
 [
-  {{"id": 1, "score": <0-10>, "reasoning": "<short reasoning>"}},
-  ...
+  {{"id": 1, "score": 7, "reasoning": "Contains relevant date information"}},
+  {{"id": 2, "score": 3, "reasoning": "Topic unrelated to query"}},
+  {{"id": 3, "score": 9, "reasoning": "Direct answer found"}}
 ]
+```
 
-Score scale (0-10):
-  0-3: Completely irrelevant.
-  4-7: Contains relevant keywords or context but no direct answer.
-  8-10: Contains exact data, facts, or direct answer.
+### Score Guidelines:
+- 0-3: Completely irrelevant to the query
+- 4-7: Contains relevant keywords/context but no direct answer
+- 8-10: Contains exact data, facts, or direct answer
 
-JSON array only, no other text.
+### Critical Rules:
+1. Output ONLY the JSON array - no explanations, no markdown formatting, no extra text
+2. The array must contain exactly one object per snippet, in order
+3. All id values must be integers starting from 1
+4. All score values must be numbers between 0 and 10
+5. Do NOT wrap the JSON in markdown code blocks
 """
 
 

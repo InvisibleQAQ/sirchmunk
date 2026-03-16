@@ -92,6 +92,9 @@ class ExperimentConfig:
     # Memory
     enable_memory: bool
 
+    # Knowledge reuse
+    reuse_knowledge: bool
+
     # Concurrency
     max_concurrent: int
     request_delay: float
@@ -146,6 +149,7 @@ def get_config(
         "output_dir": output_dir,
         "enable_thinking": _bool_env(os.getenv("SIRCHMUNK_ENABLE_THINKING"), False),
         "enable_memory": _bool_env(os.getenv("SIRCHMUNK_ENABLE_MEMORY"), False),
+        "reuse_knowledge": _bool_env(os.getenv("HOTPOT_REUSE_KNOWLEDGE"), False),
         "max_concurrent": int(os.getenv("HOTPOT_MAX_CONCURRENT", "5")),
         "request_delay": float(os.getenv("HOTPOT_REQUEST_DELAY", "0.5")),
     }

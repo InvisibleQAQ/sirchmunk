@@ -11,6 +11,56 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 
+# ---------------------------------------------------------------------------
+# Sentence boundary detection patterns
+# ---------------------------------------------------------------------------
+# Matches sentence-ending punctuation followed by whitespace
+_SENTENCE_SPLIT_RE = re.compile(
+    r'(?<=[.!?。！？])\s+'
+)
+
+
+def find_sentence_boundary(text: str, near_pos: int, window: int = 50) -> int:
+    """Find the nearest sentence boundary to a position within a window.
+
+    Searches for sentence-ending punctuation (.!?。！？) followed by whitespace
+    in a window around ``near_pos``, preferring boundaries before the position.
+
+    Args:
+        text: Full document text.
+        near_pos: Target position to search near.
+        window: Search window size on each side (default 50 chars).
+
+    Returns:
+        Best boundary position, or ``near_pos`` if no boundary found.
+    """
+    if near_pos <= 0:
+        return 0
+    if near_pos >= len(text):
+        return len(text)
+
+    start = max(0, near_pos - window)
+    end = min(len(text), near_pos + window)
+    search_region = text[start:end]
+
+    # Find all sentence boundaries in the region
+    boundaries = []
+    for m in _SENTENCE_SPLIT_RE.finditer(search_region):
+        # Position after the punctuation and whitespace
+        abs_pos = start + m.end()
+        distance = abs(abs_pos - near_pos)
+        # Prefer boundaries before the target position (penalty for after)
+        prefer_before = 1 if abs_pos <= near_pos else 2
+        boundaries.append((distance, prefer_before, abs_pos))
+
+    if boundaries:
+        # Sort by distance, then prefer boundaries before target
+        boundaries.sort(key=lambda x: (x[0], x[1]))
+        return boundaries[0][2]
+
+    return near_pos
+
+
 @dataclass
 class Chunk:
     """A semantically coherent document segment."""
@@ -208,6 +258,11 @@ class DocumentChunker:
         return balanced if balanced else [Chunk(start=0, end=len(doc), content=doc, chunk_type="text")]
 
     def _split_fixed(self, chunk: Chunk) -> List[Chunk]:
+        """Split oversized chunks at natural boundaries (sentence > paragraph > newline).
+
+        Uses sentence boundary detection to avoid cutting mid-sentence,
+        which improves evidence evaluation quality.
+        """
         parts: List[Chunk] = []
         text = chunk.content
         offset = chunk.start
@@ -217,12 +272,18 @@ class DocumentChunker:
         while i < len(text):
             end = min(i + step, len(text))
             if end < len(text):
-                search_start = max(i, end - step // 5)
-                for sep in ("\n", ". ", "。", "；", "; "):
-                    idx = text.rfind(sep, search_start, end)
-                    if idx > i:
-                        end = idx + len(sep)
-                        break
+                # Strategy 1: Try sentence boundary first (highest quality)
+                sent_boundary = find_sentence_boundary(text, end, window=step // 4)
+                if sent_boundary > i and sent_boundary < len(text):
+                    end = sent_boundary
+                else:
+                    # Strategy 2: Fall back to paragraph/newline/punctuation
+                    search_start = max(i, end - step // 5)
+                    for sep in ("\n\n", "\n", ". ", "。", "；", "; "):
+                        idx = text.rfind(sep, search_start, end)
+                        if idx > i:
+                            end = idx + len(sep)
+                            break
             segment = text[i:end]
             if segment.strip():
                 parts.append(

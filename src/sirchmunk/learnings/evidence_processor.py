@@ -83,7 +83,7 @@ class EvidenceSampler:
         self,
         query: str,
         keywords: Dict[str, float] = None,
-        confidence_threshold: float = 8.5,
+        confidence_threshold: float = 7.0,
         top_k: int = 5,
     ) -> RoiResult:
         keywords = keywords or {}

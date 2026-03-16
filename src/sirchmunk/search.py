@@ -1009,6 +1009,7 @@ class AgenticSearch(BaseSearch):
         registry.register(FileReadTool(
             max_chars_per_file=30000,
             bm25_scorer=bm25_scorer,
+            base_paths=paths,  # Enable path resolution fallback
         ))
 
         # Tool 4: Directory scan (optional, medium cost)

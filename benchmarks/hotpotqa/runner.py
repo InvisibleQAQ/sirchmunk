@@ -22,11 +22,105 @@ collapsing SP precision to near zero.
 
 import asyncio
 import json as json_mod
+import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from config import ExperimentConfig
+
+
+# ---------------------------------------------------------------------------
+# Wikipedia title → filepath index
+# ---------------------------------------------------------------------------
+# Global index: normalized_title -> list of file paths containing articles with that title
+_WIKI_TITLE_INDEX: Dict[str, List[str]] = {}
+_TITLE_INDEX_BUILT = False
+
+
+def _normalize_title(title: str) -> str:
+    """Normalize title for index lookup (lowercase, strip whitespace)."""
+    return title.lower().strip()
+
+
+def build_title_index(wiki_corpus_dir: Path, progress_interval: int = 1000) -> int:
+    """Build title→filepath index from Wikipedia JSONL files.
+
+    Scans all .jsonl files in the corpus directory, parses article titles,
+    and builds a mapping for efficient lookup. Called once at startup.
+
+    Args:
+        wiki_corpus_dir: Root directory containing Wikipedia JSONL files.
+        progress_interval: Print progress every N files.
+
+    Returns:
+        Number of titles indexed.
+    """
+    global _WIKI_TITLE_INDEX, _TITLE_INDEX_BUILT
+
+    if _TITLE_INDEX_BUILT:
+        return len(_WIKI_TITLE_INDEX)
+
+    if not wiki_corpus_dir.exists():
+        print(f"[TitleIndex] Wiki corpus dir not found: {wiki_corpus_dir}")
+        _TITLE_INDEX_BUILT = True
+        return 0
+
+    print(f"[TitleIndex] Building title→filepath index from: {wiki_corpus_dir}")
+    start_time = time.time()
+    files_processed = 0
+    titles_indexed = 0
+
+    # Find all JSONL files
+    jsonl_files = list(wiki_corpus_dir.rglob("*.jsonl"))
+    print(f"[TitleIndex] Found {len(jsonl_files)} JSONL files to index")
+
+    for jsonl_path in jsonl_files:
+        try:
+            with open(jsonl_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json_mod.loads(line)
+                        title = obj.get("title")
+                        if title:
+                            norm_title = _normalize_title(title)
+                            if norm_title not in _WIKI_TITLE_INDEX:
+                                _WIKI_TITLE_INDEX[norm_title] = []
+                            fp_str = str(jsonl_path)
+                            if fp_str not in _WIKI_TITLE_INDEX[norm_title]:
+                                _WIKI_TITLE_INDEX[norm_title].append(fp_str)
+                            titles_indexed += 1
+                    except (json_mod.JSONDecodeError, TypeError):
+                        continue
+            files_processed += 1
+            if files_processed % progress_interval == 0:
+                print(f"[TitleIndex] Processed {files_processed}/{len(jsonl_files)} files, "
+                      f"{titles_indexed} titles indexed")
+        except (FileNotFoundError, PermissionError, UnicodeDecodeError) as e:
+            continue
+
+    elapsed = time.time() - start_time
+    print(f"[TitleIndex] Complete: {len(_WIKI_TITLE_INDEX)} unique titles from "
+          f"{files_processed} files in {elapsed:.1f}s")
+
+    _TITLE_INDEX_BUILT = True
+    return len(_WIKI_TITLE_INDEX)
+
+
+def lookup_title_files(title: str) -> List[str]:
+    """Look up file paths containing a given title.
+
+    Args:
+        title: Article title to look up (case-insensitive).
+
+    Returns:
+        List of file paths containing articles with this title.
+    """
+    return _WIKI_TITLE_INDEX.get(_normalize_title(title), [])
 
 _EXTRACT_PROMPT = """\
 Given the question and a verbose response, extract ONLY the short factoid answer.
@@ -50,17 +144,28 @@ def _normalize_prediction(pred: str) -> str:
     """Post-process prediction to improve EM/F1 matching.
 
     Strips markdown formatting, quotation marks, trailing periods,
-    common wrapper phrases, and normalizes common formatting
-    differences (ampersand, ordinals, hedging prefixes).
+    common wrapper phrases, Wikipedia disambiguation patterns, and
+    normalizes common formatting differences (ampersand, ordinals,
+    hedging prefixes).
     """
     s = pred.strip()
+    # Remove markdown bold/italic
     s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
     s = re.sub(r"\*(.+?)\*", r"\1", s)
+    # Remove quotes
     if len(s) >= 2 and s[0] in ('"', "'", "\u201c", "\u2018") and s[-1] in ('"', "'", "\u201d", "\u2019"):
         s = s[1:-1].strip()
     s = s.rstrip(".:")
+
+    # Wikipedia disambiguation removal - patterns like "Foo (film)" -> "Foo"
+    # Only remove if disambiguation suffix is at the end
+    s = re.sub(r"\s*\((?:film|movie|band|singer|actor|actress|musician|album|song|novel|book|TV series|series|disambiguation|person|place|company|organization|politician|athlete|writer|artist|painter|director|composer|scientist|mathematician|physicist|chemist|biologist|philosopher|economist|historian|psychologist|sociologist|anthropologist)\)\s*$", "", s, flags=re.IGNORECASE).strip()
+
+    # Normalize common formatting
     s = s.replace(" & ", " and ")
     s = re.sub(r'\b(\d+)(?:st|nd|rd|th)\b', r'\1', s)
+
+    # Remove common wrapper prefixes
     _PREFIXES = [
         "the answer is: ", "the answer is ",
         "the short answer is: ", "the short answer is ",
@@ -77,7 +182,13 @@ def _normalize_prediction(pred: str) -> str:
         if s_lower.startswith(prefix):
             s = s[len(prefix):].strip()
             s_lower = s.lower()
+
+    # Remove trailing parenthetical (often metadata or Wikipedia disambiguation)
     s = re.sub(r"\s*\(.*?\)\s*$", "", s).strip()
+
+    # Normalize full-width to half-width common chars
+    s = s.replace("：", ":").replace("，", ",").replace("。", ".")
+
     return s
 
 
@@ -230,27 +341,44 @@ def _is_title_relevant(
     title: str,
     context_lower: str,
     context_tokens: Optional[Set[str]] = None,
+    files_read: Optional[List[str]] = None,
 ) -> bool:
     """Determine if a Wikipedia article title is relevant to the search context.
 
-    Checks:
-      1. Exact substring match (full title or without disambiguation suffix).
-      2. Token coverage: all meaningful title words appear in context.
+    Checks (in order of priority):
+      1. Index lookup: title exists in title index AND file was read.
+      2. Exact substring match (full title or without disambiguation suffix).
+      3. Token coverage: all meaningful title words appear in context.
          Only applied when the title has ≥ 2 content tokens to avoid
          spurious matches on single common words.
     """
     t = title.lower().strip()
     if len(t) < 3:
         return False
+
+    # Priority 1: Check if title is in index AND was read during search
+    if files_read:
+        index_files = lookup_title_files(title)
+        if index_files:
+            # Title found in index - check if any indexed file was read
+            files_read_set = set(files_read)
+            for idx_file in index_files:
+                if idx_file in files_read_set:
+                    return True
+
+    # Priority 2: Exact substring match
     if t in context_lower:
         return True
     stripped = _strip_disambiguation(t)
     if stripped != t and len(stripped) >= 3 and stripped in context_lower:
         return True
+
+    # Priority 3: Token coverage (relaxed)
     if context_tokens is not None:
         title_toks = _content_tokens(t)
         if len(title_toks) >= 3 and title_toks.issubset(context_tokens):
             return True
+
     return False
 
 
@@ -355,9 +483,10 @@ def _extract_titles_and_sp(
                         if not sentences:
                             continue
 
-                        # --- Relevance check ---
+                        # --- Relevance check (with index support) ---
                         relevant = _is_title_relevant(
                             title, context_lower, context_tokens,
+                            files_read=files_read,
                         )
 
                         if not relevant:
@@ -519,6 +648,9 @@ async def run_batch(
     from sirchmunk.search import AgenticSearch
     from sirchmunk.llm.openai_chat import OpenAIChat
 
+    # Build title→filepath index at startup (one-time cost)
+    build_title_index(cfg.wiki_corpus_dir)
+
     llm = OpenAIChat(
         api_key=cfg.llm_api_key,
         base_url=cfg.llm_base_url,
@@ -526,7 +658,7 @@ async def run_batch(
     )
     searcher = AgenticSearch(
         llm=llm,
-        reuse_knowledge=False,
+        reuse_knowledge=cfg.reuse_knowledge,
         verbose=False,
         enable_memory=cfg.enable_memory,
     )

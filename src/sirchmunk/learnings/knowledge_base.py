@@ -195,7 +195,7 @@ class KnowledgeBase:
         keywords: Dict[str, float] = None,
         top_k_files: Optional[int] = 3,
         top_k_snippets: Optional[int] = 5,
-        confidence_threshold: Optional[float] = 8.0,
+        confidence_threshold: Optional[float] = 7.0,
         verbose: bool = True,
     ) -> Union[KnowledgeCluster, None]:
         """Build a knowledge cluster from retrieved information and metadata.
