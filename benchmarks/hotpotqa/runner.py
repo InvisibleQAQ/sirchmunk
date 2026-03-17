@@ -134,7 +134,8 @@ Rules:
 - For dates, use the format that appears in the response.
 - For person names, use the full name as it appears in the response.
 - Even if the response expresses uncertainty or says information is incomplete, extract any specific entity/fact that partially answers the question.
-- Output "unknown" ONLY if absolutely no relevant entity, date, name, or fact can be found anywhere in the response.
+- If uncertain, provide your best guess rather than saying "unknown".
+- NEVER output "unknown". Always extract the most relevant entity or fact.
 
 Question: {question}
 Response:
@@ -229,11 +230,20 @@ async def _extract_short_answer(
     question: str,
     verbose: str,
     llm: Any,
+    reasoning_texts: Optional[List[str]] = None,
 ) -> str:
     """Extract short factoid answer from verbose AgenticSearch output."""
+    # Use head+tail to preserve both context opening and final answer portion
+    _MAX_EXTRACT_CHARS = 3000
+    if len(verbose) <= _MAX_EXTRACT_CHARS:
+        trimmed = verbose
+    else:
+        _head = _MAX_EXTRACT_CHARS * 2 // 3
+        _tail = _MAX_EXTRACT_CHARS - _head
+        trimmed = verbose[:_head] + "\n...[truncated]...\n" + verbose[-_tail:]
     prompt = _EXTRACT_PROMPT.format(
         question=question,
-        response=verbose[:3000],
+        response=trimmed,
     )
     try:
         resp = await llm.achat(
@@ -247,9 +257,17 @@ async def _extract_short_answer(
     if answer and answer.lower() != "unknown":
         return answer
 
+    # Fallback 1: extract bold entities from verbose response
     candidates = _extract_bold_entities(verbose)
     if candidates:
         return candidates[0]
+
+    # Fallback 2: extract bold entities from reasoning_texts (ReAct chain)
+    if reasoning_texts:
+        for rt in reasoning_texts:
+            rt_candidates = _extract_bold_entities(rt)
+            if rt_candidates:
+                return rt_candidates[0]
 
     return answer or verbose
 
@@ -364,10 +382,10 @@ def _is_title_relevant(
     if files_read:
         index_files = lookup_title_files(title)
         if index_files:
-            # Title found in index - check if any indexed file was read
+            from pathlib import Path as _Path
             files_read_set = set(files_read)
             for idx_file in index_files:
-                if idx_file in files_read_set:
+                if str(_Path(idx_file).resolve()) in files_read_set:
                     return True
 
     # Priority 2: Exact substring match
@@ -457,6 +475,10 @@ def _extract_titles_and_sp(
     all_titles: Set[str] = set()
     predicted_sp: List[List] = []
 
+    # Normalize all paths to resolved absolute form for consistent set comparison
+    from pathlib import Path as _Path
+    files_read = [str(_Path(f).resolve()) for f in files_read]
+
     _ev = evidence_texts or []
     context_lower = "\n".join([question, answer] + _ev).lower()
     context_tokens = _content_tokens(context_lower)
@@ -480,10 +502,14 @@ def _extract_titles_and_sp(
                         text = obj.get("text")
                         if not text:
                             continue
-                        sentences = (
-                            text[0] if text and isinstance(text[0], list)
-                            else text
-                        )
+                        # Flatten nested paragraph lists into a single sentence list
+                        if text and isinstance(text[0], list):
+                            sentences = [
+                                s for para in text
+                                for s in (para if isinstance(para, list) else [para])
+                            ]
+                        else:
+                            sentences = text
                         if not sentences:
                             continue
 
@@ -505,7 +531,8 @@ def _extract_titles_and_sp(
                                 sentences, context_lower, answer_lower,
                                 context_tokens,
                             ):
-                                predicted_sp.append([title, sid])
+                                sent_text = sentences[sid] if sid < len(sentences) else ""
+                                predicted_sp.append([title, sid, sent_text])
                     except (json_mod.JSONDecodeError, TypeError, IndexError):
                         continue
         except (FileNotFoundError, PermissionError):
@@ -513,6 +540,9 @@ def _extract_titles_and_sp(
 
     if len(predicted_sp) > _MAX_SP_PAIRS_PER_QUERY:
         predicted_sp = _prioritize_sp(predicted_sp, answer_lower, context_lower)
+    else:
+        # Strip auxiliary sent_text, keep only [title, sid]
+        predicted_sp = [[p[0], p[1]] for p in predicted_sp]
 
     return all_titles, predicted_sp
 
@@ -522,24 +552,38 @@ def _prioritize_sp(
     answer_lower: str,
     context_lower: str,
 ) -> List[List]:
-    """Rank SP pairs by relevance: answer-bearing > context-dense > rest."""
+    """Rank SP pairs by relevance using title, answer, and sentence-context overlap."""
     answer_toks = _content_tokens(answer_lower) if answer_lower else set()
+    context_toks = _content_tokens(context_lower)
 
     def _score(pair: List) -> float:
         title, sid = pair[0], pair[1]
+        sent_text = pair[2] if len(pair) > 2 else ""
         s = 0.0
         t_lower = title.lower()
+
+        # Title-answer relevance
         if answer_lower and answer_lower in t_lower:
             s += 10.0
         if answer_toks:
             t_toks = _content_tokens(t_lower)
             s += len(answer_toks & t_toks) * 2.0
+
+        # Sentence-context token overlap
+        if sent_text:
+            s_toks = _content_tokens(sent_text.lower() if isinstance(sent_text, str) else "")
+            if s_toks:
+                overlap = len(s_toks & context_toks)
+                s += min(overlap, 8) * 0.5
+
+        # Prefer lead sentence (typically the definition)
         if sid == 0:
             s += 0.5
         return s
 
     scored = sorted(sp_pairs, key=_score, reverse=True)
-    return scored[:_MAX_SP_PAIRS_PER_QUERY]
+    # Strip auxiliary sent_text before returning [title, sid] pairs
+    return [[p[0], p[1]] for p in scored[:_MAX_SP_PAIRS_PER_QUERY]]
 
 
 async def run_single(
@@ -610,11 +654,15 @@ async def run_single(
             )
             retrieved_titles = list(titles)
 
+            _reasoning_texts = list(getattr(result, "reasoning_texts", None) or [])
             if cfg.extract_answer and raw_answer:
                 # Short answers (< 80 chars) are likely already factoid-level;
                 # skip the extra LLM call to avoid corruption and latency.
                 if len(raw_answer.strip()) > 80:
-                    answer = await _extract_short_answer(question, raw_answer, llm)
+                    answer = await _extract_short_answer(
+                        question, raw_answer, llm,
+                        reasoning_texts=_reasoning_texts,
+                    )
                     answer = _normalize_prediction(answer)
                     if not answer:
                         answer = _normalize_prediction(raw_answer)

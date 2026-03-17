@@ -114,19 +114,14 @@ async def run_llm_judge(
     return list(await asyncio.gather(*tasks))
 
 
-# Minimum delay between GPT-Eval requests to avoid 429 limit_burst_rate.
-_GPT_EVAL_MIN_DELAY = 1.0
-_GPT_EVAL_CONCURRENT = 1
-
-
 async def run_gpt_eval(
     per_sample: List[Dict[str, Any]],
     cfg: ExperimentConfig,
 ) -> Tuple[float, List[Dict[str, Any]]]:
     """Run GPT-based evaluation on all samples (LinearRAG-style GPT-Acc).
 
-    Uses sequential requests (concurrency=1) with a minimum inter-request
-    delay to avoid provider 429 limit_burst_rate errors.
+    Uses ``cfg.max_concurrent`` to parallelise LLM calls and
+    ``cfg.request_delay`` between requests to stay within rate limits.
 
     Returns (accuracy, details_list).
     """
@@ -140,10 +135,9 @@ async def run_gpt_eval(
         base_url=cfg.llm_base_url,
         model=cfg.llm_model,
     )
-    delay = max(cfg.request_delay, _GPT_EVAL_MIN_DELAY)
-    semaphore = asyncio.Semaphore(_GPT_EVAL_CONCURRENT)
+    semaphore = asyncio.Semaphore(cfg.max_concurrent)
     tasks = [
-        _eval_single(s, llm, semaphore, delay, _GPT_EVAL_TEMPLATE)
+        _eval_single(s, llm, semaphore, cfg.request_delay, _GPT_EVAL_TEMPLATE)
         for s in per_sample
     ]
     details = list(await asyncio.gather(*tasks))

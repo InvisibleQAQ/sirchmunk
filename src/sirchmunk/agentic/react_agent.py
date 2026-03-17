@@ -224,9 +224,9 @@ class ReActSearchAgent:
                 )
 
         budget_exceeded = False
-        _NO_PROGRESS_LIMIT = 3
+        _NO_PROGRESS_LIMIT = 5
         _consecutive_no_progress = 0
-        _prev_files_count = len(context.read_file_ids)
+        _prev_known_files = context.total_known_files
 
         while not context.is_loop_limit_reached() and not context.is_budget_exceeded():
             context.increment_loop()
@@ -315,17 +315,20 @@ class ReActSearchAgent:
             # Record LLM reasoning for downstream SP matching
             context.add_reasoning(content)
 
-            # Track progress: did this tool call discover new files?
-            cur_files_count = len(context.read_file_ids)
-            if cur_files_count > _prev_files_count:
+            # Track progress: count read + discovered files; weight by tool type
+            cur_known_files = context.total_known_files
+            if cur_known_files > _prev_known_files:
                 _consecutive_no_progress = 0
-                _prev_files_count = cur_files_count
-            else:
+                _prev_known_files = cur_known_files
+            elif tool_name == "file_read":
                 _consecutive_no_progress += 1
+            else:
+                _consecutive_no_progress += 0.5
 
             if _consecutive_no_progress >= _NO_PROGRESS_LIMIT:
                 await self._logger.warning(
-                    f"[ReAct] No new files in {_NO_PROGRESS_LIMIT} consecutive tool calls — early stop"
+                    f"[ReAct] No progress in {_consecutive_no_progress:.0f} tool calls "
+                    f"(limit {_NO_PROGRESS_LIMIT}) — early stop"
                 )
                 messages.append({"role": "assistant", "content": content})
                 break
