@@ -475,7 +475,7 @@ async def _extract_sp_with_llm(
 
     reasoning_summary = "\n".join(_rt[-5:])
     if len(reasoning_summary) > 2000:
-        reasoning_summary = reasoning_summary[:2000] + "\n...[truncated]"
+        reasoning_summary = reasoning_summary[:1000] + "\n...[truncated]...\n" + reasoning_summary[-1000:]
 
     prompt = _SP_EXTRACT_PROMPT.format(
         question=question,
