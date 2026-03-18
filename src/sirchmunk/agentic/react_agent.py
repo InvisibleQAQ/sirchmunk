@@ -12,6 +12,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from sirchmunk.agentic.belief_state import BeliefState
 from sirchmunk.agentic.prompts import (
     QUERY_DECOMPOSITION_PROMPT,
     REACT_CONTINUATION_PROMPT,
@@ -140,6 +141,7 @@ class ReActSearchAgent:
         log_callback: LogCallback = None,
         enable_thinking: bool = False,
         enable_decomposition: bool = True,
+        enable_belief_tracking: bool = True,
     ) -> None:
         self.llm = llm
         self.registry = tool_registry
@@ -147,6 +149,7 @@ class ReActSearchAgent:
         self.max_token_budget = max_token_budget
         self.enable_thinking = enable_thinking
         self.enable_decomposition = enable_decomposition
+        self.enable_belief_tracking = enable_belief_tracking
         self._logger = create_logger(log_callback=log_callback, enable_async=True)
 
     # ---- Public API ----
@@ -172,6 +175,10 @@ class ReActSearchAgent:
             max_token_budget=self.max_token_budget,
             max_loops=self.max_loops,
         )
+        context.query = query
+
+        if self.enable_belief_tracking:
+            context.belief_state = BeliefState()
 
         # Build tool descriptions for the system prompt
         tool_descriptions = _build_tool_descriptions(self.registry)
@@ -217,6 +224,7 @@ class ReActSearchAgent:
                 context=context,
                 keywords=initial_keywords,
             )
+            self._update_beliefs(context, "keyword_search", meta)
             if result_text and "No results" not in result_text:
                 messages.append({
                     "role": "assistant",
@@ -316,6 +324,9 @@ class ReActSearchAgent:
                 **tool_args,
             )
 
+            # Update BA-ReAct belief state from tool observations
+            self._update_beliefs(context, tool_name, meta)
+
             # Truncate if the tool returned too much text
             if len(result_text) > 8000:
                 result_text = result_text[:8000] + "\n... [output truncated]"
@@ -345,6 +356,18 @@ class ReActSearchAgent:
                 )
                 messages.append({"role": "assistant", "content": content})
                 break
+
+            # BA-ReAct: ESS-based early stopping when evidence is concentrated
+            belief = getattr(context, "belief_state", None)
+            if (
+                belief
+                and belief.should_stop_early()
+                and context.loop_count >= 3
+            ):
+                await self._logger.info(
+                    f"[ReAct] Belief ESS suggests evidence convergence "
+                    f"(ESS={belief.compute_ess():.1f}) — nudging answer"
+                )
 
             # Append reasoning + tool call + observation to conversation
             messages.append({"role": "assistant", "content": content})
@@ -521,13 +544,41 @@ class ReActSearchAgent:
 
     @staticmethod
     def _build_continuation_prompt(context: SearchContext) -> str:
-        """Build the loop continuation prompt with current state."""
-        return REACT_CONTINUATION_PROMPT.format(
+        """Build the loop continuation prompt with current state.
+
+        Appends BA-ReAct advisory signals (e.g., promising unread files,
+        evidence concentration) when a belief state is available.
+        """
+        base = REACT_CONTINUATION_PROMPT.format(
             budget_remaining=context.budget_remaining,
             loop_count=context.loop_count,
             max_loops=context.max_loops,
             files_read_count=len(context.read_file_ids),
         )
+        belief = getattr(context, "belief_state", None)
+        if belief:
+            advisory = belief.get_advisory()
+            if advisory:
+                base += f"\n{advisory}"
+        return base
+
+    @staticmethod
+    def _update_beliefs(
+        context: SearchContext,
+        tool_name: str,
+        meta: Dict[str, Any],
+    ) -> None:
+        """Update BA-ReAct belief state from tool execution metadata."""
+        belief = getattr(context, "belief_state", None)
+        if not belief:
+            return
+        if tool_name == "keyword_search":
+            belief.update_from_search(meta.get("files_discovered", []))
+        elif tool_name == "title_lookup":
+            paths = meta.get("paths_found", 0)
+            title = meta.get("title", "")
+            if paths and title:
+                belief.update_from_search([title])
 
     @staticmethod
     def _prune_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

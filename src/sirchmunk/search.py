@@ -32,6 +32,7 @@ from sirchmunk.schema.knowledge import (
     KnowledgeCluster,
     Lifecycle,
 )
+from sirchmunk.schema.metadata import FileInfo
 from sirchmunk.schema.request import ContentItem, Message, Request
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
@@ -1022,10 +1023,13 @@ class AgenticSearch(BaseSearch):
         )
 
         # Tool 3: File read (medium cost, keyword-focused extraction)
+        # When BA-ReAct belief tracking is active, the deep_extract_fn
+        # enables lazy MCES activation for high-value large files.
         registry.register(FileReadTool(
             max_chars_per_file=30000,
             bm25_scorer=bm25_scorer,
-            base_paths=paths,  # Enable path resolution fallback
+            base_paths=paths,
+            deep_extract_fn=self._make_deep_extract_fn(),
         ))
 
         # Tool 4: Title lookup (zero cost — direct index lookup)
@@ -1049,6 +1053,86 @@ class AgenticSearch(BaseSearch):
         self._tool_registry = registry
         self._tool_registry_key = cache_key
         return registry
+
+    # ------------------------------------------------------------------
+    # BA-ReAct: Lazy MCES deep extraction callback
+    # ------------------------------------------------------------------
+
+    def _make_deep_extract_fn(self):
+        """Create a closure that runs MCES deep evidence extraction.
+
+        The returned async callable is injected into ``FileReadTool`` and
+        invoked transparently when the belief state triggers deep extraction
+        for a high-value large file.  Results are cached on the
+        ``SearchContext.mces_cache`` for Phase 3 reuse.
+        """
+        from sirchmunk.learnings.evidence_processor import EvidenceSampler
+
+        llm = self.llm
+        evidence_cache = self._evidence_cache
+        log_callback = getattr(self, "log_callback", None)
+        embedding_util = getattr(self, "embedding_client", None)
+
+        async def _deep_extract(
+            doc_content: str,
+            keywords: list,
+            context,
+            file_path: str,
+        ):
+            query = getattr(context, "query", "") or ""
+            if not query:
+                return None
+
+            sampler = EvidenceSampler(
+                llm=llm,
+                doc_content=doc_content,
+                verbose=False,
+                log_callback=log_callback,
+                embedding_util=embedding_util,
+                cache=evidence_cache,
+            )
+            kw_dict = {k: 1.0 for k in keywords} if keywords else {}
+            roi = await sampler.get_roi(
+                query=query,
+                keywords=kw_dict,
+                confidence_threshold=7.0,
+            )
+
+            # Track LLM tokens consumed by MCES
+            for u in sampler.llm_usages:
+                tok = u.get("total_tokens", 0)
+                if tok == 0:
+                    tok = u.get("prompt_tokens", 0) + u.get("completion_tokens", 0)
+                context.add_llm_tokens(tok, usage=u)
+
+            # Cache RoiResult for Phase 3 cluster construction
+            context.mces_cache[file_path] = {
+                "summary": roi.summary,
+                "is_found": roi.is_found,
+                "snippets": roi.snippets,
+            }
+
+            # Update belief state with MCES scores
+            belief = getattr(context, "belief_state", None)
+            if belief:
+                best_score = max(
+                    (s.get("score", 0) for s in roi.snippets),
+                    default=0,
+                )
+                belief.update_from_mces(file_path, best_score, roi.is_found)
+
+            if not roi.is_found:
+                return None
+
+            parts = [roi.summary]
+            for s in roi.snippets[:3]:
+                score = s.get("score", 0)
+                snippet = s.get("snippet", "")[:500]
+                if snippet:
+                    parts.append(f"\n--- Evidence (score={score:.1f}) ---\n{snippet}")
+            return "\n".join(parts)
+
+        return _deep_extract
 
     # ------------------------------------------------------------------
     # Unified search entry point
@@ -2646,75 +2730,140 @@ class AgenticSearch(BaseSearch):
         query_keywords: Dict[str, float],
         top_k_files: int = 5,
         top_k_snippets: int = 5,
+        mces_cache: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Optional[KnowledgeCluster]:
         """Build a KnowledgeCluster via knowledge_base.build().
 
-        For very large files (>30 KB), pre-extracts keyword-matching
-        snippets to reduce token waste in Monte Carlo sampling.
+        For files already processed by Lazy MCES during Phase 2 (cached in
+        ``mces_cache``), the cached evidence is reused directly — skipping
+        redundant re-extraction.  Remaining files go through the standard
+        keyword-snippet pre-filter + MCES pipeline.
         """
         import tempfile
 
+        mces_cache = mces_cache or {}
+
         try:
-            request = Request(
-                messages=[
-                    Message(
-                        role="user",
-                        content=[ContentItem(type="text", text=query)],
-                    ),
-                ],
-            )
+            # Partition files into cached (from Phase 2 MCES) and uncached
+            cached_evidences: List[EvidenceUnit] = []
+            uncached_paths: List[str] = []
 
-            # Pre-filter: for oversized files, write keyword-matched
-            # snippets to a temp file so the Monte Carlo sampler sees
-            # only relevant content instead of the entire 90 KB wiki dump.
-            effective_paths: List[str] = []
-            temp_files: List[str] = []
-            for fp in file_paths:
-                snippet_text = self._extract_keyword_snippets(fp, query_keywords)
-                if snippet_text:
-                    tf = tempfile.NamedTemporaryFile(
-                        mode="w", suffix=".txt", delete=False, encoding="utf-8",
-                    )
-                    tf.write(snippet_text)
-                    tf.close()
-                    effective_paths.append(tf.name)
-                    temp_files.append(tf.name)
+            for fp in file_paths[:top_k_files]:
+                cached = mces_cache.get(fp)
+                if cached:
+                    cached_evidences.append(EvidenceUnit(
+                        doc_id=FileInfo.get_cache_key(fp),
+                        file_or_url=Path(fp),
+                        summary=cached.get("summary", ""),
+                        is_found=cached.get("is_found", False),
+                        snippets=cached.get("snippets", []),
+                        extracted_at=datetime.now(tz=timezone.utc),
+                        conflict_group=[],
+                    ))
                 else:
-                    effective_paths.append(fp)
+                    uncached_paths.append(fp)
 
-            retrieved_infos = [{"path": fp} for fp in effective_paths]
-
-            cluster = await self.knowledge_base.build(
-                request=request,
-                retrieved_infos=retrieved_infos,
-                keywords=query_keywords,
-                top_k_files=top_k_files,
-                top_k_snippets=top_k_snippets,
-                verbose=self.verbose,
-            )
-            self.llm_usages.extend(self.knowledge_base.llm_usages)
-            self.knowledge_base.llm_usages.clear()
-
-            # Clean up temp files
-            for tf_path in temp_files:
-                try:
-                    os.remove(tf_path)
-                except OSError:
-                    pass
-
-            if cluster:
-                # Restore original file paths in evidence units
-                for ev in (getattr(cluster, "evidences", None) or []):
-                    for orig_fp, eff_fp in zip(file_paths, effective_paths):
-                        if str(getattr(ev, "file_or_url", "")) == eff_fp and eff_fp != orig_fp:
-                            ev.file_or_url = Path(orig_fp)
-                            break
-
-                n_ev = len(cluster.evidences) if cluster.evidences else 0
-                await self._logger.success(
-                    f"[Phase 3] KnowledgeCluster built: {cluster.name} "
-                    f"({n_ev} evidence units)"
+            if cached_evidences:
+                await self._logger.info(
+                    f"[Phase 3] Reusing {len(cached_evidences)} cached MCES results, "
+                    f"{len(uncached_paths)} files need fresh extraction"
                 )
+
+            # Process uncached files through the standard pipeline
+            mces_evidences: List[EvidenceUnit] = []
+            if uncached_paths:
+                request = Request(
+                    messages=[
+                        Message(
+                            role="user",
+                            content=[ContentItem(type="text", text=query)],
+                        ),
+                    ],
+                )
+
+                effective_paths: List[str] = []
+                temp_files: List[str] = []
+                for fp in uncached_paths:
+                    snippet_text = self._extract_keyword_snippets(fp, query_keywords)
+                    if snippet_text:
+                        tf = tempfile.NamedTemporaryFile(
+                            mode="w", suffix=".txt", delete=False, encoding="utf-8",
+                        )
+                        tf.write(snippet_text)
+                        tf.close()
+                        effective_paths.append(tf.name)
+                        temp_files.append(tf.name)
+                    else:
+                        effective_paths.append(fp)
+
+                retrieved_infos = [{"path": fp} for fp in effective_paths]
+
+                cluster = await self.knowledge_base.build(
+                    request=request,
+                    retrieved_infos=retrieved_infos,
+                    keywords=query_keywords,
+                    top_k_files=len(uncached_paths),
+                    top_k_snippets=top_k_snippets,
+                    verbose=self.verbose,
+                )
+                self.llm_usages.extend(self.knowledge_base.llm_usages)
+                self.knowledge_base.llm_usages.clear()
+
+                for tf_path in temp_files:
+                    try:
+                        os.remove(tf_path)
+                    except OSError:
+                        pass
+
+                if cluster:
+                    # Restore original paths in evidence units
+                    for ev in (getattr(cluster, "evidences", None) or []):
+                        for orig_fp, eff_fp in zip(uncached_paths, effective_paths):
+                            if str(getattr(ev, "file_or_url", "")) == eff_fp and eff_fp != orig_fp:
+                                ev.file_or_url = Path(orig_fp)
+                                break
+                    mces_evidences = list(cluster.evidences or [])
+
+            # Merge cached + freshly extracted evidence
+            all_evidences = cached_evidences + mces_evidences
+
+            if not all_evidences:
+                return None
+
+            # Build cluster from the merged evidence set
+            all_summaries = [ev.summary for ev in all_evidences if ev.summary]
+            combined_summary = "\n\n".join(all_summaries) if all_summaries else query
+
+            cluster_text = combined_summary or query
+            cluster_id = f"C{hashlib.sha256(cluster_text.encode('utf-8')).hexdigest()[:10]}"
+
+            cluster = KnowledgeCluster(
+                id=cluster_id,
+                name=query[:60],
+                description=[f"Search result for: {query}"],
+                content=combined_summary,
+                scripts=[],
+                resources=[],
+                patterns=[],
+                constraints=[],
+                evidences=all_evidences,
+                confidence=0.5,
+                abstraction_level=AbstractionLevel.TECHNIQUE,
+                landmark_potential=0.5,
+                hotness=0.5,
+                lifecycle=Lifecycle.EMERGING,
+                create_time=datetime.now(tz=timezone.utc),
+                last_modified=datetime.now(tz=timezone.utc),
+                version=1,
+                related_clusters=[],
+            )
+
+            n_ev = len(all_evidences)
+            n_cached = len(cached_evidences)
+            await self._logger.success(
+                f"[Phase 3] KnowledgeCluster built: {cluster.name} "
+                f"({n_ev} evidence units, {n_cached} from cache)"
+            )
             return cluster
         except Exception as exc:
             await self._logger.warning(f"[Phase 3] knowledge_base.build() failed: {exc}")
@@ -2902,11 +3051,13 @@ class AgenticSearch(BaseSearch):
                         discovered.append(p)
 
         if discovered:
+            mces_cache = getattr(context, "mces_cache", {})
             cluster = await self._build_cluster(
                 query=query,
                 file_paths=discovered,
                 query_keywords=query_keywords,
                 top_k_files=top_k_files,
+                mces_cache=mces_cache,
             )
             if cluster:
                 if not cluster.search_results:

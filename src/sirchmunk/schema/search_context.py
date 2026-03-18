@@ -86,6 +86,14 @@ class SearchContext:
     answer: str = field(default="", init=False)
     cluster: Optional["KnowledgeCluster"] = field(default=None, init=False)
 
+    # BA-ReAct: original search query (set by ReActSearchAgent.run)
+    query: str = field(default="", init=False)
+    # BA-ReAct: belief state tracker (set by ReActSearchAgent when enabled)
+    belief_state: Optional[Any] = field(default=None, init=False)
+    # BA-ReAct: cached MCES RoiResults for Phase 3 reuse
+    # Keys are file paths; values are dicts with summary/is_found/snippets.
+    mces_cache: Dict[str, Dict[str, Any]] = field(default_factory=dict, init=False)
+
     # ---- Token accounting ----
 
     def add_llm_tokens(self, tokens: int, usage: Optional[Dict[str, Any]] = None) -> None:
@@ -201,6 +209,7 @@ class SearchContext:
             "reasoning_texts_count": len(self.reasoning_texts),
             "loop_count": self.loop_count,
             "start_time": self.start_time.isoformat(),
+            "mces_cached_files": sorted(self.mces_cache.keys()),
         }
 
     def summary(self) -> str:

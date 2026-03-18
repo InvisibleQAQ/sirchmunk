@@ -13,12 +13,16 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from sirchmunk.learnings.chunking import DocumentChunker
 from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
 from sirchmunk.utils.file_utils import fast_extract
 
 logger = logging.getLogger(__name__)
+
+# Structure-aware chunker shared across all FileReadTool instances.
+_FILE_CHUNKER = DocumentChunker(target_size=1000, max_size=2000)
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +528,11 @@ class FileReadTool(BaseTool):
     Tracks read files in SearchContext to prevent redundant reads.
     For large files, optional keyword-guided extraction via BM25 ranking
     returns only the most relevant sections.
+
+    When a ``deep_extract_fn`` is provided and the BA-ReAct belief state
+    indicates a high-value large file, the tool transparently activates
+    deep MCES evidence extraction instead of BM25 chunk selection,
+    producing higher-quality evidence for the agent.
     """
 
     _LARGE_FILE_THRESHOLD = 30_000
@@ -534,12 +543,13 @@ class FileReadTool(BaseTool):
         max_chars_per_file: int = 30000,
         bm25_scorer: Any = None,
         base_paths: Optional[List[str]] = None,
+        deep_extract_fn: Optional[Callable] = None,
     ) -> None:
         self._max_chars = max_chars_per_file
         self._bm25_scorer = bm25_scorer
-        # Base paths for relative path resolution (e.g., wiki corpus dir)
         self._base_paths = [Path(p).resolve() for p in (base_paths or [])]
         self._chunk_cache: Dict[str, List[str]] = {}
+        self._deep_extract_fn = deep_extract_fn
 
     @staticmethod
     def _normalize_path(fp: str, base_paths: Optional[List[Path]] = None) -> Optional[Path]:
@@ -639,11 +649,13 @@ class FileReadTool(BaseTool):
         outputs: List[str] = []
         files_read: List[str] = []
         total_chars = 0
+        deep_extracted: List[str] = []
+
+        belief = getattr(context, "belief_state", None)
 
         for fp in file_paths:
             fp_str = str(fp)
 
-            # Normalize path with fallback strategies
             resolved = self._normalize_path(fp_str, self._base_paths)
             if resolved:
                 fp_str = str(resolved)
@@ -659,7 +671,6 @@ class FileReadTool(BaseTool):
             try:
                 path = Path(fp_str)
                 if not path.exists():
-                    # Log the failed path for debugging
                     outputs.append(f"[{fp_str}] File not found. (original: {fp})")
                     continue
 
@@ -675,9 +686,32 @@ class FileReadTool(BaseTool):
                     extraction = await fast_extract(path)
                     content = extraction.content if extraction else ""
 
-                # Focused extraction for large files when keywords provided
+                # --- Lazy MCES: deep extraction for high-belief large files ---
+                if (
+                    self._deep_extract_fn
+                    and belief
+                    and belief.should_trigger_mces(
+                        fp_str, len(content), context.budget_remaining,
+                    )
+                ):
+                    deep_text = await self._try_deep_extract(
+                        content, keywords, context, fp_str,
+                    )
+                    if deep_text:
+                        outputs.append(
+                            f"[{fp_str}] (deep evidence extraction)\n{deep_text}"
+                        )
+                        total_chars += len(deep_text)
+                        context.mark_file_read(fp_str)
+                        files_read.append(fp_str)
+                        deep_extracted.append(fp_str)
+                        continue
+
+                # --- Standard path: BM25 focused extraction for large files ---
                 if len(content) > self._LARGE_FILE_THRESHOLD and keywords:
-                    content = self._extract_focused_content(content, keywords, file_path=fp_str)
+                    content = self._extract_focused_content(
+                        content, keywords, file_path=fp_str,
+                    )
 
                 if len(content) > self._max_chars:
                     content = content[: self._max_chars] + "\n... [truncated]"
@@ -687,6 +721,13 @@ class FileReadTool(BaseTool):
                 context.mark_file_read(fp_str)
                 files_read.append(fp_str)
 
+                if belief:
+                    has_info = len(content) > 500
+                    belief.update_from_read(
+                        fp_str, content_chars=len(content),
+                        found_new_info=has_info,
+                    )
+
             except Exception as exc:
                 outputs.append(f"[{fp_str}] Read error: {exc}")
 
@@ -695,31 +736,47 @@ class FileReadTool(BaseTool):
         context.add_log(
             tool_name=self.name,
             tokens=approx_tokens,
-            metadata={"files_read": files_read, "files_requested": file_paths},
+            metadata={
+                "files_read": files_read,
+                "files_requested": file_paths,
+                "deep_extracted": deep_extracted,
+            },
         )
 
-        return result_text, {"files_read": files_read, "tokens": approx_tokens}
+        return result_text, {
+            "files_read": files_read,
+            "tokens": approx_tokens,
+            "deep_extracted": deep_extracted,
+        }
 
-    def _make_chunks(self, content: str) -> List[str]:
-        """Split content into ~1000-char chunks, keeping lines intact."""
-        lines = content.splitlines()
-        if not lines:
-            return []
-        chunks: List[str] = []
-        buf: List[str] = []
-        buf_len = 0
-        for line in lines:
-            line_len = len(line) + 1
-            if buf_len + line_len > 1000 and buf:
-                chunks.append("\n".join(buf))
-                buf = [line]
-                buf_len = line_len
-            else:
-                buf.append(line)
-                buf_len += line_len
-        if buf:
-            chunks.append("\n".join(buf))
-        return chunks
+    async def _try_deep_extract(
+        self,
+        content: str,
+        keywords: List[str],
+        context: SearchContext,
+        file_path: str,
+    ) -> Optional[str]:
+        """Attempt MCES deep extraction; return formatted text or None."""
+        try:
+            return await self._deep_extract_fn(
+                content, keywords, context, file_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Deep extract failed for %s: %s — falling back to BM25",
+                file_path, exc,
+            )
+            return None
+
+    @staticmethod
+    def _make_chunks(content: str) -> List[str]:
+        """Split content into structure-aware ~1000-char chunks.
+
+        Delegates to the shared DocumentChunker which respects JSONL
+        line boundaries, markdown headings, and paragraph breaks.
+        """
+        raw = _FILE_CHUNKER.chunk(content)
+        return [c.content for c in raw] if raw else []
 
     def _get_chunks(self, file_path: str, content: str) -> List[str]:
         """Return cached chunks for *file_path*, building them if needed."""
