@@ -429,24 +429,48 @@ class ReActSearchAgent:
 
             parsed = json.loads(raw)
             needs = parsed.get("needs_decomposition", False)
+            ans_fmt = parsed.get("answer_format", "entity")
+
             if not needs:
                 await self._logger.info("[ReAct] Query decomposition: simple query, no decomposition needed")
+                if ans_fmt == "yes_no":
+                    return "[Answer format: yes/no — respond with ONLY 'yes' or 'no'.]"
                 return ""
 
             sub_qs = parsed.get("sub_questions", [])
             r_type = parsed.get("reasoning_type", "bridge")
+            constraints = parsed.get("search_constraints", [])
             if not sub_qs:
                 return ""
 
             await self._logger.info(
                 f"[ReAct] Query decomposition: {r_type} type, "
-                f"{len(sub_qs)} sub-question(s)"
+                f"{len(sub_qs)} sub-question(s), "
+                f"{len(constraints)} constraint(s), "
+                f"answer_format={ans_fmt}"
             )
 
             lines = [f"[Search plan — {r_type} reasoning]"]
             for i, sq in enumerate(sub_qs, 1):
                 lines.append(f"  Step {i}: {sq}")
             lines.append("Follow this plan in order. Each step may depend on the previous one's result.")
+
+            if constraints:
+                lines.append("")
+                lines.append("[Search constraints — do NOT answer until ALL are satisfied]")
+                for c in constraints:
+                    lines.append(f"  - {c}")
+
+            _FMT_LABELS = {
+                "yes_no": "yes/no — respond with ONLY 'yes' or 'no'",
+                "entity": "an entity name (person, place, title, etc.)",
+                "number": "a number or quantity",
+                "date": "a date or time period",
+                "description": "a short descriptive phrase",
+            }
+            fmt_label = _FMT_LABELS.get(ans_fmt, "a short phrase")
+            lines.append(f"\n[Answer format: {fmt_label}]")
+
             return "\n".join(lines)
 
         except Exception as exc:

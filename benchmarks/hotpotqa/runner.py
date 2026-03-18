@@ -144,15 +144,28 @@ Response:
 Short answer:"""
 
 
+_YES_NO_RE = re.compile(
+    r"^(yes|no)\b",
+    re.IGNORECASE,
+)
+
+
 def _normalize_prediction(pred: str) -> str:
     """Post-process prediction to improve EM/F1 matching.
 
     Strips markdown formatting, quotation marks, trailing periods,
     common wrapper phrases, Wikipedia disambiguation patterns, and
     normalizes common formatting differences (ampersand, ordinals,
-    hedging prefixes).
+    hedging prefixes).  Also collapses verbose yes/no answers to
+    just "yes" or "no".
     """
     s = pred.strip()
+
+    # Collapse verbose yes/no answers (e.g. "Yes, Stefan Edberg..." → "yes")
+    m = _YES_NO_RE.match(s)
+    if m and len(s) > 10:
+        return m.group(1).lower()
+
     # Remove markdown bold/italic
     s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
     s = re.sub(r"\*(.+?)\*", r"\1", s)
@@ -270,6 +283,117 @@ async def _extract_short_answer(
                 return rt_candidates[0]
 
     return answer or verbose
+
+
+# ---------------------------------------------------------------------------
+# Evidence-grounded answer extraction
+# ---------------------------------------------------------------------------
+
+_YES_NO_STARTERS = frozenset((
+    "is", "are", "was", "were", "did", "do", "does",
+    "has", "have", "had", "can", "could", "will", "would", "should",
+))
+
+_GROUNDED_EXTRACT_PROMPT = """\
+Extract the precise answer to the question from the evidence sentences below.
+
+Rules:
+- Your answer MUST be grounded in the evidence — use the exact phrasing \
+from the evidence whenever possible.
+- The answer should be {answer_format}.
+- For yes/no questions, output ONLY "yes" or "no".
+- For entity or name questions, use the FULL name exactly as it appears \
+in the evidence.
+- If the evidence is insufficient, output "INSUFFICIENT".
+- Output ONLY the answer (1-10 words). No explanation.
+
+Question: {question}
+
+Evidence sentences:
+{evidence}
+
+Additional context from search:
+{raw_summary}
+
+Answer:"""
+
+
+def _detect_answer_format(question: str) -> str:
+    """Heuristically detect the expected answer format from a question.
+
+    Returns a human-readable format hint for use in extraction prompts.
+    This is independent of any upstream decomposition — works on any
+    question regardless of the search pipeline used.
+    """
+    q = question.strip()
+    first_word = q.split()[0].lower().rstrip(",.?") if q else ""
+
+    if first_word in _YES_NO_STARTERS:
+        return "yes or no"
+    if q.lower().startswith(("how many", "how much", "how long", "how old", "how far")):
+        return "a number or quantity"
+    if first_word == "when":
+        return "a date or time period"
+    if first_word == "where":
+        return "a place name"
+    if first_word == "who" or first_word == "whom":
+        return "a person or entity name"
+    return "a short factual phrase (1-10 words)"
+
+
+async def _extract_grounded_answer(
+    question: str,
+    predicted_sp: List[List],
+    candidates: Dict[str, List[str]],
+    raw_answer: str,
+    llm: Any,
+) -> str:
+    """Extract an answer grounded in supporting-evidence sentences.
+
+    Uses the predicted supporting fact sentences as the primary evidence
+    source, forcing the LLM to return an exact span from the evidence
+    rather than generating freely.  This reduces form mismatches and
+    hallucinated entities.
+
+    Returns the extracted answer, or empty string on failure.
+    """
+    evidence_lines: List[str] = []
+    for sp_item in predicted_sp:
+        title = sp_item[0] if isinstance(sp_item, (list, tuple)) and len(sp_item) >= 2 else ""
+        sid = int(sp_item[1]) if isinstance(sp_item, (list, tuple)) and len(sp_item) >= 2 else -1
+        sents = candidates.get(title, [])
+        if 0 <= sid < len(sents):
+            sent = sents[sid].strip()
+            if sent:
+                evidence_lines.append(f"[{title}]: {sent[:300]}")
+
+    if not evidence_lines:
+        return ""
+
+    answer_format = _detect_answer_format(question)
+    raw_summary = raw_answer[:500] if len(raw_answer) > 500 else raw_answer
+
+    prompt = _GROUNDED_EXTRACT_PROMPT.format(
+        question=question,
+        answer_format=answer_format,
+        evidence="\n".join(evidence_lines),
+        raw_summary=raw_summary,
+    )
+
+    try:
+        resp = await llm.achat(
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+        )
+        answer = (resp.content or "").strip()
+
+        if not answer or answer.upper() == "INSUFFICIENT":
+            return ""
+
+        return answer
+    except Exception as exc:
+        logger.warning("Grounded extraction failed: %s", exc)
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -696,17 +820,28 @@ async def run_single(
                 retrieved_titles = list(titles)
 
                 if cfg.extract_answer and raw_answer:
-                    # Short answers (< 80 chars) are likely already factoid-level;
-                    # skip the extra LLM call to avoid corruption and latency.
-                    if len(raw_answer.strip()) > 80:
+                    answer = ""
+
+                    # Primary: evidence-grounded extraction (uses SP sentences)
+                    if predicted_sp and sp_candidates:
+                        answer = await _extract_grounded_answer(
+                            question, predicted_sp, sp_candidates,
+                            raw_answer, llm,
+                        )
+
+                    # Fallback: LLM extraction from verbose raw answer
+                    if not answer and len(raw_answer.strip()) > 80:
                         answer = await _extract_short_answer(
                             question, raw_answer, llm,
                             reasoning_texts=_reasoning_texts,
                         )
-                        answer = _normalize_prediction(answer)
-                        if not answer:
-                            answer = _normalize_prediction(raw_answer)
-                    else:
+
+                    # Last resort: use raw answer directly
+                    if not answer:
+                        answer = raw_answer
+
+                    answer = _normalize_prediction(answer)
+                    if not answer:
                         answer = _normalize_prediction(raw_answer)
                 else:
                     answer = _normalize_prediction(raw_answer)

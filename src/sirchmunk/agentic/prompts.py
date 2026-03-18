@@ -78,24 +78,30 @@ Budget remaining: {budget_remaining} tokens | Loop: {loop_count}/{max_loops} | F
 
 
 QUERY_DECOMPOSITION_PROMPT = """\
-Analyze the following search query and decide whether it requires multi-step \
-reasoning (connecting information from multiple sources).
+Analyze the following search query. Determine its complexity, the expected \
+answer format, and whether it requires multi-step reasoning.
 
 Query: {query}
 
 Instructions:
-1. If the query is a SIMPLE factual question that can be answered by finding \
-a single piece of information, set "needs_decomposition" to false.
-2. If the query requires MULTI-HOP reasoning (finding fact A to discover \
-entity B, then searching for B to find the answer), set "needs_decomposition" \
-to true and provide ordered sub-questions.
-3. Sub-questions should form a logical chain where each subsequent question \
-may depend on the answer to the previous one.
-4. Keep sub-questions concise and searchable — each should target a specific \
-entity or fact.
+1. Classify the expected **answer_format**:
+   - "yes_no": question asks whether something is true (starts with Is/Are/Was/Did/Has/Can/Does...)
+   - "entity": answer is a name, title, or proper noun
+   - "number": answer is a count, year, age, distance, or quantity
+   - "date": answer is a specific date or time period
+   - "description": answer requires a phrase or short explanation
+2. If the query is SIMPLE (single fact lookup), set "needs_decomposition" to false.
+3. If the query requires MULTI-HOP reasoning, set "needs_decomposition" to true \
+and provide ordered sub-questions plus explicit search constraints.
+4. **search_constraints** are minimum evidence requirements that MUST be met \
+before answering:
+   - For comparison: "Find evidence about [Entity A]" AND "Find evidence about [Entity B]"
+   - For bridge: "Find the intermediate entity" AND "Find the final fact via that entity"
+   - For multi-constraint: one constraint per filter condition in the question
+5. Sub-questions should form a logical chain where each may depend on the previous.
 
 Output ONLY valid JSON (no extra text):
-{{"needs_decomposition": true/false, "reasoning_type": "simple|bridge|comparison|multi_constraint", "sub_questions": ["q1", "q2", ...]}}
+{{"needs_decomposition": true/false, "reasoning_type": "simple|bridge|comparison|multi_constraint", "answer_format": "yes_no|entity|number|date|description", "sub_questions": ["q1", "q2", ...], "search_constraints": ["constraint1", "constraint2", ...]}}
 """
 
 
