@@ -104,7 +104,7 @@ def _to_sp_set(sp_list) -> Set[Tuple[str, int]]:
     if isinstance(sp_list, dict):
         titles = sp_list.get("title", [])
         sids = sp_list.get("sent_id", [])
-        return set(zip(titles, sids))
+        return {(t, int(s)) for t, s in zip(titles, sids)}
     if isinstance(sp_list, (list, tuple)):
         return {(t, int(s)) for t, s in sp_list}
     return set()
@@ -116,17 +116,19 @@ def sp_prec_recall_f1(
 ) -> Tuple[float, float, float, float]:
     """Set-level EM, precision, recall, F1 for supporting facts.
 
+    Aligned with official ``update_sp`` in hotpot_evaluate_v1.py:
+    tp/fp/fn counting → prec, recall, f1, em.
+
     Returns (sp_em, sp_prec, sp_recall, sp_f1).
     """
-    if not predicted_sp and not gold_sp:
-        return 1.0, 1.0, 1.0, 1.0
-
-    sp_em = 1.0 if predicted_sp == gold_sp else 0.0
-
     tp = len(predicted_sp & gold_sp)
-    prec = tp / len(predicted_sp) if predicted_sp else 0.0
-    recall = tp / len(gold_sp) if gold_sp else 0.0
+    fp = len(predicted_sp - gold_sp)
+    fn = len(gold_sp - predicted_sp)
+
+    prec = 1.0 * tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = 1.0 * tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = (2 * prec * recall / (prec + recall)) if (prec + recall) > 0 else 0.0
+    sp_em = 1.0 if (fp + fn) == 0 else 0.0
 
     return sp_em, prec, recall, f1
 
@@ -258,17 +260,25 @@ def evaluate_predictions(
                for k, v in row.items()},
         })
 
-    def _agg(bucket: Dict[str, list]) -> Dict[str, Any]:
-        """Aggregate a metric bucket into averages."""
-        count = len(bucket["ans_em"]) if bucket["ans_em"] else 0
-        if count == 0:
+    def _agg(bucket: Dict[str, list], n: int = 0) -> Dict[str, Any]:
+        """Aggregate a metric bucket into averages.
+
+        When *n* is provided (> 0) it is used as the denominator instead
+        of the number of evaluated samples.  This aligns with the official
+        eval which divides by ``len(gold)`` — missing / errored samples
+        implicitly receive 0 for every metric.
+        """
+        evaluated = len(bucket["ans_em"]) if bucket["ans_em"] else 0
+        denom = n if n > 0 else evaluated
+        if denom == 0:
             return {k: 0.0 for k in METRIC_KEYS} | {"count": 0}
         return {
-            k: sum(bucket[k]) / count for k in METRIC_KEYS
-        } | {"count": count}
+            k: sum(bucket[k]) / denom for k in METRIC_KEYS
+        } | {"count": denom}
 
+    total_n = len(samples)
     return {
-        "overall": _agg(overall),
+        "overall": _agg(overall, n=total_n),
         "by_type": {t: _agg(v) for t, v in by_type.items()},
         "by_level": {lv: _agg(v) for lv, v in by_level.items()},
         "per_sample": per_sample,

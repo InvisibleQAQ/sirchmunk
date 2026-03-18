@@ -44,39 +44,7 @@ from sirchmunk.utils.utils import (
     KeywordValidation,
     extract_fields,
 )
-
-# Only for quick simple-chat intent detection to reduce unnecessary LLM calls
-_CHAT_QUERY_RE = re.compile(
-    r"^("
-    # Greetings (ZH / EN / pinyin / JA / KO)
-    r"你好|您好|嗨|哈喽|喂|早上好|下午好|晚上好|早安|午安|晚安"
-    r"|hello|hi|hey|howdy|greetings|yo"
-    r"|nihao|ni\s*hao"
-    r"|good\s*(morning|afternoon|evening|night)"
-    r"|こんにちは|こんばんは|おはよう"
-    r"|안녕하세요|안녕"
-    # Identity / capability
-    r"|who\s+are\s+you|what\s+are\s+you|你是谁|你是什么"
-    r"|介绍.*你自己|tell\s+me\s+about\s+yourself"
-    r"|what\s+can\s+you\s+do|你能做什么|你会什么"
-    # Small talk
-    r"|how\s+are\s+you|你好吗|你怎么样|what'?s\s+up"
-    # Thanks
-    r"|thank\s*you|thanks|谢谢|感谢|多谢"
-    # Goodbye
-    r"|bye|goodbye|再见|拜拜|see\s+you"
-    # Ping / test
-    r"|test(ing)?|ping"
-    r")[\s!！？?。.，,~～…]*$",
-    re.IGNORECASE,
-)
-
-_CHAT_RESPONSE_SYSTEM = (
-    "You are Sirchmunk, an intelligent document search and analysis assistant. "
-    "The user sent a conversational message (greeting, identity question, etc.) "
-    "rather than a search query. Respond naturally and helpfully in 1-3 sentences. "
-    "Reply in the same language as the user's message."
-)
+from sirchmunk.utils.chat_utils import CHAT_QUERY_RE, CHAT_RESPONSE_SYSTEM
 
 
 class AgenticSearch(BaseSearch):
@@ -1569,7 +1537,7 @@ class AgenticSearch(BaseSearch):
     @staticmethod
     def _is_chat_query(query: str) -> bool:
         """Return True for obvious conversational queries (rule-based, no LLM)."""
-        return bool(_CHAT_QUERY_RE.match(query.strip()))
+        return bool(CHAT_QUERY_RE.match(query.strip()))
 
     async def _respond_chat(
         self,
@@ -1584,7 +1552,7 @@ class AgenticSearch(BaseSearch):
         )
         ctx = context or SearchContext()
         messages = [
-            {"role": "system", "content": _CHAT_RESPONSE_SYSTEM},
+            {"role": "system", "content": CHAT_RESPONSE_SYSTEM},
             *(chat_history or []),
             {"role": "user", "content": query},
         ]
@@ -2469,45 +2437,6 @@ class AgenticSearch(BaseSearch):
     # Phase 2 retrievers
     # ------------------------------------------------------------------
 
-    # High-frequency English words with near-zero discriminative power in
-    # large encyclopaedic corpora.  Kept compact — only words that cause
-    # catastrophic recall explosion (>1000 files) in a Wikipedia-scale corpus.
-    _HIGH_FREQ_STOPWORDS: set = {
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "shall",
-        "should", "may", "might", "can", "could", "must",
-        "and", "or", "but", "if", "of", "at", "by", "for", "with", "about",
-        "to", "from", "in", "on", "into", "through", "during", "before",
-        "after", "above", "below", "between", "out", "off", "over", "under",
-        "not", "no", "nor", "so", "too", "very", "just", "also",
-        "it", "its", "he", "she", "they", "them", "his", "her", "their",
-        "this", "that", "these", "those", "what", "which", "who", "whom",
-        "how", "when", "where", "why",
-        "all", "each", "every", "both", "few", "more", "most", "other",
-        "some", "such", "only", "own", "same", "than", "then",
-        "first", "last", "new", "old", "one", "two", "three",
-        "known", "used", "made", "many", "much", "well", "part",
-        "based", "found", "located", "born", "died", "became", "called",
-        "named", "published", "founded", "including", "according",
-    }
-
-    @staticmethod
-    def _filter_keywords(keywords: List[str], stopwords: set) -> List[str]:
-        """Remove high-frequency words that cause recall explosion.
-
-        Keeps multi-word phrases intact (they have higher discriminative
-        power). Only filters single-word keywords that appear in the
-        stopword set.
-        """
-        filtered = []
-        for kw in keywords:
-            words = kw.strip().split()
-            if len(words) > 1:
-                filtered.append(kw)
-            elif words and words[0].lower() not in stopwords:
-                filtered.append(kw)
-        return filtered
-
     async def _retrieve_by_keywords(
         self,
         keywords: List[str],
@@ -2516,19 +2445,8 @@ class AgenticSearch(BaseSearch):
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
     ) -> List[str]:
-        """Run keyword search via rga and return discovered file paths.
-
-        Filters out high-frequency words before searching to avoid
-        recall explosion on large corpora.
-        """
+        """Run keyword search via rga and return discovered file paths."""
         from sirchmunk.agentic.tools import KeywordSearchTool
-
-        filtered = self._filter_keywords(keywords, self._HIGH_FREQ_STOPWORDS)
-        if not filtered:
-            await self._logger.warning(
-                f"[Retrieve:Keywords] All keywords filtered as high-freq: {keywords}"
-            )
-            filtered = keywords[:2]
 
         tool = KeywordSearchTool(
             retriever=self.grep_retriever,
@@ -2540,7 +2458,7 @@ class AgenticSearch(BaseSearch):
             max_count=self._rga_max_count,
         )
         ctx = SearchContext()
-        result_text, meta = await tool.execute(context=ctx, keywords=filtered)
+        result_text, meta = await tool.execute(context=ctx, keywords=keywords)
 
         # Extract discovered file paths from the tool's context logs
         discovered: List[str] = []

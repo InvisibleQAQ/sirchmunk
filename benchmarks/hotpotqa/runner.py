@@ -327,163 +327,24 @@ def _collect_evidence_texts(cluster: Any, result: Any = None) -> List[str]:
     return texts
 
 
-_MAX_SENTS_PER_ARTICLE = 3
-_MAX_SP_PAIRS_PER_QUERY = 8
-_SENT_OVERLAP_THRESHOLD = 0.5
-_SENT_MIN_OVERLAP_TOKENS = 4
+_MAX_CANDIDATE_ARTICLES = 30
+_MAX_SENTS_PER_CANDIDATE = 10
 
-_SP_STOP = frozenset({
-    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
-    'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
-    'would', 'could', 'should', 'may', 'might', 'shall', 'can',
-    'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
-    'as', 'into', 'through', 'during', 'before', 'after', 'and',
-    'or', 'but', 'if', 'because', 'while', 'that', 'this',
-    'which', 'what', 'it', 'its', 'he', 'she', 'they', 'them',
-    'his', 'her', 'their', 'who', 'whom', 'whose', 'not', 'no',
-    'so', 'than', 'too', 'very', 'just', 'also', 'only',
-})
-_WORD_RE = re.compile(r'\b\w+\b')
+_STRIP_DISAMBIG_RE = re.compile(r"\s*\([^)]*\)\s*$")
 
 
-def _content_tokens(text: str) -> Set[str]:
-    """Extract meaningful content tokens for overlap-based matching."""
-    return {
-        t for t in _WORD_RE.findall(text.lower())
-        if t not in _SP_STOP and len(t) >= 2
-    }
-
-
-def _strip_disambiguation(title: str) -> str:
-    """Remove Wikipedia disambiguation suffix, e.g. 'Foo (film)' → 'Foo'."""
-    return re.sub(r"\s*\([^)]*\)\s*$", "", title).strip()
-
-
-def _is_title_relevant(
-    title: str,
-    context_lower: str,
-    context_tokens: Optional[Set[str]] = None,
-    files_read: Optional[List[str]] = None,
-) -> bool:
-    """Determine if a Wikipedia article title is relevant to the search context.
-
-    Checks (in order of priority):
-      1. Index lookup: title exists in title index AND file was read.
-      2. Exact substring match (full title or without disambiguation suffix).
-      3. Token coverage: all meaningful title words appear in context.
-         Only applied when the title has ≥ 2 content tokens to avoid
-         spurious matches on single common words.
-    """
-    t = title.lower().strip()
-    if len(t) < 3:
-        return False
-
-    # Priority 1: Check if title is in index AND was read during search
-    if files_read:
-        index_files = lookup_title_files(title)
-        if index_files:
-            from pathlib import Path as _Path
-            files_read_set = set(files_read)
-            for idx_file in index_files:
-                if str(_Path(idx_file).resolve()) in files_read_set:
-                    return True
-
-    # Priority 2: Exact substring match
-    if t in context_lower:
-        return True
-    stripped = _strip_disambiguation(t)
-    if stripped != t and len(stripped) >= 3 and stripped in context_lower:
-        return True
-
-    # Priority 3: Token coverage (relaxed)
-    if context_tokens is not None:
-        title_toks = _content_tokens(t)
-        if len(title_toks) >= 3 and title_toks.issubset(context_tokens):
-            return True
-
-    return False
-
-
-def _select_relevant_sentences(
-    sentences: List[str],
-    context_lower: str,
-    answer_lower: str = "",
-    context_tokens: Optional[Set[str]] = None,
-) -> List[int]:
-    """Choose which sentence IDs to include in the SP prediction.
-
-    Strategy:
-      1. Substring match: include sentences whose leading text appears
-         verbatim in the context.
-      2. Token overlap: include sentences sharing enough content tokens
-         with the evidence/question/answer context — catches bridging
-         facts at any position regardless of paraphrasing.
-      3. Answer match: include sentences containing the answer text.
-    Capped at ``_MAX_SENTS_PER_ARTICLE`` to keep SP precision high.
-    """
-    selected: Set[int] = set()
-
-    if context_tokens is None:
-        context_tokens = _content_tokens(context_lower)
-
-    for sid, sent in enumerate(sentences):
-        s = sent.strip() if isinstance(sent, str) else ""
-        if not s or len(s) <= 15:
-            continue
-        s_lower = s.lower()
-
-        prefix = s_lower[:120].rstrip(".,;:!?")
-        if len(prefix) > 20 and prefix in context_lower:
-            selected.add(sid)
-            continue
-
-        sent_toks = _content_tokens(s)
-        if sent_toks:
-            common = sent_toks & context_tokens
-            if (len(common) >= _SENT_MIN_OVERLAP_TOKENS
-                    and len(common) / len(sent_toks) >= _SENT_OVERLAP_THRESHOLD):
-                selected.add(sid)
-                continue
-
-        if answer_lower and len(answer_lower) >= 3 and answer_lower in s_lower:
-            selected.add(sid)
-
-    return sorted(selected)[:_MAX_SENTS_PER_ARTICLE]
-
-
-def _extract_titles_and_sp(
+def _parse_wiki_articles(
     files_read: List[str],
-    question: str = "",
-    answer: str = "",
-    evidence_texts: Optional[List[str]] = None,
-) -> Tuple[Set[str], List[List]]:
-    """Parse wiki JSONL files to extract article titles and predicted SP.
+) -> Tuple[Set[str], Dict[str, List[str]]]:
+    """Parse wiki JSONL files into article titles and their sentences.
 
-    Returns (all_titles, predicted_sp) where:
-      - all_titles: ALL article titles from all read files
-        (broad set for Evidence Recall diagnostic metric)
-      - predicted_sp: Only (title, sent_id) pairs from articles that are
-        demonstrably relevant to the query (narrow set for Sup EM/F1)
-
-    Relevance filtering (for predicted_sp only):
-      1. Article title appears as exact substring in the search context
-      2. Article sentence content (first 80 chars) appears in the context
-
-    Without this filter, every article in every read JSONL would be
-    predicted (~17K SP pairs), collapsing SP precision to near zero.
+    Returns (all_titles, articles) where:
+      - all_titles: every article title seen (for Evidence Recall metric)
+      - articles: {title → [sentence_0, sentence_1, ...]} for articles
+        whose sentences could be parsed
     """
     all_titles: Set[str] = set()
-    predicted_sp: List[List] = []
-
-    # Normalize all paths to resolved absolute form for consistent set comparison
-    from pathlib import Path as _Path
-    files_read = [str(_Path(f).resolve()) for f in files_read]
-
-    _ev = evidence_texts or []
-    context_lower = "\n".join([question, answer] + _ev).lower()
-    context_tokens = _content_tokens(context_lower)
-    from evaluate import normalize_answer
-    answer_lower = normalize_answer(answer) if answer else ""
+    articles: Dict[str, List[str]] = {}
 
     for fpath in files_read:
         try:
@@ -502,88 +363,159 @@ def _extract_titles_and_sp(
                         text = obj.get("text")
                         if not text:
                             continue
-                        # Flatten nested paragraph lists into a single sentence list
-                        if text and isinstance(text[0], list):
+                        if isinstance(text[0], list):
                             sentences = [
                                 s for para in text
                                 for s in (para if isinstance(para, list) else [para])
                             ]
                         else:
-                            sentences = text
-                        if not sentences:
-                            continue
-
-                        # --- Relevance check (with index support) ---
-                        relevant = _is_title_relevant(
-                            title, context_lower, context_tokens,
-                            files_read=files_read,
-                        )
-
-                        if not relevant:
-                            for sent in sentences:
-                                s = sent.strip() if isinstance(sent, str) else ""
-                                if len(s) > 20 and s[:80].lower() in context_lower:
-                                    relevant = True
-                                    break
-
-                        if relevant:
-                            for sid in _select_relevant_sentences(
-                                sentences, context_lower, answer_lower,
-                                context_tokens,
-                            ):
-                                sent_text = sentences[sid] if sid < len(sentences) else ""
-                                predicted_sp.append([title, sid, sent_text])
+                            sentences = list(text)
+                        if sentences and title not in articles:
+                            articles[title] = sentences
                     except (json_mod.JSONDecodeError, TypeError, IndexError):
                         continue
         except (FileNotFoundError, PermissionError):
             continue
 
-    if len(predicted_sp) > _MAX_SP_PAIRS_PER_QUERY:
-        predicted_sp = _prioritize_sp(predicted_sp, answer_lower, context_lower)
-    else:
-        # Strip auxiliary sent_text, keep only [title, sid]
-        predicted_sp = [[p[0], p[1]] for p in predicted_sp]
-
-    return all_titles, predicted_sp
+    return all_titles, articles
 
 
-def _prioritize_sp(
-    sp_pairs: List[List],
-    answer_lower: str,
-    context_lower: str,
-) -> List[List]:
-    """Rank SP pairs by relevance using title, answer, and sentence-context overlap."""
-    answer_toks = _content_tokens(answer_lower) if answer_lower else set()
-    context_toks = _content_tokens(context_lower)
+def _select_candidate_articles(
+    articles: Dict[str, List[str]],
+    context: str,
+) -> Dict[str, List[str]]:
+    """Lightweight pre-filter: keep articles whose title appears in context."""
+    ctx_lower = context.lower()
+    candidates: Dict[str, List[str]] = {}
 
-    def _score(pair: List) -> float:
-        title, sid = pair[0], pair[1]
-        sent_text = pair[2] if len(pair) > 2 else ""
-        s = 0.0
+    for title, sents in articles.items():
         t_lower = title.lower()
+        if t_lower in ctx_lower:
+            candidates[title] = sents
+            continue
+        stripped = _STRIP_DISAMBIG_RE.sub("", t_lower).strip()
+        if stripped != t_lower and len(stripped) >= 3 and stripped in ctx_lower:
+            candidates[title] = sents
 
-        # Title-answer relevance
-        if answer_lower and answer_lower in t_lower:
-            s += 10.0
-        if answer_toks:
-            t_toks = _content_tokens(t_lower)
-            s += len(answer_toks & t_toks) * 2.0
+    return dict(list(candidates.items())[:_MAX_CANDIDATE_ARTICLES])
 
-        # Sentence-context token overlap
-        if sent_text:
-            s_toks = _content_tokens(sent_text.lower() if isinstance(sent_text, str) else "")
-            if s_toks:
-                overlap = len(s_toks & context_toks)
-                s += min(overlap, 8) * 0.5
 
-        # Prefer lead sentence (typically the definition)
-        if sid == 0:
-            s += 0.5
-        return s
+def _format_candidates_for_llm(
+    candidates: Dict[str, List[str]],
+) -> str:
+    """Format candidate articles into a compact string for the LLM prompt."""
+    parts: List[str] = []
+    for title, sents in candidates.items():
+        lines = [f'["{title}"]']
+        for sid, sent in enumerate(sents[:_MAX_SENTS_PER_CANDIDATE]):
+            s = sent.strip() if isinstance(sent, str) else ""
+            if s:
+                lines.append(f"  {sid}: {s[:200]}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
 
-    scored = sorted(sp_pairs, key=_score, reverse=True)
-    # Strip auxiliary sent_text before returning [title, sid] pairs
-    return [[p[0], p[1]] for p in scored[:_MAX_SP_PAIRS_PER_QUERY]]
+
+_SP_EXTRACT_PROMPT = """\
+Given a multi-hop question, its answer, and the search reasoning, identify \
+the supporting facts from the Wikipedia articles below.
+
+Rules:
+- A supporting fact is a [title, sentence_index] pair where sentence_index \
+is the 0-based index shown before each sentence.
+- Typically 2-5 supporting facts are needed for multi-hop questions.
+- Include ONLY sentences that directly provide evidence for answering the question.
+- For comparison questions, include the key defining sentence from EACH entity.
+- Do NOT include tangential or background sentences.
+
+Question: {question}
+Answer: {answer}
+
+Search reasoning (excerpts):
+{reasoning}
+
+Candidate articles:
+{candidates}
+
+Output ONLY a JSON array of [title, sentence_index] pairs.
+Example: [["Article A", 0], ["Article B", 2]]
+JSON:"""
+
+
+async def _extract_sp_with_llm(
+    question: str,
+    answer: str,
+    files_read: List[str],
+    llm: Any,
+    evidence_texts: Optional[List[str]] = None,
+    reasoning_texts: Optional[List[str]] = None,
+) -> Tuple[Set[str], List[List]]:
+    """Extract supporting facts using LLM post-processing.
+
+    Replaces heuristic substring matching with a single LLM call that
+    understands the question semantics and selects precise (title, sent_id)
+    pairs in the same format as the official gold data.
+
+    Returns (all_titles, predicted_sp).
+    """
+    from pathlib import Path as _Path
+    files_read = [str(_Path(f).resolve()) for f in files_read]
+
+    all_titles, articles = _parse_wiki_articles(files_read)
+
+    _ev = evidence_texts or []
+    _rt = reasoning_texts or []
+    context = "\n".join([question, answer] + _ev + _rt)
+
+    candidates = _select_candidate_articles(articles, context)
+
+    if not candidates:
+        return all_titles, []
+
+    candidates_text = _format_candidates_for_llm(candidates)
+
+    reasoning_summary = "\n".join(_rt[-5:])
+    if len(reasoning_summary) > 2000:
+        reasoning_summary = reasoning_summary[:2000] + "\n...[truncated]"
+
+    prompt = _SP_EXTRACT_PROMPT.format(
+        question=question,
+        answer=answer,
+        reasoning=reasoning_summary or "(no reasoning available)",
+        candidates=candidates_text,
+    )
+
+    try:
+        resp = await llm.achat(
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+        )
+        raw = resp.content.strip()
+
+        bracket_start = raw.find("[")
+        bracket_end = raw.rfind("]")
+        if bracket_start >= 0 and bracket_end > bracket_start:
+            raw = raw[bracket_start:bracket_end + 1]
+
+        parsed = json_mod.loads(raw)
+        if not isinstance(parsed, list):
+            return all_titles, []
+
+        predicted_sp: List[List] = []
+        valid_titles = set(candidates.keys())
+        for item in parsed:
+            if (isinstance(item, (list, tuple))
+                    and len(item) >= 2
+                    and isinstance(item[0], str)
+                    and isinstance(item[1], (int, float))):
+                title, sid = item[0], int(item[1])
+                if title in valid_titles and 0 <= sid < len(candidates[title]):
+                    predicted_sp.append([title, sid])
+
+        return all_titles, predicted_sp
+
+    except Exception as e:
+        logger.warning("SP LLM extraction failed: %s", e)
+        return all_titles, []
 
 
 _SAMPLE_RETRYABLE_KEYWORDS = ("429", "RateLimitError", "rate limit",
@@ -661,15 +593,16 @@ async def run_single(
                     "llm_calls": len(getattr(result, "llm_usages", None) or []),
                 }
 
-                # Collect evidence texts for relevance-based SP filtering
                 evidence_texts = _collect_evidence_texts(cluster, result)
+                _reasoning_texts = list(getattr(result, "reasoning_texts", None) or [])
 
-                titles, predicted_sp = _extract_titles_and_sp(
-                    files_read, question, raw_answer, evidence_texts,
+                titles, predicted_sp = await _extract_sp_with_llm(
+                    question, raw_answer, files_read, llm,
+                    evidence_texts=evidence_texts,
+                    reasoning_texts=_reasoning_texts,
                 )
                 retrieved_titles = list(titles)
 
-                _reasoning_texts = list(getattr(result, "reasoning_texts", None) or [])
                 if cfg.extract_answer and raw_answer:
                     # Short answers (< 80 chars) are likely already factoid-level;
                     # skip the extra LLM call to avoid corruption and latency.
