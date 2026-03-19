@@ -64,6 +64,9 @@ class MemoryPrior:
     extra_files: Dict[str, float] = field(default_factory=dict)
     """Explicitly transferred file paths from similar-query memory hints."""
 
+    avg_confidence: float = 0.0
+    """Weighted average confidence across all memory sources (0-1)."""
+
     @property
     def is_empty(self) -> bool:
         return (
@@ -142,10 +145,12 @@ class MemoryBridge:
                 pass
 
         # 4. QuerySimilarityIndex: transfer from similar historical queries
+        _hint_confidences: list = []
         try:
             hints = mem.get_similar_query_hints(query, top_k=3)
             for hint in hints:
-                if hint.confidence >= 0.5:
+                _hint_confidences.append(hint.confidence)
+                if hint.confidence >= 0.4:
                     for fp in hint.useful_files[:5]:
                         existing = prior.similar_query_files.get(fp, 0.0)
                         prior.similar_query_files[fp] = max(
@@ -165,6 +170,10 @@ class MemoryBridge:
             for fp in extra_files:
                 prior.extra_files[fp] = 0.5
 
+        # Compute aggregate confidence from available signals
+        if _hint_confidences:
+            prior.avg_confidence = sum(_hint_confidences) / len(_hint_confidences)
+
         if not prior.is_empty:
             n_priors = (
                 len(prior.path_scores)
@@ -174,10 +183,11 @@ class MemoryBridge:
             )
             logger.info(
                 "MemoryBridge: extracted %d file priors, %d dead paths, "
-                "chain_hint=%s",
+                "chain_hint=%s, avg_conf=%.2f",
                 n_priors,
                 len(prior.dead_paths),
                 "yes" if prior.chain_hint else "no",
+                prior.avg_confidence,
             )
 
         return prior

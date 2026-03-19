@@ -268,6 +268,61 @@ class FailureMemory(MemoryStore):
         except Exception as exc:
             logger.debug(f"FailureMemory: keyword record failed: {exc}")
 
+    def record_highfreq_keyword(
+        self,
+        keyword: str,
+        files_found: int,
+    ) -> None:
+        """Directly mark a keyword as high-frequency noise (from ugrep detection).
+
+        Skips the normal gradual learning path and immediately records
+        the keyword with ``recommendation='skip'`` so future queries
+        can bypass ugrep re-detection.
+        """
+        key = keyword.lower().strip()
+        if not key:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            existing = self._db.fetch_one(
+                "SELECT sample_count FROM noise_keywords WHERE keyword = ?",
+                [key],
+            )
+            if existing:
+                self._db.update_data(
+                    "noise_keywords",
+                    {
+                        "avg_files_found": float(files_found),
+                        "avg_useful_ratio": 0.0,
+                        "sample_count": max(existing[0], self._NOISE_MIN_SAMPLES),
+                        "recommendation": "skip",
+                        "updated_at": now,
+                    },
+                    "keyword = ?", [key],
+                )
+            else:
+                self._db.insert_data("noise_keywords", {
+                    "keyword": key,
+                    "avg_files_found": float(files_found),
+                    "avg_useful_ratio": 0.0,
+                    "sample_count": self._NOISE_MIN_SAMPLES,
+                    "recommendation": "skip",
+                    "updated_at": now,
+                })
+        except Exception as exc:
+            logger.debug(f"FailureMemory: highfreq keyword record failed: {exc}")
+
+    def is_noise_keyword(self, keyword: str) -> bool:
+        """Check if a keyword is marked as noise (recommendation='skip')."""
+        try:
+            row = self._db.fetch_one(
+                "SELECT recommendation FROM noise_keywords WHERE keyword = ?",
+                [keyword.lower().strip()],
+            )
+            return row is not None and row[0] == "skip"
+        except Exception:
+            return False
+
     def _classify_noise(self, useful_ratio: float, sample_count: int) -> str:
         if sample_count < self._NOISE_MIN_SAMPLES:
             return "monitor"

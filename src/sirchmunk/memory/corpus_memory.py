@@ -197,8 +197,17 @@ class CorpusMemory(MemoryStore):
         path: str,
         entity_type: str = "unknown",
         success: bool = True,
+        confidence: float = 0.5,
     ) -> None:
-        """Record that *entity* was found in *path*."""
+        """Record that *entity* was found in *path*.
+
+        Parameters
+        ----------
+        confidence : float
+            Continuous confidence (0-1) from the feedback signal.
+            Used to modulate the delta applied to the stored confidence
+            and as the initial confidence for new entries.
+        """
         entity_lower = entity.lower()
         now = datetime.now(timezone.utc).isoformat()
         try:
@@ -209,7 +218,7 @@ class CorpusMemory(MemoryStore):
             )
             if existing:
                 new_hits = existing[0] + 1
-                delta = 0.05 if success else -0.02
+                delta = 0.05 * confidence if success else -0.05 * (1 - confidence)
                 new_conf = max(0.0, min(1.0, existing[1] + delta))
                 self._db.execute(
                     "UPDATE entity_index SET hit_count = ?, confidence = ?, "
@@ -217,11 +226,12 @@ class CorpusMemory(MemoryStore):
                     [new_hits, new_conf, now, entity_lower, path],
                 )
             else:
+                init_conf = min(0.8, confidence) if success else max(0.1, confidence * 0.5)
                 self._db.insert_data("entity_index", {
                     "entity": entity_lower,
                     "entity_type": entity_type,
                     "path": path,
-                    "confidence": 0.5 if success else 0.3,
+                    "confidence": init_conf,
                     "hit_count": 1,
                     "last_hit": now,
                 })

@@ -256,6 +256,20 @@ class RetrievalMemory:
         """Delegate to CorpusMemory's improved entity extractor."""
         return CorpusMemory.extract_entities(keywords)
 
+    def is_noise_keyword(self, keyword: str) -> bool:
+        """FailureMemory → check if a keyword is known high-frequency noise."""
+        try:
+            return self._failure_memory.is_noise_keyword(keyword)
+        except Exception:
+            return False
+
+    def record_highfreq_keyword(self, keyword: str, files_found: int) -> None:
+        """FailureMemory → persist a ugrep-detected high-frequency keyword."""
+        try:
+            self._failure_memory.record_highfreq_keyword(keyword, files_found)
+        except Exception:
+            pass
+
     # ================================================================
     #  Recording API  (async, called after search completes)
     # ================================================================
@@ -312,7 +326,9 @@ class RetrievalMemory:
                 for entity in entities[:20]:
                     for fp in signal.files_read[:20]:
                         self._corpus_memory.record_entity_path(
-                            entity, fp, success=(confidence >= 0.5),
+                            entity, fp,
+                            success=(confidence >= 0.5),
+                            confidence=confidence,
                         )
         except Exception as exc:
             logger.debug(f"[memory:dispatch] CorpusMemory entity failed: {exc}")
@@ -335,6 +351,25 @@ class RetrievalMemory:
                 )
         except Exception as exc:
             logger.debug(f"[memory:dispatch] PathMemory failed: {exc}")
+
+        # 5b. PatternMemory — reasoning chain (abstracted trace)
+        if confidence >= 0.5 and signal.files_read and signal.keywords_used:
+            try:
+                steps: List[Dict[str, str]] = []
+                for kw in signal.keywords_used[:3]:
+                    steps.append({"action": "keyword_search", "target": kw})
+                for fp in signal.files_read[:3]:
+                    steps.append({"action": "read_file", "target": fp})
+                if signal.answer_found:
+                    steps.append({"action": "answer", "target": "found"})
+                if steps:
+                    self._pattern_memory.record_chain(
+                        query=signal.query,
+                        steps=steps,
+                        success=(confidence >= 0.5),
+                    )
+            except Exception as exc:
+                logger.debug(f"[memory:dispatch] PatternMemory chain failed: {exc}")
 
         # 6. FailureMemory — noise keywords + dead paths + failed strategies
         try:
@@ -404,17 +439,19 @@ class RetrievalMemory:
                 )
 
         # 7. QuerySimilarityIndex — record for future similarity lookup
+        # Prefer high_value_files (belief-confirmed useful) over raw lists
+        _useful = (
+            signal.high_value_files
+            if signal.high_value_files
+            else (signal.files_discovered if signal.files_discovered else signal.files_read)
+        )
         try:
             self._query_similarity.record(
                 query=signal.query,
                 confidence=confidence,
                 mode=signal.mode,
                 keywords=signal.keywords_used,
-                useful_files=(
-                    signal.files_discovered
-                    if signal.files_discovered
-                    else signal.files_read
-                ),
+                useful_files=_useful,
                 answer_snippet=(signal.answer_text or "")[:300],
             )
         except Exception as exc:

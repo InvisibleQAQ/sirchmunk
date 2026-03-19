@@ -97,6 +97,7 @@ class ExperimentConfig:
 
     # Memory
     enable_memory: bool
+    enable_eval_feedback: bool
 
     # Knowledge reuse
     reuse_knowledge: bool
@@ -170,6 +171,7 @@ def get_config(
         "output_dir": output_dir,
         "enable_thinking": _bool_env(os.getenv("SIRCHMUNK_ENABLE_THINKING"), False),
         "enable_memory": _bool_env(os.getenv("SIRCHMUNK_ENABLE_MEMORY"), False),
+        "enable_eval_feedback": _bool_env(os.getenv("HOTPOT_ENABLE_EVAL_FEEDBACK"), False),
         "reuse_knowledge": _bool_env(os.getenv("HOTPOT_REUSE_KNOWLEDGE"), False),
         "ugrep_corpus_path": os.getenv("HOTPOT_UGREP_CORPUS_PATH") or None,
         "highfreq_file_threshold": int(os.getenv("HOTPOT_HIGHFREQ_FILE_THRESHOLD", "2000")),

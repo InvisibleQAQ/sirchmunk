@@ -13,7 +13,7 @@ the ``KnowledgeCluster`` (when available), and all pipeline telemetry.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 if TYPE_CHECKING:
@@ -81,7 +81,9 @@ class SearchContext:
     search_history: List[str] = field(default_factory=list, init=False)
     reasoning_texts: List[str] = field(default_factory=list, init=False)
     loop_count: int = field(default=0, init=False)
-    start_time: datetime = field(default_factory=datetime.now, init=False)
+    start_time: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc), init=False,
+    )
 
     answer: str = field(default="", init=False)
     cluster: Optional["KnowledgeCluster"] = field(default=None, init=False)

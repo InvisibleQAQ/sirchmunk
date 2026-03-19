@@ -379,6 +379,7 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
 
     # --- Run predictions on pending samples ---
     new_results = []
+    searcher = None
     t0 = time.time()
     if pending_samples:
         if cfg.llm_only:
@@ -388,7 +389,7 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
         else:
             print(f"\n[run] Starting evaluation on {len(pending_samples)} questions "
                   f"against wiki corpus ({n_corpus} files) ...")
-            new_results = await run_batch(pending_samples, cfg)
+            new_results, searcher = await run_batch(pending_samples, cfg)
 
         # Save intermediate checkpoint after each batch
         all_results_so_far = resumed_results + new_results
@@ -406,6 +407,25 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
 
     # --- Evaluate ---
     metrics = evaluate_predictions(results, samples)
+
+    # --- Evaluation Feedback Injection (closes the memory learning loop) ---
+    if searcher and cfg.enable_memory and cfg.enable_eval_feedback:
+        n_injected = 0
+        for ps in metrics.get("per_sample", []):
+            try:
+                searcher.inject_evaluation(
+                    query=ps.get("question", ""),
+                    em_score=float(ps.get("ans_em", 0)),
+                    f1_score=float(ps.get("ans_f1", 0)),
+                )
+                n_injected += 1
+            except Exception:
+                pass
+        if n_injected:
+            print(f"[memory] Injected evaluation feedback for {n_injected} samples")
+        await searcher.flush_memory()
+    elif searcher:
+        await searcher.flush_memory()
 
     # --- GPT-Eval ---
     gpt_acc = None

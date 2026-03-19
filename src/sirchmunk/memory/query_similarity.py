@@ -153,20 +153,54 @@ class QuerySimilarityIndex:
         query: str,
         top_k: int = 5,
         min_similarity: float = 0.55,
+        include_exact: bool = True,
     ) -> List[SimilarQueryHint]:
-        """Return up to *top_k* similar historical queries."""
+        """Return up to *top_k* similar historical queries.
+
+        Parameters
+        ----------
+        include_exact : bool
+            When ``True``, exact query matches are returned with
+            similarity = 1.0 (highest priority).  Previously exact
+            matches were always excluded; this default change allows
+            reuse of direct experience from repeated queries.
+        """
         with self._lock:
             entries = list(self._entries)
             embeddings = dict(self._embeddings)
         if not entries:
             return []
 
+        results: List[SimilarQueryHint] = []
+
+        if include_exact:
+            for e in reversed(entries):
+                if e.get("query", "") == query:
+                    results.append(SimilarQueryHint(
+                        query=e["query"],
+                        similarity=1.0,
+                        confidence=e.get("confidence", 0.0),
+                        mode=e.get("mode"),
+                        keywords=e.get("keywords", []),
+                        useful_files=e.get("useful_files", []),
+                    ))
+                    break
+
+        remaining = top_k - len(results)
+        if remaining <= 0:
+            return results[:top_k]
+
         embedding = self._encode(query)
         if embedding is not None and embeddings:
-            return self._search_by_embedding(
-                query, embedding, entries, embeddings, top_k, min_similarity,
+            fuzzy = self._search_by_embedding(
+                query, embedding, entries, embeddings, remaining, min_similarity,
             )
-        return self._search_by_bm25(query, entries, top_k, min_similarity)
+        else:
+            fuzzy = self._search_by_bm25(
+                query, entries, remaining, min_similarity,
+            )
+        results.extend(fuzzy)
+        return results[:top_k]
 
     # ── Embedding path ────────────────────────────────────────────────
 

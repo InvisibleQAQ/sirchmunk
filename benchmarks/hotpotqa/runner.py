@@ -890,8 +890,12 @@ async def run_single(
 async def run_batch(
     samples: List[Dict[str, Any]],
     cfg: ExperimentConfig,
-) -> List[Dict[str, Any]]:
-    """Run AgenticSearch on all samples with progress tracking."""
+) -> Tuple[List[Dict[str, Any]], Any]:
+    """Run AgenticSearch on all samples with progress tracking.
+
+    Returns (results, searcher) so callers can inject evaluation feedback
+    and flush memory after evaluation completes.
+    """
     from sirchmunk.search import AgenticSearch
     from sirchmunk.llm.openai_chat import OpenAIChat
 
@@ -946,7 +950,8 @@ async def run_batch(
 
     tasks = [_tracked(s) for s in samples]
     results = await asyncio.gather(*tasks)
-    return list(results)
+
+    return list(results), searcher
 
 
 # ---------------------------------------------------------------------------

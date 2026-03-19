@@ -81,12 +81,15 @@ class BeliefState:
     # Memory warm-start
     # ------------------------------------------------------------------
 
+    # Minimum aggregate confidence to apply any warm-start priors
+    _WARM_START_MIN_CONFIDENCE: float = 0.3
+
     def warm_start(self, prior: "MemoryPrior") -> None:
         """Initialize beliefs from cross-session memory priors.
 
-        Uses dampened combination so that memory priors never exceed
-        ``_MAX_WARM_BELIEF``, preserving the UCB exploration term's
-        ability to recommend unseen files.
+        Uses confidence-scaled dampening: when ``prior.avg_confidence``
+        is low, the effective cap shrinks proportionally, reducing the
+        influence of uncertain or stale memory data.
 
         Layering order (later layers can boost but not exceed the cap):
         1. PathMemory hot_scores (weakest — historical frequency)
@@ -97,7 +100,12 @@ class BeliefState:
         self._dead_paths = set(prior.dead_paths) if prior.dead_paths else set()
         self._chain_hint = prior.chain_hint
 
-        cap = self._MAX_WARM_BELIEF
+        if prior.avg_confidence < self._WARM_START_MIN_CONFIDENCE:
+            return
+
+        # Scale cap by confidence: high confidence → full cap, low → reduced
+        conf_scale = min(1.0, prior.avg_confidence / 0.8)
+        cap = self._MAX_WARM_BELIEF * conf_scale
 
         # Layer 1: path hotness (dampened by 0.4)
         for fp, score in prior.path_scores.items():

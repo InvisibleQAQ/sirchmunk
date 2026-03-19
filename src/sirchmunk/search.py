@@ -137,6 +137,7 @@ class AgenticSearch(BaseSearch):
         self.knowledge_storage: Optional[KnowledgeStorage] = None
         self.embedding_client = None
         self._memory = None
+        self._pending_feedback: List[asyncio.Task] = []
 
         # ---- Background warm-up: non-blocking ----
         self._warmup_event = threading.Event()
@@ -209,6 +210,7 @@ class AgenticSearch(BaseSearch):
                         work_path=str(self.work_path),
                         embedding_util=self.embedding_client,
                     )
+                    self.grep_retriever.set_memory(self._memory)
                     _loguru_logger.info("[warmup] Retrieval memory enabled and initialised")
                 except Exception as exc:
                     _loguru_logger.info(f"[warmup] Retrieval memory not available: {exc}")
@@ -238,6 +240,43 @@ class AgenticSearch(BaseSearch):
             _loguru_logger.warning(
                 "[warmup] Timed out — proceeding with available components"
             )
+
+    def inject_evaluation(
+        self,
+        query: str,
+        em_score: float,
+        f1_score: float,
+        llm_judge_verdict: Optional[str] = None,
+    ) -> None:
+        """Back-fill evaluation metrics into memory for the given query.
+
+        Called by benchmark harnesses after ground-truth evaluation is
+        available.  This closes the learning loop by providing gradient
+        confidence to all memory layers.
+        """
+        if self._memory:
+            self._memory.inject_evaluation(
+                query=query,
+                em_score=em_score,
+                f1_score=f1_score,
+                llm_judge_verdict=llm_judge_verdict,
+            )
+
+    async def flush_memory(self) -> None:
+        """Await all pending feedback tasks and flush memory to disk.
+
+        Must be called before process exit to guarantee feedback persistence.
+        """
+        if self._pending_feedback:
+            done = [t for t in self._pending_feedback if not t.done()]
+            if done:
+                await asyncio.gather(*done, return_exceptions=True)
+            self._pending_feedback.clear()
+        if self._memory:
+            try:
+                self._memory.close()
+            except Exception:
+                pass
 
     def update_log_callback(self, log_callback: LogCallback = None) -> None:
         """Replace the per-request log callback on all sub-components.
@@ -1263,13 +1302,16 @@ class AgenticSearch(BaseSearch):
         # ---- Memory: strategy hint + similar-query transfer (zero-LLM) ----
         _memory_extra_files: List[str] = []
         _memory_extra_keywords: List[str] = []
-        _MEMORY_CONFIDENCE_THRESHOLD = 0.7
+        # Strategy changes are high-impact → require strong confidence.
+        # File/keyword hints are supplementary → accept moderate confidence.
+        _STRATEGY_CONFIDENCE_MIN = 0.7
+        _HINT_CONFIDENCE_MIN = 0.4
         _MEMORY_MAX_EXTRA_FILES = 5
         _MEMORY_MAX_EXTRA_KEYWORDS = 8
         if self._memory and mode != "FILENAME_ONLY":
             try:
                 hint = self._memory.suggest_strategy(query)
-                if hint and hint.confidence >= _MEMORY_CONFIDENCE_THRESHOLD:
+                if hint and hint.confidence >= _STRATEGY_CONFIDENCE_MIN:
                     if hint.mode:
                         mode = hint.mode
                     if hint.top_k_files is not None:
@@ -1283,7 +1325,7 @@ class AgenticSearch(BaseSearch):
             try:
                 sim_hints = self._memory.get_similar_query_hints(query, top_k=3)
                 for sh in sim_hints:
-                    if sh.confidence >= _MEMORY_CONFIDENCE_THRESHOLD:
+                    if sh.confidence >= _HINT_CONFIDENCE_MIN:
                         _memory_extra_files.extend(sh.useful_files[:3])
                         _memory_extra_keywords.extend(sh.keywords[:3])
                 _memory_extra_files = _memory_extra_files[:_MEMORY_MAX_EXTRA_FILES]
@@ -1543,12 +1585,13 @@ class AgenticSearch(BaseSearch):
         if self._memory:
             try:
                 from sirchmunk.memory.schemas import FeedbackSignal
-                elapsed = (
-                    datetime.now(timezone.utc)
-                    - (context.start_time.replace(tzinfo=timezone.utc)
-                       if context.start_time.tzinfo is None
-                       else context.start_time)
-                ).total_seconds()
+                _now = datetime.now(timezone.utc)
+                _start = (
+                    context.start_time
+                    if context.start_time.tzinfo
+                    else context.start_time.replace(tzinfo=timezone.utc)
+                )
+                elapsed = max(0.0, (_now - _start).total_seconds())
                 _discovered = list(context.read_file_ids)
                 for log_entry in context.retrieval_logs:
                     if log_entry.tool_name == "keyword_search":
@@ -1579,7 +1622,7 @@ class AgenticSearch(BaseSearch):
                         getattr(cluster, "confidence", 0.0) if cluster else 0.0
                     ),
                     react_loops=context.loop_count,
-                    files_read_count=len(context.read_file_ids),
+                    files_read_count=context.total_known_files,
                     files_useful_count=_useful_count,
                     total_tokens=context.total_llm_tokens,
                     latency_sec=elapsed,
@@ -1596,7 +1639,8 @@ class AgenticSearch(BaseSearch):
                     except Exception:
                         pass
 
-                asyncio.ensure_future(self._memory.record_feedback(signal))
+                task = asyncio.ensure_future(self._memory.record_feedback(signal))
+                self._pending_feedback.append(task)
             except Exception:
                 pass
 
@@ -2095,12 +2139,13 @@ class AgenticSearch(BaseSearch):
         if self._memory:
             try:
                 from sirchmunk.memory.schemas import FeedbackSignal
-                elapsed = (
-                    datetime.now(timezone.utc)
-                    - (context.start_time.replace(tzinfo=timezone.utc)
-                       if context.start_time.tzinfo is None
-                       else context.start_time)
-                ).total_seconds()
+                _now = datetime.now(timezone.utc)
+                _start = (
+                    context.start_time
+                    if context.start_time.tzinfo
+                    else context.start_time.replace(tzinfo=timezone.utc)
+                )
+                elapsed = max(0.0, (_now - _start).total_seconds())
                 signal = FeedbackSignal(
                     query=query,
                     mode="FAST",
@@ -2117,7 +2162,8 @@ class AgenticSearch(BaseSearch):
                     files_read=list(context.read_file_ids),
                     files_discovered=[file_path] if file_path else [],
                 )
-                asyncio.ensure_future(self._memory.record_feedback(signal))
+                task = asyncio.ensure_future(self._memory.record_feedback(signal))
+                self._pending_feedback.append(task)
             except Exception:
                 pass
 

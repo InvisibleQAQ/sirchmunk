@@ -50,6 +50,11 @@ class GrepRetriever(BaseRetriever):
         self._highfreq_file_threshold: int = int(kwargs.get("highfreq_file_threshold", 0))
         self._rga_max_parse_lines: int = int(kwargs.get("rga_max_parse_lines", 0))
         self._merge_max_files: int = int(kwargs.get("merge_max_files", 0))
+        self._memory: Any = None
+
+    def set_memory(self, memory: Any) -> None:
+        """Inject memory reference for noise-keyword persistence."""
+        self._memory = memory
 
     async def retrieve(
         self,
@@ -603,6 +608,19 @@ class GrepRetriever(BaseRetriever):
         )  # Default 10MB
         rga_cache_path = kwargs.get("rga_cache_path")
 
+        # Memory-based noise keyword fast-path (skip ugrep entirely)
+        _mem = self._memory if hasattr(self, "_memory") else None
+        if _mem and highfreq_file_threshold:
+            try:
+                if _mem.is_noise_keyword(pattern):
+                    logger.info(
+                        "[highfreq:memory-skip] '{}' known as noise keyword",
+                        pattern[:60],
+                    )
+                    return []
+            except Exception:
+                pass
+
         # ugrep --index pre-filtering: narrow search scope to candidate files
         if ugrep_corpus_path and path and not invert_match:
             candidates = await GrepRetriever._run_ugrep_prefilter_async(
@@ -620,6 +638,11 @@ class GrepRetriever(BaseRetriever):
                         "[highfreq:skip] '{}' hits {} files (threshold {}), skipping",
                         pattern[:60], len(candidates), highfreq_file_threshold,
                     )
+                    if _mem:
+                        try:
+                            _mem.record_highfreq_keyword(pattern, len(candidates))
+                        except Exception:
+                            pass
                     return []
                 if len(candidates) <= _UGREP_PREFILTER_MAX_FILES:
                     path = candidates
