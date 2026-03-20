@@ -299,22 +299,23 @@ class OpenAIChat:
             self,
             chunk: Any,
             acc: _StreamAccumulator,
-    ) -> Tuple[Optional[str], Optional[str]]:
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """Update *acc* with a single stream chunk.
 
-        Returns ``(role_delta, content_delta)`` — either may be ``None``.
-        The caller is responsible for logging these deltas (sync or async).
+        Returns ``(role_delta, content_delta, thinking_delta)`` — any may
+        be ``None``.  The caller is responsible for logging these deltas.
         """
         if chunk.usage:
             acc.usage = self._safe_model_dump(chunk.usage)
         if chunk.model:
             acc.model = chunk.model
         if not chunk.choices:
-            return None, None
+            return None, None, None
 
         delta = chunk.choices[0].delta
         role_delta: Optional[str] = None
         content_delta: Optional[str] = None
+        thinking_delta: Optional[str] = None
 
         if delta.role:
             acc.role = delta.role
@@ -325,6 +326,7 @@ class OpenAIChat:
             tc = getattr(delta, thinking_field, None)
             if tc:
                 acc.thinking_parts.append(tc)
+                thinking_delta = tc
 
         if delta.content:
             acc.content_parts.append(delta.content)
@@ -333,7 +335,7 @@ class OpenAIChat:
         if chunk.choices[0].finish_reason:
             acc.finish_reason = chunk.choices[0].finish_reason
 
-        return role_delta, content_delta
+        return role_delta, content_delta, thinking_delta
 
     def _parse_non_stream_response(self, resp: Any) -> OpenAIChatResponse:
         """Parse a complete (non-streaming) API response into a response object.
@@ -442,12 +444,23 @@ class OpenAIChat:
             return result
 
         acc = _StreamAccumulator(model=self._model)
+        in_thinking = False
         for chunk in resp:
-            role_delta, content_delta = self._process_stream_chunk(chunk, acc)
+            role_delta, content_delta, thinking_delta = self._process_stream_chunk(chunk, acc)
             if role_delta:
                 self._logger.info(f"[role={role_delta}] ", end="", flush=True)
+            if thinking_delta:
+                if not in_thinking:
+                    self._logger.info("<think>", end="", flush=True)
+                    in_thinking = True
+                self._logger.info(thinking_delta, end="", flush=True)
             if content_delta:
+                if in_thinking:
+                    self._logger.info("</think>\n", end="", flush=True)
+                    in_thinking = False
                 self._logger.info(content_delta, end="", flush=True)
+        if in_thinking:
+            self._logger.info("</think>\n", end="", flush=True)
         self._logger.info("", end="\n", flush=True)
 
         return acc.to_response()
@@ -513,12 +526,23 @@ class OpenAIChat:
             return result
 
         acc = _StreamAccumulator(model=self._model)
+        in_thinking = False
         async for chunk in resp:
-            role_delta, content_delta = self._process_stream_chunk(chunk, acc)
+            role_delta, content_delta, thinking_delta = self._process_stream_chunk(chunk, acc)
             if role_delta:
                 await self._logger_async.info(f"[role={role_delta}] ", end="", flush=True)
+            if thinking_delta:
+                if not in_thinking:
+                    await self._logger_async.info("<think>", end="", flush=True)
+                    in_thinking = True
+                await self._logger_async.info(thinking_delta, end="", flush=True)
             if content_delta:
+                if in_thinking:
+                    await self._logger_async.info("</think>\n", end="", flush=True)
+                    in_thinking = False
                 await self._logger_async.info(content_delta, end="", flush=True)
+        if in_thinking:
+            await self._logger_async.info("</think>\n", end="", flush=True)
         await self._logger_async.info("", end="\n", flush=True)
 
         return acc.to_response()

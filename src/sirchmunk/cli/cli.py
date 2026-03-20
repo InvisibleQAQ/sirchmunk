@@ -165,6 +165,13 @@ MCP_HOST=localhost
 
 # Port for HTTP transport
 MCP_PORT=8080
+
+# ===== Optional: Custom Embedding Model Settings =====
+# Embedding model ID (from ModelScope or HuggingFace)
+EMBEDDING_MODEL_ID=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+
+# Embedding model cache directory
+EMBEDDING_CACHE_DIR=${SIRCHMUNK_WORK_PATH}/.cache/models
 """
 
     with open(env_file, "w") as f:
@@ -292,9 +299,12 @@ def _run_base_init(work_path: Path) -> int:
     try:
         from sirchmunk.utils.embedding_util import EmbeddingUtil
 
-        model_cache_dir = str(work_path / ".cache" / "models")
+        model_cache_dir = os.getenv("EMBEDDING_CACHE_DIR", str(work_path / ".cache" / "models"))
+        # Read embedding model id from environment or use default
+        embedding_model_id = os.getenv("EMBEDDING_MODEL_ID", EmbeddingUtil.DEFAULT_MODEL_ID)
         model_dir = EmbeddingUtil.preload_model(
             cache_dir=model_cache_dir,
+            model_id=embedding_model_id,
         )
         print(f"  ✓ Embedding model downloaded: {model_dir}")
     except Exception as e:
@@ -600,7 +610,12 @@ def _search_via_api(
     mode: str = "FAST",
     output_format: str = "text",
 ) -> int:
-    """Execute search via API server.
+    """Execute search via API server with SSE log streaming.
+
+    Uses the ``/api/v1/search/stream`` endpoint to receive real-time
+    log output during the search, then prints the final result.
+    Falls back to the non-streaming ``/api/v1/search`` endpoint when
+    the streaming endpoint is unavailable.
 
     Args:
         query: Search query
@@ -624,18 +639,21 @@ def _search_via_api(
     print(f"   Mode: {mode}")
     print()
 
+    payload = {"query": query, "paths": paths, "mode": mode}
+
+    try:
+        return _search_via_api_stream(api_url, payload, output_format)
+    except Exception:
+        pass
+
+    # Fallback: non-streaming endpoint
     try:
         response = requests.post(
             f"{api_url}/api/v1/search",
-            json={
-                "query": query,
-                "paths": paths,
-                "mode": mode,
-            },
-            timeout=300,  # 5 minute timeout for long searches
+            json=payload,
+            timeout=300,
         )
         response.raise_for_status()
-
         data = response.json()
 
         if output_format == "json":
@@ -650,7 +668,6 @@ def _search_via_api(
             else:
                 print(f"  Search failed: {data.get('error', 'Unknown error')}")
                 return 1
-
         return 0
 
     except requests.exceptions.ConnectionError:
@@ -663,6 +680,101 @@ def _search_via_api(
     except Exception as e:
         print(f"  API error: {e}")
         return 1
+
+
+def _search_via_api_stream(
+    api_url: str,
+    payload: dict,
+    output_format: str,
+) -> int:
+    """Stream search via the SSE endpoint, printing logs in real time."""
+    import requests
+
+    _LEVEL_PREFIX = {
+        "info": "[INFO]",
+        "warning": "[WARN]",
+        "error": "[ERR ]",
+        "success": "[ OK ]",
+        "debug": "[DBG ]",
+        "critical": "[CRIT]",
+    }
+
+    result_data: Optional[dict] = None
+
+    with requests.post(
+        f"{api_url}/api/v1/search/stream",
+        json=payload,
+        stream=True,
+        timeout=(10, 600),
+        headers={"Accept": "text/event-stream"},
+    ) as resp:
+        resp.raise_for_status()
+
+        event_type = ""
+        data_buf = ""
+        for raw_line in resp.iter_lines(decode_unicode=True):
+            if raw_line is None:
+                continue
+            line = raw_line
+
+            if line.startswith("event: "):
+                event_type = line[7:].strip()
+                continue
+
+            if line.startswith("data: "):
+                data_buf = line[6:]
+                try:
+                    obj = json.loads(data_buf)
+                except json.JSONDecodeError:
+                    continue
+                data_buf = ""
+
+                if event_type == "log":
+                    lvl = obj.get("level", "info")
+                    msg = obj.get("message", "")
+                    prefix = _LEVEL_PREFIX.get(lvl, f"[{lvl.upper():4s}]")
+                    print(f"  {prefix} {msg}", flush=True)
+
+                elif event_type == "result":
+                    result_data = obj
+                elif event_type == "error":
+                    print(f"  [ERR ] {obj.get('error', 'Unknown error')}")
+                    return 1
+
+                event_type = ""
+                continue
+
+            if line.startswith(":") or line == "":
+                continue
+
+    if result_data is None:
+        print("  No result received from server.")
+        return 1
+
+    if output_format == "json":
+        print(json.dumps(result_data, indent=2, ensure_ascii=False))
+    else:
+        data = result_data.get("data", {})
+        summary = data.get("summary", "")
+        if result_data.get("success") and summary:
+            print()
+            print("=" * 60)
+            print("Search Results")
+            print("=" * 60)
+            print()
+            print(summary)
+        elif result_data.get("success") and data.get("type") == "context":
+            print()
+            print("=" * 60)
+            print("Search Results (context)")
+            print("=" * 60)
+            print()
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+        elif not result_data.get("success"):
+            print(f"  Search failed: {result_data.get('error', 'Unknown error')}")
+            return 1
+
+    return 0
 
 
 # ------------------------------------------------------------------

@@ -1,7 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
 import re
-from typing import Dict, List, LiteralString, Optional
+from typing import Dict, List, Optional
+try:
+    from typing import LiteralString
+except ImportError:
+    # Python 3.10 compatibility: LiteralString not available
+    LiteralString = str
 
 from pydantic import RootModel, model_validator
 

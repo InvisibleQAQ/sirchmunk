@@ -11,6 +11,7 @@ during time-critical search operations.
 import asyncio
 import concurrent.futures
 import hashlib
+import os
 import threading
 import warnings
 from typing import List, Optional, Dict, Any
@@ -33,12 +34,12 @@ class EmbeddingUtil:
 
     def __init__(
         self,
-        model_id: str = DEFAULT_MODEL_ID,
+        model_id: Optional[str] = None,
         device: Optional[str] = None,
         cache_dir: Optional[str] = None,
     ):
-        self.model_id = model_id
-        self._cache_dir = cache_dir
+        self.model_id = model_id or os.getenv("EMBEDDING_MODEL_ID", self.DEFAULT_MODEL_ID)
+        self._cache_dir = cache_dir or os.getenv("EMBEDDING_CACHE_DIR")
         self.model = None
 
         # Defer torch import to the background thread to avoid blocking
