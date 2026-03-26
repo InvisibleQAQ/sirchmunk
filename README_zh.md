@@ -152,6 +152,11 @@
 
 ## 🎉 News
 
+* 🚀 **2026年3月20日**: Sirchmunk v0.0.6post1
+  - **🐿️x🦞OpenClaw 技能**：Sirchmunk 已发布为 [OpenClaw](https://openclaw.org/) 技能，上架 [ClawHub](https://clawhub.ai/wangxingjun778/sirchmunk) — 任何兼容 OpenClaw 的 AI Agent均可通过自然语言搜索本地文件。详见 [openclaw-recipe](recipes/openclaw_skills/README.md)。
+  - **Search API**：新增 SSE 流式端点（`POST /api/v1/search/stream`），支持实时日志输出；通过 `SIRCHMUNK_MAX_CONCURRENT_SEARCHES` 控制并发；`paths` 参数同时支持字符串和数组，且为可选（回退到 `SIRCHMUNK_SEARCH_PATHS`）。
+  - **依赖修复**：`sirchmunk serve` 不再要求安装 `sirchmunk[web]` — `uvicorn` 已纳入核心依赖；`psutil` 改为可选。
+
 * 🚀 **2026年3月12日**: Sirchmunk v0.0.6
   - **多轮对话**：上下文管理与 LLM 查询重写；配置项 `CHAT_HISTORY_MAX_TURNS` / `CHAT_HISTORY_MAX_TOKENS`；搜索默认 token 预算 128K
   - **文档摘要与跨语言检索**：摘要流水线（分块/合并/重排）、跨语言关键词提取、聊天历史相关性过滤
@@ -269,7 +274,7 @@ llm = OpenAIChat(
     api_key="your-minimax-api-key",
     base_url="https://api.minimax.io/v1",     # 海外版
     # base_url="https://api.minimaxi.com/v1", # 国内版
-    model="MiniMax-M2.5"                       # 或 "MiniMax-M2.5-highspeed"
+    model="MiniMax-M2.7"                       # 或 "MiniMax-M2.7-highspeed"
 )
 ```
 
@@ -664,8 +669,9 @@ KnowledgeCluster 是一个丰富标注的对象，完整记录了单次搜索周
 
 | 方法 | 端点 | 说明 |
 |------|------|------|
-| `POST` | `/api/v1/search` | 执行搜索查询 |
-| `GET` | `/api/v1/search/status` | 检查服务器和 LLM 配置状态 |
+| `POST` | `/api/v1/search` | 执行搜索查询（完成后一次性返回 JSON） |
+| `POST` | `/api/v1/search/stream` | 请求体与 `/search` 相同；通过 **SSE** 流式返回运行日志及最终 `result` / `error` |
+| `GET` | `/api/v1/search/status` | 检查服务器与 LLM 配置（含 `max_concurrent_searches`） |
 
 **交互式文档：** http://localhost:8584/docs（Swagger UI）
 
@@ -673,6 +679,12 @@ KnowledgeCluster 是一个丰富标注的对象，完整记录了单次搜索周
 
 <details>
 <summary><b>cURL 示例</b></summary>
+
+**`paths` 规则（`/search` 与 `/search/stream` 相同）：**
+
+- **可选**。类型：**单个字符串**或**字符串数组**（`"paths": "/一个目录"` 或 `"paths": ["/a", "/b"]`）。
+- **不传**、**`null`**、**`""`**、**`[]`**，或列表里全是空白项时，使用服务器环境变量 **`SIRCHMUNK_SEARCH_PATHS`**（一般在 `~/.sirchmunk/.env` 中配置，服务启动时加载）。若未设置，则回退到服务进程**当前工作目录**。
+- **优先级：** 请求里非空的 `paths` → `SIRCHMUNK_SEARCH_PATHS` → cwd。
 
 ```bash
 # FAST 模式（默认，贪心搜索，2 次 LLM 调用）
@@ -682,6 +694,19 @@ curl -X POST http://localhost:8584/api/v1/search \
     "query": "认证是如何工作的？",
     "paths": ["/path/to/project"]
   }'
+
+# 单个路径用字符串（等价于单元素数组）
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "认证是如何工作的？",
+    "paths": "/path/to/project"
+  }'
+
+# 省略 paths — 使用服务器上 ~/.sirchmunk/.env 中的 SIRCHMUNK_SEARCH_PATHS
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "认证是如何工作的？"}'
 
 # DEEP 模式（蒙特卡洛证据采样全面分析）
 curl -X POST http://localhost:8584/api/v1/search \
@@ -701,7 +726,7 @@ curl -X POST http://localhost:8584/api/v1/search \
     "mode": "FILENAME_ONLY"
   }'
 
-# 完整参数示例
+# 完整参数（详见下表「请求参数说明」）
 curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
@@ -710,7 +735,7 @@ curl -X POST http://localhost:8584/api/v1/search \
     "mode": "DEEP",
     "max_depth": 10,
     "top_k_files": 20,
-    "keyword_levels": 3,
+    "max_loops": 10,
     "include_patterns": ["*.py", "*.java"],
     "exclude_patterns": ["*test*", "*__pycache__*"],
     "return_context": true
@@ -741,7 +766,8 @@ response = requests.post(
 
 data = response.json()
 if data["success"]:
-    print(data["data"]["result"])
+    payload = data.get("data") or {}
+    print(payload.get("summary", payload))
 ```
 
 **使用 `httpx`（异步）：**
@@ -756,11 +782,14 @@ async def search():
             "http://localhost:8584/api/v1/search",
             json={
                 "query": "查找所有 API 端点",
+                # 可选：省略 paths 时使用服务端 SIRCHMUNK_SEARCH_PATHS
                 "paths": ["/path/to/project"],
             }
         )
         data = resp.json()
-        print(data["data"]["result"])
+        if data.get("success"):
+            p = data.get("data") or {}
+            print(p.get("summary", p))
 
 asyncio.run(search())
 ```
@@ -782,9 +811,167 @@ const response = await fetch("http://localhost:8584/api/v1/search", {
 
 const data = await response.json();
 if (data.success) {
-  console.log(data.data.result);
+  const p = data.data || {};
+  console.log(p.summary ?? p);
 }
 ```
+
+</details>
+
+<details>
+<summary><b>SSE 流式搜索（<code>/api/v1/search/stream</code>）</b></summary>
+
+需要 **实时查看搜索过程日志** 时使用本接口（检索流程与 `POST /api/v1/search` 一致）。响应类型为 **`text/event-stream`**（Server-Sent Events）。请求 JSON 与 `/api/v1/search` **完全相同**（**`paths`** 可选；可为字符串或数组，见上文 cURL 说明）。
+
+**事件类型**
+
+| SSE `event` | `data`（JSON） | 含义 |
+|-------------|----------------|------|
+| `log` | `{"level":"info",...,"message":"..."}` | 搜索流水线输出的一条日志 |
+| `result` | `{"success":true,"data":{...}}` | 最终结果（`data` 与 `/search` 一致：可为 `summary`、`files` 或 `context`） |
+| `error` | `{"error":"..."}` | 致命错误，流结束 |
+
+以 `:` 开头的行是心跳/注释，可忽略。
+
+**并发限制**
+
+服务端通过环境变量 **`SIRCHMUNK_MAX_CONCURRENT_SEARCHES`**（默认 `3`）限制同时进行的搜索任务数，超出时新请求会排队等待。可在 `GET /api/v1/search/status` 的响应中查看 **`max_concurrent_searches`**。
+
+**cURL（使用 `-N` / `--no-buffer` 才能实时看到分块输出）**
+
+```bash
+curl -N -X POST "http://localhost:8584/api/v1/search/stream" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+    "query": "认证是如何工作的？",
+    "paths": ["/path/to/project"],
+    "mode": "FAST"
+  }'
+```
+
+**Python — `requests`（按行流式读取）**
+
+```python
+import json
+import requests
+
+url = "http://localhost:8584/api/v1/search/stream"
+payload = {
+    "query": "认证是如何工作的？",
+    "paths": ["/path/to/project"],
+    "mode": "FAST",
+}
+
+event_type = ""
+with requests.post(
+    url, json=payload, stream=True, timeout=(10, 600),
+    headers={"Accept": "text/event-stream"},
+) as resp:
+    resp.raise_for_status()
+    for raw in resp.iter_lines(decode_unicode=True):
+        if raw is None or raw == "":
+            continue
+        if raw.startswith(":"):
+            continue
+        if raw.startswith("event: "):
+            event_type = raw[7:].strip()
+            continue
+        if raw.startswith("data: "):
+            obj = json.loads(raw[6:])
+            if event_type == "log":
+                print(f"[{obj.get('level', 'info')}] {obj.get('message', '')}")
+            elif event_type == "result":
+                print("完成:", json.dumps(obj, indent=2, ensure_ascii=False))
+            elif event_type == "error":
+                print("错误:", obj.get("error"))
+            event_type = ""
+```
+
+**Python — `httpx`**
+
+```python
+import json
+import httpx
+
+url = "http://localhost:8584/api/v1/search/stream"
+payload = {"query": "查找 API 路由", "paths": ["/path/to/project"], "mode": "DEEP"}
+
+event_type = ""
+with httpx.Client(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
+    with client.stream(
+        "POST",
+        url,
+        json=payload,
+        headers={"Accept": "text/event-stream"},
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("event: "):
+                event_type = line[7:].strip()
+                continue
+            if line.startswith("data: "):
+                obj = json.loads(line[6:])
+                if event_type == "log":
+                    print(obj.get("message", ""))
+                elif event_type == "result":
+                    data = obj.get("data", {})
+                    print(data.get("summary") or data)
+                event_type = ""
+```
+
+**JavaScript — `fetch` + ReadableStream**（`EventSource` 仅支持 GET；POST 的 SSE 需用 `fetch`）
+
+```javascript
+async function searchStream(baseUrl, body) {
+  const res = await fetch(`${baseUrl}/api/v1/search/stream`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await res.text());
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  let currentEvent = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const parts = buf.split("\n\n");
+    buf = parts.pop() || "";
+    for (const block of parts) {
+      let dataLine = null;
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) currentEvent = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLine = line.slice(5).trim();
+      }
+      if (!dataLine) continue;
+      const obj = JSON.parse(dataLine);
+      if (currentEvent === "log") console.log(`[${obj.level}]`, obj.message);
+      if (currentEvent === "result") console.log("result", obj);
+      if (currentEvent === "error") console.error(obj.error);
+    }
+  }
+}
+
+await searchStream("http://localhost:8584", {
+  query: "认证是如何工作的？",
+  paths: ["/path/to/project"],
+  mode: "FAST",
+});
+```
+
+**命令行**
+
+`sirchmunk search --api` 在可用时会优先调用本流式端点，实时打印日志，最后输出摘要。
 
 </details>
 
@@ -794,13 +981,13 @@ if (data.success) {
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `query` | `string` | *必填* | 搜索查询或问题 |
-| `paths` | `string[]` | *必填* | 搜索的目录或文件（至少 1 个）；未设置时回退到 `SIRCHMUNK_SEARCH_PATHS` |
+| `paths` | `string` \| `string[]` | *可选* | 单路径或多路径。省略 / `null` / `""` / `[]` / 仅空白 → 使用服务端 `SIRCHMUNK_SEARCH_PATHS`（如 `~/.sirchmunk/.env`），再回退 cwd。请求中的路径优先于环境变量。 |
 | `mode` | `string` | `"FAST"` | `FAST`、`DEEP` 或 `FILENAME_ONLY` |
 | `enable_dir_scan` | `bool` | `true` | 是否启用目录扫描（FAST/DEEP）以发现文件 |
 | `max_depth` | `int` | `null` | 最大目录深度 |
 | `top_k_files` | `int` | `null` | 返回的文件数量 |
+| `max_loops` | `int` | `null` | ReAct 最大迭代次数（DEEP 模式） |
 | `max_token_budget` | `int` | `null` | LLM token 预算（DEEP 模式，默认 128K） |
-| `keyword_levels` | `int` | `null` | 关键词粒度层级 |
 | `include_patterns` | `string[]` | `null` | 文件 glob 匹配模式（包含） |
 | `exclude_patterns` | `string[]` | `null` | 文件 glob 匹配模式（排除） |
 | `return_context` | `bool` | `false` | 返回完整 SearchContext（含 KnowledgeCluster 和遥测数据） |
@@ -830,7 +1017,7 @@ Sirchmunk 采用 **无索引** 方法：
 
 任何 OpenAI 兼容 API 端点，包括但不限于：
 - OpenAI（GPT-5.2, ...）
-- [MiniMax](https://platform.minimax.io)（MiniMax-M2.5、MiniMax-M2.5-highspeed）
+- [MiniMax](https://platform.minimax.io)（MiniMax-M2.7、MiniMax-M2.7-highspeed、MiniMax-M2.5）
 - DeepSeek、Moonshot、Mistral、Groq、Together AI、Cohere
 - Google Gemini、智谱（GLM）、百川、零一万物、硅基流动、火山引擎
 - Azure OpenAI
@@ -842,7 +1029,7 @@ Sirchmunk 采用 **无索引** 方法：
 LLM_BASE_URL=https://api.minimax.io/v1        # 海外版
 # LLM_BASE_URL=https://api.minimaxi.com/v1    # 国内版
 LLM_API_KEY=your-minimax-api-key
-LLM_MODEL_NAME=MiniMax-M2.5
+LLM_MODEL_NAME=MiniMax-M2.7
 ```
 
 详见 [MiniMax OpenAI 兼容 API 文档](https://platform.minimax.io/docs/api-reference/text-openai-api)。

@@ -9,6 +9,7 @@ ranks the most promising document candidates for a given query.
 This is a *zero-index* approach — no pre-built vector indices required.
 """
 import asyncio
+import random
 import json
 import logging
 import mimetypes
@@ -352,7 +353,10 @@ class DirectoryScanner:
 
         t_start = datetime.now()
 
-        candidates_to_rank = scan_result.candidates[:top_k]
+        if len(scan_result.candidates) > top_k:
+            candidates_to_rank = random.sample(scan_result.candidates, top_k)
+        else:
+            candidates_to_rank = scan_result.candidates
 
         root_dir = self._find_common_root(candidates_to_rank)
         dir_tree = self._build_dir_tree(candidates_to_rank, root_dir)

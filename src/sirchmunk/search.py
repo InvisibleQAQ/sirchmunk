@@ -37,6 +37,7 @@ from sirchmunk.schema.request import ContentItem, Message, Request
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
 from sirchmunk.utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH
+from sirchmunk.utils.embedding_util import EmbeddingUtil
 from sirchmunk.utils.deps import check_dependencies
 from sirchmunk.utils import create_logger, LogCallback
 from loguru import logger as _loguru_logger
@@ -53,6 +54,7 @@ class AgenticSearch(BaseSearch):
     def __init__(
         self,
         llm: Optional[OpenAIChat] = None,
+        embedding: Optional[EmbeddingUtil] = None,
         work_path: Optional[Union[str, Path]] = None,
         paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
         verbose: bool = True,

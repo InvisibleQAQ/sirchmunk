@@ -156,6 +156,11 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 ## 🎉 News
 
+* 🚀 **Mar 20, 2026**: Sirchmunk v0.0.6post1
+  - **🐿️x🦞OpenClaw skill**: Sirchmunk is now available as an [OpenClaw](https://openclaw.org/) skill on [ClawHub](https://clawhub.ai/wangxingjun778/sirchmunk) — any OpenClaw-compatible agent can search local files via natural language. See [openclaw-recipe](recipes/openclaw_skills/README.md) for details.
+  - **Search API**: New SSE streaming endpoint (`POST /api/v1/search/stream`) for real-time log output; concurrency control via `SIRCHMUNK_MAX_CONCURRENT_SEARCHES`; `paths` parameter now accepts both string and array, and is optional (falls back to `SIRCHMUNK_SEARCH_PATHS`).
+  - **Dependency fix**: `sirchmunk serve` no longer requires `sirchmunk[web]` — `uvicorn` is now a core dependency; `psutil` made optional.
+
 * 🚀 **Mar 12, 2026**: Sirchmunk v0.0.6
   - **Multi-turn conversation**: Context management with LLM query rewriting; configs `CHAT_HISTORY_MAX_TURNS` / `CHAT_HISTORY_MAX_TOKENS`; default search token budget 128K
   - **Document summarization & cross-lingual retrieval**: Summarization pipeline (chunk/merge/rerank), cross-lingual keyword extraction, chat-history relevance filtering
@@ -271,7 +276,7 @@ from sirchmunk.llm import OpenAIChat
 llm = OpenAIChat(
     api_key="your-minimax-api-key",
     base_url="https://api.minimax.io/v1",
-    model="MiniMax-M2.5"           # or "MiniMax-M2.5-highspeed"
+    model="MiniMax-M2.7"           # or "MiniMax-M2.7-highspeed"
 )
 ```
 
@@ -665,8 +670,9 @@ When the server is running (`sirchmunk serve` or `sirchmunk web serve`), the Sea
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/api/v1/search` | Execute a search query |
-| `GET` | `/api/v1/search/status` | Check server and LLM configuration status |
+| `POST` | `/api/v1/search` | Execute a search query (JSON response when complete) |
+| `POST` | `/api/v1/search/stream` | Same body as `/search`; **Server-Sent Events** stream of logs + final `result` / `error` |
+| `GET` | `/api/v1/search/status` | Check server and LLM configuration status (includes `max_concurrent_searches`) |
 
 **Interactive Docs:** http://localhost:8584/docs (Swagger UI)
 
@@ -674,6 +680,12 @@ When the server is running (`sirchmunk serve` or `sirchmunk web serve`), the Sea
 
 <details>
 <summary><b>cURL Examples</b></summary>
+
+**`paths` rules (same for `/search` and `/search/stream`):**
+
+- Type: **a single string** or **an array of strings** (`"paths": "/one/dir"` or `"paths": ["/a", "/b"]`).
+- If you **omit** `paths`, send **`null`**, **`""`**, **`[]`**, or only blank strings, the server uses **`SIRCHMUNK_SEARCH_PATHS`** from its environment (typically set in `~/.sirchmunk/.env`, loaded at startup). If that is unset too, search falls back to the server process **current working directory**.
+- **Priority:** explicit non-empty request `paths` → `SIRCHMUNK_SEARCH_PATHS` → cwd.
 
 ```bash
 # FAST mode (default, greedy search with 2 LLM calls)
@@ -683,6 +695,19 @@ curl -X POST http://localhost:8584/api/v1/search \
     "query": "How does authentication work?",
     "paths": ["/path/to/project"]
   }'
+
+# Single path as a string (equivalent to a one-element list)
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "How does authentication work?",
+    "paths": "/path/to/project"
+  }'
+
+# Omit paths — use SIRCHMUNK_SEARCH_PATHS from ~/.sirchmunk/.env on the server
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "How does authentication work?"}'
 
 # DEEP mode (comprehensive analysis with Monte Carlo sampling)
 curl -X POST http://localhost:8584/api/v1/search \
@@ -702,7 +727,7 @@ curl -X POST http://localhost:8584/api/v1/search \
     "mode": "FILENAME_ONLY"
   }'
 
-# Full parameters
+# Full parameters (see Request Parameters table)
 curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
@@ -711,7 +736,7 @@ curl -X POST http://localhost:8584/api/v1/search \
     "mode": "DEEP",
     "max_depth": 10,
     "top_k_files": 20,
-    "keyword_levels": 3,
+    "max_loops": 10,
     "include_patterns": ["*.py", "*.java"],
     "exclude_patterns": ["*test*", "*__pycache__*"],
     "return_context": true
@@ -742,7 +767,9 @@ response = requests.post(
 
 data = response.json()
 if data["success"]:
-    print(data["data"]["result"])
+    payload = data.get("data") or {}
+    # API returns type "summary" | "files" | "context"
+    print(payload.get("summary", payload))
 ```
 
 **Using `httpx` (async):**
@@ -757,11 +784,14 @@ async def search():
             "http://localhost:8584/api/v1/search",
             json={
                 "query": "find all API endpoints",
+                # Optional: omit "paths" to use server SIRCHMUNK_SEARCH_PATHS
                 "paths": ["/path/to/project"],
             }
         )
         data = resp.json()
-        print(data["data"]["result"])
+        if data.get("success"):
+            p = data.get("data") or {}
+            print(p.get("summary", p))
 
 asyncio.run(search())
 ```
@@ -783,9 +813,167 @@ const response = await fetch("http://localhost:8584/api/v1/search", {
 
 const data = await response.json();
 if (data.success) {
-  console.log(data.data.result);
+  const p = data.data || {};
+  console.log(p.summary ?? p);
 }
 ```
+
+</details>
+
+<details>
+<summary><b>SSE streaming search (<code>/api/v1/search/stream</code>)</b></summary>
+
+Use this endpoint when you need **real-time search logs** (same pipeline as `POST /api/v1/search`). The response is **`text/event-stream`** (Server-Sent Events). The JSON body is identical to `/api/v1/search` (**`paths`** optional; string or array — see cURL section above).
+
+**Event types**
+
+| SSE `event` | `data` (JSON) | Meaning |
+|-------------|----------------|---------|
+| `log` | `{"level":"info",...,"message":"..."}` | One log line from the search pipeline |
+| `result` | `{"success":true,"data":{...}}` | Final outcome (same shape as `/search` `data`: `summary`, `files`, or `context`) |
+| `error` | `{"error":"..."}` | Fatal error; stream ends |
+
+Comment lines starting with `:` are keep-alives (safe to ignore).
+
+**Concurrency**
+
+Concurrent streaming searches are limited server-side by **`SIRCHMUNK_MAX_CONCURRENT_SEARCHES`** (default `3`). Extra clients wait until a slot is free. See `GET /api/v1/search/status` → `max_concurrent_searches`.
+
+**cURL (use `-N` / `--no-buffer` so chunks print as they arrive)**
+
+```bash
+curl -N -X POST "http://localhost:8584/api/v1/search/stream" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+    "query": "How does authentication work?",
+    "paths": ["/path/to/project"],
+    "mode": "FAST"
+  }'
+```
+
+**Python — `requests` (streaming lines)**
+
+```python
+import json
+import requests
+
+url = "http://localhost:8584/api/v1/search/stream"
+payload = {
+    "query": "How does authentication work?",
+    "paths": ["/path/to/project"],
+    "mode": "FAST",
+}
+
+event_type = ""
+with requests.post(
+    url, json=payload, stream=True, timeout=(10, 600),
+    headers={"Accept": "text/event-stream"},
+) as resp:
+    resp.raise_for_status()
+    for raw in resp.iter_lines(decode_unicode=True):
+        if raw is None or raw == "":
+            continue
+        if raw.startswith(":"):
+            continue
+        if raw.startswith("event: "):
+            event_type = raw[7:].strip()
+            continue
+        if raw.startswith("data: "):
+            obj = json.loads(raw[6:])
+            if event_type == "log":
+                print(f"[{obj.get('level', 'info')}] {obj.get('message', '')}")
+            elif event_type == "result":
+                print("DONE:", json.dumps(obj, indent=2, ensure_ascii=False))
+            elif event_type == "error":
+                print("ERROR:", obj.get("error"))
+            event_type = ""
+```
+
+**Python — `httpx`**
+
+```python
+import json
+import httpx
+
+url = "http://localhost:8584/api/v1/search/stream"
+payload = {"query": "find API routes", "paths": ["/path/to/project"], "mode": "DEEP"}
+
+event_type = ""
+with httpx.Client(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
+    with client.stream(
+        "POST",
+        url,
+        json=payload,
+        headers={"Accept": "text/event-stream"},
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("event: "):
+                event_type = line[7:].strip()
+                continue
+            if line.startswith("data: "):
+                obj = json.loads(line[6:])
+                if event_type == "log":
+                    print(obj.get("message", ""))
+                elif event_type == "result":
+                    data = obj.get("data", {})
+                    print(data.get("summary") or data)
+                event_type = ""
+```
+
+**JavaScript — `fetch` + readable stream** (`EventSource` is GET-only; POST SSE needs `fetch`)
+
+```javascript
+async function searchStream(baseUrl, body) {
+  const res = await fetch(`${baseUrl}/api/v1/search/stream`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await res.text());
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  let currentEvent = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const parts = buf.split("\n\n");
+    buf = parts.pop() || "";
+    for (const block of parts) {
+      let dataLine = null;
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) currentEvent = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLine = line.slice(5).trim();
+      }
+      if (!dataLine) continue;
+      const obj = JSON.parse(dataLine);
+      if (currentEvent === "log") console.log(`[${obj.level}]`, obj.message);
+      if (currentEvent === "result") console.log("result", obj);
+      if (currentEvent === "error") console.error(obj.error);
+    }
+  }
+}
+
+await searchStream("http://localhost:8584", {
+  query: "How does authentication work?",
+  paths: ["/path/to/project"],
+  mode: "FAST",
+});
+```
+
+**CLI**
+
+`sirchmunk search --api` uses this streaming endpoint when available and prints log lines to stderr/stdout as they arrive, then prints the final summary.
 
 </details>
 
@@ -795,13 +983,13 @@ if (data.success) {
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `query` | `string` | *required* | Search query or question |
-| `paths` | `string[]` | *required* | Directories or files to search (min 1); falls back to `SIRCHMUNK_SEARCH_PATHS` if unset |
+| `paths` | `string` \| `string[]` | *optional* | One path or many. Omit / `null` / `""` / `[]` / only blanks → server `SIRCHMUNK_SEARCH_PATHS` (e.g. `~/.sirchmunk/.env`), then cwd. Request paths override env. |
 | `mode` | `string` | `"FAST"` | `FAST`, `DEEP`, or `FILENAME_ONLY` |
 | `enable_dir_scan` | `bool` | `true` | Enable directory scanning (FAST/DEEP) for file discovery |
 | `max_depth` | `int` | `null` | Maximum directory depth |
 | `top_k_files` | `int` | `null` | Number of top files to return |
+| `max_loops` | `int` | `null` | Maximum ReAct iterations (DEEP mode) |
 | `max_token_budget` | `int` | `null` | LLM token budget (DEEP mode, default 128K) |
-| `keyword_levels` | `int` | `null` | Keyword granularity levels |
 | `include_patterns` | `string[]` | `null` | File glob patterns to include |
 | `exclude_patterns` | `string[]` | `null` | File glob patterns to exclude |
 | `return_context` | `bool` | `false` | Return SearchContext with cluster and telemetry |
@@ -831,7 +1019,7 @@ Sirchmunk takes an **indexless approach**:
 
 Any OpenAI-compatible API endpoint, including (but not limited to):
 - OpenAI (GPT-5.2, ...)
-- [MiniMax](https://platform.minimax.io) (MiniMax-M2.5, MiniMax-M2.5-highspeed)
+- [MiniMax](https://platform.minimax.io) (MiniMax-M2.7, MiniMax-M2.7-highspeed, MiniMax-M2.5)
 - DeepSeek, Moonshot, Mistral, Groq, Together AI, Cohere
 - Google Gemini, Zhipu (GLM), Baichuan, Yi, SiliconFlow, Volcengine
 - Azure OpenAI
@@ -842,7 +1030,7 @@ To use MiniMax, configure:
 ```bash
 LLM_BASE_URL=https://api.minimax.io/v1
 LLM_API_KEY=your-minimax-api-key
-LLM_MODEL_NAME=MiniMax-M2.5
+LLM_MODEL_NAME=MiniMax-M2.7
 ```
 
 For more details, see [MiniMax OpenAI-Compatible API](https://platform.minimax.io/docs/api-reference/text-openai-api).

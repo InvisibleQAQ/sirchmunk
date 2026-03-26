@@ -17,6 +17,8 @@ from fastapi import APIRouter, HTTPException
 from typing import Dict, Any, Optional
 from pydantic import BaseModel
 
+from sirchmunk.utils.embedding_util import EmbeddingUtil
+
 router = APIRouter(prefix="/api/v1/settings", tags=["settings"])
 
 # Default values
@@ -137,6 +139,8 @@ class EnvironmentVariables(BaseModel):
     LLM_BASE_URL: Optional[str] = None
     LLM_API_KEY: Optional[str] = None
     LLM_MODEL_NAME: Optional[str] = None
+    EMBEDDING_MODEL_ID: Optional[str] = None
+    EMBEDDING_CACHE_DIR: Optional[str] = None
     GREP_CONCURRENT_LIMIT: Optional[int] = None
     CHAT_HISTORY_MAX_TURNS: Optional[int] = None
     CHAT_HISTORY_MAX_TOKENS: Optional[int] = None
@@ -190,8 +194,20 @@ def get_current_env_variables() -> Dict[str, Any]:
             "value": os.getenv("LLM_MODEL_NAME", _DEFAULT_LLM_MODEL_NAME),
             "default": _DEFAULT_LLM_MODEL_NAME,
             "description": "Model name for LLM. "
-                           "Examples: gpt-5.2, MiniMax-M2.5, deepseek-chat",
+                           "Examples: gpt-5.2, MiniMax-M2.7, deepseek-chat",
             "category": "llm"
+        },
+        "EMBEDDING_MODEL_ID": {
+            "value": os.getenv("EMBEDDING_MODEL_ID", EmbeddingUtil.DEFAULT_MODEL_ID),
+            "default": EmbeddingUtil.DEFAULT_MODEL_ID,
+            "description": "Embedding model ID for local embeddings (from ModelScope or HuggingFace)",
+            "category": "embedding"
+        },
+        "EMBEDDING_CACHE_DIR": {
+            "value": os.getenv("EMBEDDING_CACHE_DIR", ""),
+            "default": str(Path(_DEFAULT_WORK_PATH).expanduser().resolve() / ".cache" / "models"),
+            "description": "Cache directory for embedding model downloads",
+            "category": "embedding"
         },
         "GREP_CONCURRENT_LIMIT": {
             "value": os.getenv("GREP_CONCURRENT_LIMIT", _DEFAULT_GREP_CONCURRENT_LIMIT),
