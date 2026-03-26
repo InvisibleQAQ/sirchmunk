@@ -3,8 +3,9 @@ import asyncio
 import json
 import math
 import random
+import re
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from rapidfuzz import fuzz, process
 
@@ -305,15 +306,68 @@ class MonteCarloEvidenceSampling:
             resp: str = resp_obj.content
             self.llm_usages.append(resp_obj.usage)
 
-            clean_resp = resp.replace("```json", "").replace("```", "").strip()
-            data = json.loads(clean_resp)
-            sample.score = float(data.get("score", 0))
-            sample.reasoning = data.get("reasoning", "")
+            data = self._parse_evaluation_json(resp)
+            if data is not None:
+                sample.score = float(data.get("score", 0))
+                sample.reasoning = data.get("reasoning", "")
+            else:
+                await self._log.warning(
+                    f"Unparseable LLM response for sample at {sample.start_idx}, "
+                    f"response (first 200 chars): {resp[:200]!r}"
+                )
+                sample.score = 0.0
         except Exception as e:
             await self._log.warning(f"Error evaluating sample at {sample.start_idx}: {e}")
             sample.score = 0.0
 
         return sample
+
+    @staticmethod
+    def _parse_evaluation_json(text: str) -> Optional[dict]:
+        """Extract ``{"score": ..., "reasoning": ...}`` from LLM output.
+
+        Tries, in order: direct parse, markdown-fence stripping,
+        outermost ``{...}`` extraction, and finally regex score fallback.
+        """
+        if not text:
+            return None
+        text = text.strip()
+
+        # 1. Direct parse
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # 2. Strip markdown code fences
+        cleaned = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
+        cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
+        try:
+            return json.loads(cleaned)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # 3. Extract first {...} block (greedy, allows nested braces from reasoning)
+        m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group())
+            except (json.JSONDecodeError, TypeError):
+                pass
+            # Try the innermost flat object (no nested braces)
+            m2 = re.search(r"\{[^{}]+\}", cleaned)
+            if m2:
+                try:
+                    return json.loads(m2.group())
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        # 4. Last resort: regex extraction of score
+        score_m = re.search(r'"score"\s*:\s*(\d+(?:\.\d+)?)', text)
+        if score_m:
+            return {"score": float(score_m.group(1)), "reasoning": ""}
+
+        return None
 
     async def _evaluate_batch(
         self, samples: List[SampleWindow], query: str
