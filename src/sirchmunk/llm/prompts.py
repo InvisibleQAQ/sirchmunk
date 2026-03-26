@@ -203,14 +203,14 @@ Text Snippet (Source: {sample_source}):
 "...{sample_content}..."
 
 ### Output Requirement:
-Return JSON:
+Return a single JSON object (no extra text):
 - score (0-10):
   0-3: Completely irrelevant.
   4-7: Contains relevant keywords or context but no direct answer.
   8-10: Contains exact data, facts, or direct answer.
 - reasoning: Short reasoning in the SAME language as the query.
 
-JSON format only.
+Example: {{"score": 7, "reasoning": "Contains relevant context about the topic."}}
 """
 
 
