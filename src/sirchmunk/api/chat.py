@@ -546,7 +546,6 @@ def get_search_instance(log_callback=None):
         )
 
         enable_cluster_reuse = os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true"
-        enable_memory = os.getenv("SIRCHMUNK_ENABLE_MEMORY", "false").lower() in ("1", "true", "yes")
         cluster_sim_threshold = float(os.getenv("CLUSTER_SIM_THRESHOLD", "0.85"))
         cluster_sim_top_k = int(os.getenv("CLUSTER_SIM_TOP_K", "3"))
 
@@ -554,7 +553,6 @@ def get_search_instance(log_callback=None):
             llm=llm,
             log_callback=log_callback,
             reuse_knowledge=enable_cluster_reuse,
-            enable_memory=enable_memory,
             cluster_sim_threshold=cluster_sim_threshold,
             cluster_sim_top_k=cluster_sim_top_k,
         )

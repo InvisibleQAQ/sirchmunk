@@ -260,8 +260,6 @@ class OpenAIChat:
             if profile.thinking_param == "reasoning_effort":
                 if enable_thinking:
                     extra_body["reasoning_effort"] = "high"
-                else:
-                    extra_body.pop("reasoning_effort", None)
             else:
                 extra_body[profile.thinking_param] = enable_thinking
 
@@ -388,7 +386,7 @@ class OpenAIChat:
             self,
             messages: List[Dict[str, Any]],
             stream: bool = True,
-            enable_thinking: Optional[bool] = None,
+            enable_thinking: Optional[bool] = False,
             **kwargs,
     ) -> OpenAIChatResponse:
         """
@@ -402,8 +400,7 @@ class OpenAIChat:
             messages (List[Dict[str, Any]]): A list of messages for the chat.
             stream (bool): Whether to stream the response.
             enable_thinking (Optional[bool]): Whether to enable model thinking/reasoning.
-                Sent via ``extra_body``. Defaults to None (uses instance-level setting
-                from ``extra_body`` if provided, otherwise disabled).
+                Sent via ``extra_body``. Defaults to False. Pass None to omit.
             **kwargs: Additional keyword arguments merged with instance-level kwargs
                 and forwarded to the OpenAI API. Call-level kwargs take precedence.
 
@@ -472,7 +469,7 @@ class OpenAIChat:
             self,
             messages: List[Dict[str, Any]],
             stream: bool = True,
-            enable_thinking: Optional[bool] = None,
+            enable_thinking: Optional[bool] = False,
             **kwargs,
     ) -> OpenAIChatResponse:
         """
@@ -485,8 +482,7 @@ class OpenAIChat:
             messages (List[Dict[str, Any]]): A list of messages for the chat.
             stream (bool): Whether to stream the response.
             enable_thinking (Optional[bool]): Whether to enable model thinking/reasoning.
-                Sent via ``extra_body``. Defaults to None (uses instance-level setting
-                from ``extra_body`` if provided, otherwise disabled).
+                Sent via ``extra_body``. Defaults to False. Pass None to omit.
             **kwargs: Additional keyword arguments merged with instance-level kwargs
                 and forwarded to the OpenAI API. Call-level kwargs take precedence.
 

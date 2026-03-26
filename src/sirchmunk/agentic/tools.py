@@ -11,18 +11,14 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from sirchmunk.learnings.chunking import DocumentChunker
 from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
 from sirchmunk.utils.file_utils import fast_extract
 
 logger = logging.getLogger(__name__)
-
-# Structure-aware chunker shared across all FileReadTool instances.
-_FILE_CHUNKER = DocumentChunker(target_size=1000, max_size=2000)
 
 
 # ---------------------------------------------------------------------------
@@ -147,9 +143,6 @@ class KeywordSearchTool(BaseTool):
         max_snippet_lines: int = 5,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
-        bm25_scorer: Any = None,
-        max_count: Optional[int] = None,
-        rga_no_cache: bool = False,
     ) -> None:
         self._retriever = retriever
         self._paths = paths
@@ -157,10 +150,8 @@ class KeywordSearchTool(BaseTool):
         self._max_results = max_results
         self._max_snippet_lines = max_snippet_lines
         self._include = include
+        # Merge caller-provided excludes with sensible defaults (deduped)
         self._exclude = list(set(self._DEFAULT_EXCLUDE) | set(exclude or []))
-        self._bm25_scorer = bm25_scorer
-        self._max_count = max_count
-        self._rga_no_cache = rga_no_cache
 
     @property
     def name(self) -> str:
@@ -219,10 +210,8 @@ class KeywordSearchTool(BaseTool):
                 literal=literal,
                 regex=regex,
                 max_depth=self._max_depth,
-                max_count=self._max_count,
                 include=self._include,
                 exclude=self._exclude,
-                rga_no_cache=self._rga_no_cache,
                 timeout=30.0,
             )
 
@@ -238,11 +227,7 @@ class KeywordSearchTool(BaseTool):
                     item["_keyword"] = keyword
                 combined.append(item)
 
-        return self._retriever.merge_results(
-            combined,
-            limit=self._max_results * 2,
-            max_files=self._retriever._merge_max_files,
-        )
+        return self._retriever.merge_results(combined, limit=self._max_results * 2)
 
     async def _do_search_regex(
         self,
@@ -266,124 +251,49 @@ class KeywordSearchTool(BaseTool):
             literal=False,
             regex=True,
             max_depth=self._max_depth,
-            max_count=self._max_count,
             include=self._include,
             exclude=self._exclude,
-            rga_no_cache=self._rga_no_cache,
             timeout=30.0,
         )
-        return self._retriever.merge_results(
-            raw,
-            limit=self._max_results,
-            max_files=self._retriever._merge_max_files,
-        )
+        return self._retriever.merge_results(raw, limit=self._max_results)
 
     async def execute(
         self,
         context: SearchContext,
         **kwargs,
     ) -> Tuple[str, Dict[str, Any]]:
-        import time as _time
-
         keywords: List[str] = kwargs.get("keywords", [])
         if not keywords:
             return "No keywords provided.", {}
 
-        _t_start = _time.perf_counter()
         context.add_search(" ".join(keywords))
 
-        phrases = [k for k in keywords if " " in k.strip()]
-        singles = [k for k in keywords if " " not in k.strip()]
+        # Strategy 1: per-keyword literal search (safe for metacharacters,
+        # avoids the `-F` + `|` bug where rga treats `|` literally)
+        results = await self._do_search_per_term(keywords, literal=True, regex=False)
 
-        results: List[Dict[str, Any]] = []
-        _phase_hit = ""
-
-        # Phase A: search compound phrases first (e.g. "Tivoli Gardens")
-        if phrases:
-            _ta = _time.perf_counter()
-            results = await self._do_search_per_term(phrases, literal=True, regex=False)
-            logger.info(
-                "[keyword_search:profile] Phase-A phrases={}: {:.2f}s, {} file groups",
-                phrases, _time.perf_counter() - _ta, len(results),
-            )
-            if results:
-                _phase_hit = "A"
-
-        # Phase B: add single-word terms only when phrase hits are insufficient.
-        if len(results) < 3 and singles:
-            _tb = _time.perf_counter()
-            extra = await self._do_search_per_term(singles, literal=True, regex=False)
-            logger.info(
-                "[keyword_search:profile] Phase-B singles={}: {:.2f}s, {} file groups",
-                singles, _time.perf_counter() - _tb, len(extra) if extra else 0,
-            )
-            if extra:
-                seen = {r.get("path") for r in results}
-                for item in extra:
-                    if item.get("path") not in seen:
-                        results.append(item)
-                        seen.add(item.get("path"))
-                _phase_hit = _phase_hit or "B"
-
-        # Phase C: if nothing found at all, try all keywords together
+        # Strategy 2: escaped-regex OR search (single rga call, handles
+        # adapters that only work in regex mode — e.g. some PDF/DOCX)
         if not results:
-            _tc = _time.perf_counter()
-            results = await self._do_search_per_term(keywords, literal=True, regex=False)
-            logger.info(
-                "[keyword_search:profile] Phase-C all={}: {:.2f}s, {} file groups",
-                keywords, _time.perf_counter() - _tc, len(results),
-            )
-            if results:
-                _phase_hit = "C"
-
-        # Phase D: escaped-regex OR search
-        if not results:
-            _td = _time.perf_counter()
+            logger.info("[keyword_search] Literal per-term empty, trying escaped regex OR")
             results = await self._do_search_regex(keywords)
-            logger.info(
-                "[keyword_search:profile] Phase-D regex: {:.2f}s, {} file groups",
-                _time.perf_counter() - _td, len(results),
-            )
-            if results:
-                _phase_hit = "D"
 
         if not results:
-            _elapsed = _time.perf_counter() - _t_start
-            logger.info(
-                "[keyword_search:profile] TOTAL {:.2f}s — no results | keywords={}",
-                _elapsed, keywords,
-            )
             return "No results found for the given keywords.", {"keywords": keywords, "count": 0}
 
-        # Deduplicate
-        _t_dedup = _time.perf_counter()
+        # Deduplicate: per-term literal search may return the same file
+        # from multiple keyword passes.  Merge matches by file path.
         deduped: Dict[str, List[Dict]] = {}
         for item in results:
             path = item.get("path", "unknown")
             if path not in deduped:
                 deduped[path] = []
             deduped[path].extend(item.get("matches", []))
-        _dedup_ms = (_time.perf_counter() - _t_dedup) * 1000
 
-        # BM25-rerank files when significantly more candidates than limit
-        _rerank_ms = 0.0
-        _rerank_input = len(deduped)
-        _BM25_RERANK_RATIO = 1.5
-        if (
-            self._bm25_scorer
-            and len(deduped) > self._max_results * _BM25_RERANK_RATIO
-        ):
-            _tr = _time.perf_counter()
-            ranked = self._bm25_rerank_results(keywords, deduped, self._max_results)
-            _rerank_ms = (_time.perf_counter() - _tr) * 1000
-            if ranked is not None:
-                deduped = ranked
-            logger.info(
-                "[keyword_search:profile] BM25 rerank {}→{} files: {:.0f}ms",
-                _rerank_input, len(deduped), _rerank_ms,
-            )
-
-        # Format as concise snippets
+        # Format as concise snippets (low token cost).
+        # Use keyword-diverse selection: group matches by _keyword tag
+        # and round-robin so each keyword contributes at least one
+        # snippet when possible.
         output_lines: List[str] = []
         total_chars = 0
         for path, matches in list(deduped.items())[: self._max_results]:
@@ -397,34 +307,16 @@ class KeywordSearchTool(BaseTool):
 
         result_text = "\n\n".join(output_lines)
 
+        # Approximate token count (~4 chars per token)
         approx_tokens = total_chars // 4
-        discovered_paths = list(deduped.keys())[: self._max_results]
-        context.add_discovered_files(discovered_paths)
-
-        _elapsed = _time.perf_counter() - _t_start
-        timing_meta = {
-            "total_sec": round(_elapsed, 2),
-            "phase_hit": _phase_hit,
-            "dedup_ms": round(_dedup_ms, 1),
-            "rerank_ms": round(_rerank_ms, 1),
-            "files_before_dedup": len(results),
-            "files_after_dedup": _rerank_input,
-        }
-        logger.info(
-            "[keyword_search:profile] TOTAL {:.2f}s | phase={} | raw={} dedup={} "
-            "dedup_ms={:.0f} rerank_ms={:.0f} | keywords={}",
-            _elapsed, _phase_hit, len(results), _rerank_input,
-            _dedup_ms, _rerank_ms, keywords,
-        )
-
+        discovered_paths = list(deduped.keys())
         context.add_log(
             tool_name=self.name,
             tokens=approx_tokens,
             metadata={
                 "keywords": keywords,
-                "files_found": len(deduped),
+                "files_found": len(discovered_paths),
                 "files_discovered": discovered_paths,
-                "timing": timing_meta,
             },
         )
 
@@ -487,35 +379,6 @@ class KeywordSearchTool(BaseTool):
 
         return selected
 
-    def _bm25_rerank_results(
-        self,
-        keywords: List[str],
-        deduped: Dict[str, List[Dict]],
-        top_k: int,
-    ) -> Optional[Dict[str, List[Dict]]]:
-        """Rerank deduplicated file results by BM25 relevance to *keywords*."""
-        file_paths = list(deduped.keys())
-        docs = []
-        for matches in deduped.values():
-            text = " ".join(
-                m.get("data", {}).get("lines", {}).get("text", "")
-                for m in matches
-            ).strip()
-            docs.append(text or " ")
-        query = " ".join(keywords)
-        try:
-            indices = self._bm25_scorer.rerank(query, docs, top_k=top_k)
-            if indices:
-                ranked: Dict[str, List[Dict]] = {}
-                for idx in indices:
-                    if 0 <= idx < len(file_paths):
-                        key = file_paths[idx]
-                        ranked[key] = deduped[key]
-                return ranked if ranked else None
-        except Exception:
-            pass
-        return None
-
 
 # ---------------------------------------------------------------------------
 # Tool 2: File Read (medium cost — returns full file content)
@@ -526,79 +389,10 @@ class FileReadTool(BaseTool):
 
     Supports all formats via kreuzberg extraction (PDF, DOCX, XLSX, etc.).
     Tracks read files in SearchContext to prevent redundant reads.
-    For large files, optional keyword-guided extraction via BM25 ranking
-    returns only the most relevant sections.
-
-    When a ``deep_extract_fn`` is provided and the BA-ReAct belief state
-    indicates a high-value large file, the tool transparently activates
-    deep MCES evidence extraction instead of BM25 chunk selection,
-    producing higher-quality evidence for the agent.
     """
 
-    _LARGE_FILE_THRESHOLD = 30_000
-    _CHUNK_CACHE_MAX = 32
-
-    def __init__(
-        self,
-        max_chars_per_file: int = 30000,
-        bm25_scorer: Any = None,
-        base_paths: Optional[List[str]] = None,
-        deep_extract_fn: Optional[Callable] = None,
-    ) -> None:
+    def __init__(self, max_chars_per_file: int = 30000) -> None:
         self._max_chars = max_chars_per_file
-        self._bm25_scorer = bm25_scorer
-        self._base_paths = [Path(p).resolve() for p in (base_paths or [])]
-        self._chunk_cache: Dict[str, List[str]] = {}
-        self._deep_extract_fn = deep_extract_fn
-
-    @staticmethod
-    def _normalize_path(fp: str, base_paths: Optional[List[Path]] = None) -> Optional[Path]:
-        """Normalize and resolve file path with multiple fallback strategies.
-
-        Handles:
-        - Absolute paths (returned as-is if they exist)
-        - Relative paths (resolved against base_paths)
-        - Paths with symlinks (resolved to real path)
-        - Paths with case mismatches on case-insensitive systems
-
-        Args:
-            fp: File path string to normalize.
-            base_paths: List of base directories to try for relative path resolution.
-
-        Returns:
-            Resolved Path if file exists, None otherwise.
-        """
-        # Strategy 1: Direct absolute/relative path
-        path = Path(fp)
-        if path.is_absolute():
-            if path.exists():
-                return path.resolve()
-            # Try resolving symlinks
-            try:
-                resolved = path.resolve(strict=False)
-                if resolved.exists():
-                    return resolved
-            except (OSError, RuntimeError):
-                pass
-        else:
-            # Relative path: try resolving against base_paths
-            for base in (base_paths or []):
-                candidate = base / fp
-                if candidate.exists():
-                    return candidate.resolve()
-
-        # Strategy 2: Basename matching against base_paths
-        # (handles cases where only filename is provided)
-        basename = Path(fp).name
-        if basename and base_paths:
-            for base in base_paths:
-                if base.is_dir():
-                    # Look for the file in immediate children or subdirs
-                    for candidate in base.rglob(basename):
-                        if candidate.is_file():
-                            return candidate.resolve()
-
-        return None
 
     @property
     def name(self) -> str:
@@ -610,9 +404,7 @@ class FileReadTool(BaseTool):
             "description": (
                 "Read the full content of one or more files. Supports PDF, "
                 "DOCX, XLSX, TXT, MD, and other formats. Use this after "
-                "keyword_search identifies promising files. For large files, "
-                "provide keywords to extract only the most relevant sections. "
-                "Higher token cost."
+                "keyword_search identifies promising files. Higher token cost."
             ),
             "parameters": {
                 "type": "object",
@@ -621,15 +413,6 @@ class FileReadTool(BaseTool):
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Absolute paths of files to read.",
-                    },
-                    "keywords": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "Optional focus keywords for large files. When "
-                            "provided, only sections relevant to these keywords "
-                            "are returned instead of the full content."
-                        ),
                     },
                 },
                 "required": ["file_paths"],
@@ -642,28 +425,22 @@ class FileReadTool(BaseTool):
         **kwargs,
     ) -> Tuple[str, Dict[str, Any]]:
         file_paths: List[str] = kwargs.get("file_paths", [])
-        keywords: List[str] = kwargs.get("keywords", [])
         if not file_paths:
             return "No file paths provided.", {}
 
         outputs: List[str] = []
         files_read: List[str] = []
         total_chars = 0
-        deep_extracted: List[str] = []
-
-        belief = getattr(context, "belief_state", None)
 
         for fp in file_paths:
             fp_str = str(fp)
 
-            resolved = self._normalize_path(fp_str, self._base_paths)
-            if resolved:
-                fp_str = str(resolved)
-
+            # Dedup: skip already-read files
             if context.is_file_read(fp_str):
                 outputs.append(f"[{fp_str}] (already read, skipped)")
                 continue
 
+            # Budget check
             if context.is_budget_exceeded():
                 outputs.append(f"[{fp_str}] (skipped — token budget exceeded)")
                 break
@@ -671,14 +448,14 @@ class FileReadTool(BaseTool):
             try:
                 path = Path(fp_str)
                 if not path.exists():
-                    outputs.append(f"[{fp_str}] File not found. (original: {fp})")
+                    outputs.append(f"[{fp_str}] File not found.")
                     continue
 
+                # Text-like files: read directly; others: use kreuzberg
                 text_extensions = {
                     ".txt", ".md", ".py", ".js", ".ts", ".json", ".yaml",
                     ".yml", ".xml", ".csv", ".log", ".rst", ".html", ".css",
                     ".sh", ".bash", ".toml", ".cfg", ".ini", ".conf",
-                    ".jsonl",
                 }
                 if path.suffix.lower() in text_extensions:
                     content = path.read_text(encoding="utf-8", errors="replace")
@@ -686,33 +463,7 @@ class FileReadTool(BaseTool):
                     extraction = await fast_extract(path)
                     content = extraction.content if extraction else ""
 
-                # --- Lazy MCES: deep extraction for high-belief large files ---
-                if (
-                    self._deep_extract_fn
-                    and belief
-                    and belief.should_trigger_mces(
-                        fp_str, len(content), context.budget_remaining,
-                    )
-                ):
-                    deep_text = await self._try_deep_extract(
-                        content, keywords, context, fp_str,
-                    )
-                    if deep_text:
-                        outputs.append(
-                            f"[{fp_str}] (deep evidence extraction)\n{deep_text}"
-                        )
-                        total_chars += len(deep_text)
-                        context.mark_file_read(fp_str)
-                        files_read.append(fp_str)
-                        deep_extracted.append(fp_str)
-                        continue
-
-                # --- Standard path: BM25 focused extraction for large files ---
-                if len(content) > self._LARGE_FILE_THRESHOLD and keywords:
-                    content = self._extract_focused_content(
-                        content, keywords, file_path=fp_str,
-                    )
-
+                # Truncate if needed
                 if len(content) > self._max_chars:
                     content = content[: self._max_chars] + "\n... [truncated]"
 
@@ -720,13 +471,6 @@ class FileReadTool(BaseTool):
                 total_chars += len(content)
                 context.mark_file_read(fp_str)
                 files_read.append(fp_str)
-
-                if belief:
-                    has_info = len(content) > 500
-                    belief.update_from_read(
-                        fp_str, content_chars=len(content),
-                        found_new_info=has_info,
-                    )
 
             except Exception as exc:
                 outputs.append(f"[{fp_str}] Read error: {exc}")
@@ -736,99 +480,10 @@ class FileReadTool(BaseTool):
         context.add_log(
             tool_name=self.name,
             tokens=approx_tokens,
-            metadata={
-                "files_read": files_read,
-                "files_requested": file_paths,
-                "deep_extracted": deep_extracted,
-            },
+            metadata={"files_read": files_read, "files_requested": file_paths},
         )
 
-        return result_text, {
-            "files_read": files_read,
-            "tokens": approx_tokens,
-            "deep_extracted": deep_extracted,
-        }
-
-    async def _try_deep_extract(
-        self,
-        content: str,
-        keywords: List[str],
-        context: SearchContext,
-        file_path: str,
-    ) -> Optional[str]:
-        """Attempt MCES deep extraction; return formatted text or None."""
-        try:
-            return await self._deep_extract_fn(
-                content, keywords, context, file_path,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Deep extract failed for %s: %s — falling back to BM25",
-                file_path, exc,
-            )
-            return None
-
-    @staticmethod
-    def _make_chunks(content: str) -> List[str]:
-        """Split content into structure-aware ~1000-char chunks.
-
-        Delegates to the shared DocumentChunker which respects JSONL
-        line boundaries, markdown headings, and paragraph breaks.
-        """
-        raw = _FILE_CHUNKER.chunk(content)
-        return [c.content for c in raw] if raw else []
-
-    def _get_chunks(self, file_path: str, content: str) -> List[str]:
-        """Return cached chunks for *file_path*, building them if needed."""
-        if file_path in self._chunk_cache:
-            return self._chunk_cache[file_path]
-        chunks = self._make_chunks(content)
-        if len(self._chunk_cache) >= self._CHUNK_CACHE_MAX:
-            oldest = next(iter(self._chunk_cache))
-            del self._chunk_cache[oldest]
-        self._chunk_cache[file_path] = chunks
-        return chunks
-
-    def _extract_focused_content(
-        self,
-        content: str,
-        keywords: List[str],
-        max_chunks: int = 20,
-        file_path: str = "",
-    ) -> str:
-        """Extract keyword-relevant chunks using BM25 ranking.
-
-        Splits content into line-based chunks (preserving structural
-        boundaries for JSONL and similar formats), then selects the
-        most relevant chunks via BM25 scoring.  Falls back to simple
-        keyword matching when no scorer is available.
-        """
-        chunks = self._get_chunks(file_path, content) if file_path else self._make_chunks(content)
-        if not chunks or len(chunks) <= max_chunks:
-            return content
-
-        query = " ".join(keywords)
-
-        # Only invoke BM25 when chunk count is significantly above limit
-        if self._bm25_scorer and len(chunks) > max_chunks * 1.5:
-            try:
-                self._bm25_scorer.index_corpus(chunks)
-                indices = self._bm25_scorer.rerank(
-                    query, chunks, top_k=max_chunks,
-                )
-                if indices:
-                    indices.sort()
-                    return "\n\n[...]\n\n".join(chunks[i] for i in indices)
-            except Exception:
-                pass
-
-        # Fallback: keyword matching
-        kw_lower = [k.lower() for k in keywords]
-        matched = [c for c in chunks if any(k in c.lower() for k in kw_lower)]
-        if matched:
-            return "\n\n[...]\n\n".join(matched[:max_chunks])
-
-        return content[: self._max_chars]
+        return result_text, {"files_read": files_read, "tokens": approx_tokens}
 
 
 # ---------------------------------------------------------------------------
@@ -913,104 +568,3 @@ class KnowledgeQueryTool(BaseTool):
         )
 
         return result_text, {"query": query, "clusters_found": len(clusters)}
-
-
-# ---------------------------------------------------------------------------
-# Tool 4: Title Lookup (zero cost — direct index lookup)
-# ---------------------------------------------------------------------------
-
-class TitleLookupTool(BaseTool):
-    """Look up document/article file paths by exact title.
-
-    Uses an externally-provided title-to-filepath index for O(1) lookup.
-    Useful when the agent already knows the exact title of a document
-    (e.g., from entity chaining in multi-hop reasoning) and wants to
-    jump directly to the containing file without a full keyword search.
-
-    Args:
-        lookup_fn: Callable that maps a title string to a list of file
-            paths.  If ``None``, the tool gracefully reports that no
-            title index is available.
-    """
-
-    def __init__(
-        self,
-        lookup_fn: Optional[Callable[[str], List[str]]] = None,
-    ) -> None:
-        self._lookup_fn = lookup_fn
-
-    @property
-    def name(self) -> str:
-        return "title_lookup"
-
-    def get_schema(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "description": (
-                "Look up a document/article by its exact title and return "
-                "the file path(s) containing it. Instant lookup with zero "
-                "token cost. Use this when you already know the exact title "
-                "of an article or document you want to read — much faster "
-                "than keyword_search for known titles."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": (
-                            "The exact title of the document or article to look up."
-                        ),
-                    },
-                },
-                "required": ["title"],
-            },
-        }
-
-    async def execute(
-        self,
-        context: SearchContext,
-        **kwargs,
-    ) -> Tuple[str, Dict[str, Any]]:
-        title: str = kwargs.get("title", "").strip()
-        if not title:
-            return "No title provided.", {}
-
-        if self._lookup_fn is None:
-            return (
-                "Title index is not available for this corpus. "
-                "Use keyword_search instead."
-            ), {"title": title, "available": False}
-
-        try:
-            paths = self._lookup_fn(title)
-        except Exception as exc:
-            logger.warning("title_lookup error for %r: %s", title, exc)
-            return (
-                f"Title lookup failed: {exc}. Use keyword_search as fallback."
-            ), {"title": title, "error": str(exc)}
-
-        meta = {"title": title, "paths_found": len(paths)}
-
-        if not paths:
-            return (
-                f"No files found for title \"{title}\". "
-                f"The title may be misspelled or not in the corpus. "
-                f"Try keyword_search with the entity name instead."
-            ), meta
-
-        context.add_log(
-            tool_name=self.name,
-            tokens=0,
-            metadata=meta,
-        )
-
-        lines = [f"Found {len(paths)} file(s) for \"{title}\":"]
-        for p in paths[:5]:
-            lines.append(f"  - {p}")
-        if len(paths) > 5:
-            lines.append(f"  ... and {len(paths) - 5} more")
-        lines.append("\nUse file_read to read the content. "
-                      "Provide the title as a keyword for targeted extraction.")
-
-        return "\n".join(lines), meta

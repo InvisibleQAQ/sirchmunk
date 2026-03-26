@@ -6,14 +6,12 @@ import json
 import logging
 import os
 import re
-import threading
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from sirchmunk.base import BaseSearch
-from sirchmunk.learnings.evidence_cache import EvidenceCache
 from sirchmunk.learnings.knowledge_base import KnowledgeBase
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import (
@@ -32,7 +30,6 @@ from sirchmunk.schema.knowledge import (
     KnowledgeCluster,
     Lifecycle,
 )
-from sirchmunk.schema.metadata import FileInfo
 from sirchmunk.schema.request import ContentItem, Message, Request
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
@@ -46,7 +43,39 @@ from sirchmunk.utils.utils import (
     KeywordValidation,
     extract_fields,
 )
-from sirchmunk.utils.chat_utils import CHAT_QUERY_RE, CHAT_RESPONSE_SYSTEM
+
+# Only for quick simple-chat intent detection to reduce unnecessary LLM calls
+_CHAT_QUERY_RE = re.compile(
+    r"^("
+    # Greetings (ZH / EN / pinyin / JA / KO)
+    r"你好|您好|嗨|哈喽|喂|早上好|下午好|晚上好|早安|午安|晚安"
+    r"|hello|hi|hey|howdy|greetings|yo"
+    r"|nihao|ni\s*hao"
+    r"|good\s*(morning|afternoon|evening|night)"
+    r"|こんにちは|こんばんは|おはよう"
+    r"|안녕하세요|안녕"
+    # Identity / capability
+    r"|who\s+are\s+you|what\s+are\s+you|你是谁|你是什么"
+    r"|介绍.*你自己|tell\s+me\s+about\s+yourself"
+    r"|what\s+can\s+you\s+do|你能做什么|你会什么"
+    # Small talk
+    r"|how\s+are\s+you|你好吗|你怎么样|what'?s\s+up"
+    # Thanks
+    r"|thank\s*you|thanks|谢谢|感谢|多谢"
+    # Goodbye
+    r"|bye|goodbye|再见|拜拜|see\s+you"
+    # Ping / test
+    r"|test(ing)?|ping"
+    r")[\s!！？?。.，,~～…]*$",
+    re.IGNORECASE,
+)
+
+_CHAT_RESPONSE_SYSTEM = (
+    "You are Sirchmunk, an intelligent document search and analysis assistant. "
+    "The user sent a conversational message (greeting, identity question, etc.) "
+    "rather than a search query. Respond naturally and helpfully in 1-3 sentences. "
+    "Reply in the same language as the user's message."
+)
 
 
 class AgenticSearch(BaseSearch):
@@ -60,20 +89,9 @@ class AgenticSearch(BaseSearch):
         verbose: bool = True,
         log_callback: LogCallback = None,
         reuse_knowledge: bool = True,
-        enable_memory: bool = False,
-        rga_max_count: Optional[int] = None,
-        ugrep_corpus_path: Optional[Union[str, Path]] = None,
-        highfreq_file_threshold: int = 0,
-        rga_max_parse_lines: int = 0,
-        merge_max_files: int = 0,
-        title_lookup_fn=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-
-        # Store rga max_count setting
-        self._rga_max_count = rga_max_count
-        self._title_lookup_fn = title_lookup_fn
 
         # Normalise and store default search paths
         if paths is not None:
@@ -96,34 +114,84 @@ class AgenticSearch(BaseSearch):
             log_callback=log_callback,
         )
 
-        self.grep_retriever: GrepRetriever = GrepRetriever(
-            work_path=self.work_path,
-            ugrep_corpus_path=ugrep_corpus_path,
-            highfreq_file_threshold=highfreq_file_threshold,
-            rga_max_parse_lines=rga_max_parse_lines,
-            merge_max_files=merge_max_files,
-        )
+        self.grep_retriever: GrepRetriever = GrepRetriever(work_path=self.work_path)
 
         # Create bound logger with callback - returns AsyncLogger instance
         self._logger = create_logger(log_callback=log_callback, enable_async=True)
-
-        # Shared evidence cache across all searches in this session
-        self._evidence_cache = EvidenceCache()
 
         # Pass log_callback to KnowledgeBase so it can also log through the same callback
         self.knowledge_base = KnowledgeBase(
             llm=self.llm,
             work_path=self.work_path,
-            log_callback=log_callback,
-            evidence_cache=self._evidence_cache,
+            log_callback=log_callback
         )
 
+        # Initialize KnowledgeManager for persistent storage
+        self.knowledge_storage = KnowledgeStorage(work_path=str(self.work_path))
+
+        # Load historical knowledge clusters from cache
+        self._load_historical_knowledge()
+
         self.verbose: bool = verbose
+
         self.llm_usages: List[Dict[str, Any]] = []
+
+        # Maximum number of queries to keep per cluster (FIFO strategy)
         self.max_queries_per_cluster: int = 5
+
+        # Initialize embedding client for cluster reuse.
+        # EmbeddingUtil.__init__ is cheap (stores config only).
+        # start_loading() is called immediately so the background thread
+        # can download / construct the model while the first search runs.
+        # By the time the search finishes and needs to persist the cluster
+        # embedding, the model is typically ready.
+        self.embedding_client = None
         self.cluster_sim_threshold: float = kwargs.pop('cluster_sim_threshold', 0.85)
         self.cluster_sim_top_k: int = kwargs.pop('cluster_sim_top_k', 3)
+        if reuse_knowledge:
+            try:
+                # Use provided embedding instance if available
+                if embedding is not None:
+                    self.embedding_client = embedding
+                    self.embedding_client.start_loading()
+                    _loguru_logger.info(
+                        f"Using provided embedding client (model={self.embedding_client.model_id or 'default'}, cache_dir={self.embedding_client._cache_dir or 'default'})"
+                    )
+                else:
+                    embedding_cache = os.getenv("EMBEDDING_CACHE_DIR")
+                    cache_dir = (
+                        embedding_cache
+                        if embedding_cache
+                        else str(self.work_path / ".cache" / "models")
+                    )
+                    embedding_model_id = os.getenv("EMBEDDING_MODEL_ID")
+                    self.embedding_client = EmbeddingUtil(
+                        model_id=embedding_model_id,
+                        cache_dir=cache_dir
+                    )
+                    self.embedding_client.start_loading()
+                    _loguru_logger.info(
+                        f"Embedding client created (model={embedding_model_id or 'default'}, cache_dir={cache_dir}), background model loading started"
+                    )
+            except Exception as e:
+                _loguru_logger.error(
+                    f"Failed to initialize embedding client: {e}. "
+                    "Knowledge cluster embeddings will NOT be stored. "
+                    "Ensure sentence-transformers, torch, and modelscope are installed."
+                )
+                self.embedding_client = None
+        else:
+            _loguru_logger.info(
+                "Knowledge reuse disabled (reuse_knowledge=False). "
+                "Embeddings will not be computed."
+            )
 
+        if not check_dependencies():
+            _loguru_logger.info("Installing rga (ripgrep-all) and rg (ripgrep)...")
+            install_rga()
+
+        # Suppress noisy pypdf warnings about malformed PDF cross-references.
+        # pypdf._reader emits logging.warning() for "Ignoring wrong pointing object".
         logging.getLogger("pypdf._reader").setLevel(logging.ERROR)
 
         # ---- Agentic (ReAct) components (lazy-initialised on first use) ----
@@ -133,152 +201,7 @@ class AgenticSearch(BaseSearch):
         # ---- Spec-path cache for per-search-path context ----
         self.spec_path: Path = self.work_path / ".cache" / "spec"
         self.spec_path.mkdir(parents=True, exist_ok=True)
-        self._spec_lock = asyncio.Lock()
-
-        # ---- Heavy components (populated by background warm-up thread) ----
-        self.knowledge_storage: Optional[KnowledgeStorage] = None
-        self.embedding_client = None
-        self._memory = None
-        self._pending_feedback: List[asyncio.Task] = []
-
-        # ---- Background warm-up: non-blocking ----
-        self._warmup_event = threading.Event()
-        _warmup_thread = threading.Thread(
-            target=self._warmup_bg,
-            kwargs={
-                "reuse_knowledge": reuse_knowledge,
-                "enable_memory": enable_memory,
-            },
-            daemon=True,
-            name="sirchmunk-warmup",
-        )
-        _warmup_thread.start()
-
-    # ------------------------------------------------------------------
-    # Background warm-up
-    # ------------------------------------------------------------------
-
-    def _warmup_bg(self, *, reuse_knowledge: bool, enable_memory: bool = False) -> None:
-        """Background thread: initialise heavy components without blocking __init__."""
-        try:
-            # 1. KnowledgeStorage — DuckDB + Parquet load
-            try:
-                self.knowledge_storage = KnowledgeStorage(work_path=str(self.work_path))
-                self._load_historical_knowledge()
-            except Exception as exc:
-                _loguru_logger.warning(f"[warmup] KnowledgeStorage init failed: {exc}")
-
-            # 2. Embedding model — triggers its own daemon thread for download/load
-            if reuse_knowledge:
-                try:
-                    from sirchmunk.utils.embedding_util import EmbeddingUtil
-
-                    embedding_cache = os.getenv("EMBEDDING_CACHE_DIR")
-                    cache_dir = (
-                        embedding_cache
-                        if embedding_cache
-                        else str(self.work_path / ".cache" / "models")
-                    )
-                    self.embedding_client = EmbeddingUtil(cache_dir=cache_dir)
-                    self.embedding_client.start_loading()
-                    self.knowledge_base.embedding_util = self.embedding_client
-                    _loguru_logger.info(
-                        "[warmup] Embedding client created, background model loading started"
-                    )
-                except Exception as exc:
-                    _loguru_logger.error(
-                        f"[warmup] Embedding init failed: {exc}. "
-                        "Cluster embeddings will NOT be stored."
-                    )
-                    self.embedding_client = None
-            else:
-                _loguru_logger.info(
-                    "[warmup] Knowledge reuse disabled — embeddings will not be computed"
-                )
-
-            # 3. System dependencies (rga / rg)
-            try:
-                if not check_dependencies():
-                    _loguru_logger.info("[warmup] Installing rga (ripgrep-all) and rg (ripgrep)...")
-                    install_rga()
-            except Exception as exc:
-                _loguru_logger.warning(f"[warmup] Dependency check failed: {exc}")
-
-            # 4. Self-evolving retrieval memory (opt-in)
-            if enable_memory:
-                try:
-                    from sirchmunk.memory import RetrievalMemory
-                    self._memory = RetrievalMemory(
-                        work_path=str(self.work_path),
-                        embedding_util=self.embedding_client,
-                    )
-                    self.grep_retriever.set_memory(self._memory)
-                    _loguru_logger.info("[warmup] Retrieval memory enabled and initialised")
-                except Exception as exc:
-                    _loguru_logger.info(f"[warmup] Retrieval memory not available: {exc}")
-            else:
-                _loguru_logger.info("[warmup] Retrieval memory disabled")
-
-        except Exception as exc:
-            _loguru_logger.error(f"[warmup] Unexpected error: {exc}")
-        finally:
-            self._warmup_event.set()
-            _loguru_logger.info("[warmup] Background warm-up complete")
-
-    async def _ensure_warmup(self, timeout: float = 30.0) -> None:
-        """Wait for background warm-up to finish (non-blocking for the event loop).
-
-        Called once at the top of ``search()``.  If warm-up is already done
-        this is a no-op (~0 ms).  Otherwise it awaits in a thread-pool so
-        the asyncio loop isn't blocked.
-        """
-        if self._warmup_event.is_set():
-            return
-        loop = asyncio.get_running_loop()
-        ready = await loop.run_in_executor(
-            None, self._warmup_event.wait, timeout,
-        )
-        if not ready:
-            _loguru_logger.warning(
-                "[warmup] Timed out — proceeding with available components"
-            )
-
-    def inject_evaluation(
-        self,
-        query: str,
-        em_score: float,
-        f1_score: float,
-        llm_judge_verdict: Optional[str] = None,
-    ) -> None:
-        """Back-fill evaluation metrics into memory for the given query.
-
-        Called by benchmark harnesses after ground-truth evaluation is
-        available.  This closes the learning loop by providing gradient
-        confidence to all memory layers.
-        """
-        if self._memory:
-            self._memory.inject_evaluation(
-                query=query,
-                em_score=em_score,
-                f1_score=f1_score,
-                llm_judge_verdict=llm_judge_verdict,
-            )
-
-    async def flush_memory(self) -> None:
-        """Await all pending feedback tasks and flush memory to disk.
-
-        Must be called before process exit to guarantee feedback persistence.
-        """
-        if self._pending_feedback:
-            done = [t for t in self._pending_feedback if not t.done()]
-            if done:
-                await asyncio.gather(*done, return_exceptions=True)
-            self._pending_feedback.clear()
-        if self._memory:
-            try:
-                self._memory.close()
-            except Exception:
-                pass
+        self._spec_lock = asyncio.Lock()  # guards concurrent spec writes
 
     def update_log_callback(self, log_callback: LogCallback = None) -> None:
         """Replace the per-request log callback on all sub-components.
@@ -435,10 +358,13 @@ class AgenticSearch(BaseSearch):
         Returns:
             KnowledgeCluster if a suitable cached cluster is found, None otherwise.
         """
-        if not self.embedding_client or not self.knowledge_storage:
+        if not self.embedding_client:
             return None
 
         try:
+            # Wait briefly for the model so reuse can work when it's already loading.
+            # Use a short timeout to avoid blocking the first request (e.g. in Docker
+            # the model may take 30–60s to load; we skip reuse and do full search instead).
             if not self.embedding_client.is_ready():
                 self.embedding_client.start_loading()
                 try:
@@ -553,9 +479,6 @@ class AgenticSearch(BaseSearch):
         Args:
             cluster: KnowledgeCluster to save
         """
-        if not self.knowledge_storage:
-            return
-
         # Save knowledge cluster to persistent storage.
         # insert() returns False (without raising) when the cluster already
         # exists, so we explicitly fall back to update() in that case.
@@ -666,9 +589,9 @@ class AgenticSearch(BaseSearch):
             description=[f"Search result for: {query}"],
             content=answer,
             queries=[query],
-            evidences=evidences,
+            evidences=evidences if evidences else None,
             search_results=list(file_paths or []),
-            resources=resources or [],
+            resources=resources or None,
             confidence=0.5,
             abstraction_level=AbstractionLevel.TECHNIQUE,
             hotness=0.5,
@@ -879,17 +802,6 @@ class AgenticSearch(BaseSearch):
 
         return keyword_sets
 
-    _TEMPLATE_PLACEHOLDERS = frozenset({
-        "keyword1", "keyword2", "keyword3",
-        "translated_keyword1", "translated_keyword2", "translated_keyword3",
-        "idf_value",
-    })
-
-    @classmethod
-    def _is_placeholder(cls, term: str) -> bool:
-        """True if *term* is a prompt-template placeholder, not a real keyword."""
-        return term.lower().strip('"') in cls._TEMPLATE_PLACEHOLDERS
-
     @staticmethod
     def _extract_alt_keywords(llm_resp: str) -> Dict[str, float]:
         """Extract cross-lingual keywords from ``<KEYWORDS_ALT>`` block."""
@@ -900,100 +812,19 @@ class AgenticSearch(BaseSearch):
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, dict):
-                return {
-                    k: float(v) for k, v in parsed.items()
-                    if isinstance(k, str) and not AgenticSearch._is_placeholder(k)
-                }
+                return {k: float(v) for k, v in parsed.items() if isinstance(k, str)}
         except (json.JSONDecodeError, TypeError, ValueError):
             try:
                 parsed = ast.literal_eval(raw)
                 if isinstance(parsed, dict):
-                    return {
-                        k: float(v) for k, v in parsed.items()
-                        if isinstance(k, str) and not AgenticSearch._is_placeholder(k)
-                    }
+                    return {k: float(v) for k, v in parsed.items() if isinstance(k, str)}
             except Exception:
                 pass
         return {}
 
-    @staticmethod
-    def _fallback_query_keywords(query: str) -> Dict[str, float]:
-        """Heuristic keyword extraction when LLM extraction fails.
-
-        Extracts capitalized named entities and non-stop content words
-        directly from the query.  Avoids the expensive ReAct fallback
-        for every query when the LLM prompt format is incompatible.
-        """
-        import re as _re
-        _STOP = frozenset({
-            "the", "a", "an", "is", "are", "was", "were", "be", "been",
-            "have", "has", "had", "do", "does", "did", "will", "would",
-            "can", "could", "may", "might", "shall", "should", "must",
-            "of", "in", "to", "for", "with", "on", "at", "from", "by",
-            "about", "as", "into", "through", "during", "before", "after",
-            "and", "but", "or", "not", "so", "yet", "both", "also",
-            "what", "which", "who", "where", "when", "how", "that",
-            "this", "it", "its", "than", "between", "out",
-        })
-        kw: Dict[str, float] = {}
-
-        named = _re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", query)
-        for name in named:
-            if name.lower() not in _STOP:
-                kw[name] = 7.0
-
-        words = query.split()
-        for w in words:
-            clean = _re.sub(r"[^\w]", "", w)
-            if not clean or len(clean) < 3 or clean.lower() in _STOP:
-                continue
-            if clean not in kw:
-                kw[clean] = 5.0
-
-        return kw
-
     # ------------------------------------------------------------------
     # Agentic (ReAct) infrastructure — lazy initialisation
     # ------------------------------------------------------------------
-
-    def _get_bm25_scorer(self):
-        """Lazily create a shared BM25Scorer with the best available tokenizer."""
-        if getattr(self, "_shared_bm25_scorer", None) is not None:
-            return self._shared_bm25_scorer
-        try:
-            from sirchmunk.utils.tokenizer_util import TokenizerUtil
-            tokenizer = TokenizerUtil()
-        except Exception:
-            tokenizer = None
-        from sirchmunk.utils.bm25_util import BM25Scorer
-        self._shared_bm25_scorer = BM25Scorer(tokenizer=tokenizer)
-        return self._shared_bm25_scorer
-
-    @staticmethod
-    def _detect_text_only_corpus(paths: List[str], sample_limit: int = 20) -> bool:
-        """Check if search paths contain only plain-text files (no binary adapters needed).
-
-        Samples up to *sample_limit* files and returns True when none of the
-        sampled files have a binary-adapter extension (.pdf, .docx, .epub, etc.).
-        For text-only corpora rga adapter caching is useless and the
-        ``--rga-no-cache`` flag should be passed to avoid overhead.
-        """
-        _ADAPTER_EXTS = {".pdf", ".docx", ".odt", ".epub", ".fb2", ".ipynb", ".xlsx"}
-        sampled = 0
-        for p in paths:
-            pp = Path(p)
-            if not pp.is_dir():
-                continue
-            for child in pp.iterdir():
-                if child.is_file():
-                    if child.suffix.lower() in _ADAPTER_EXTS:
-                        return False
-                    sampled += 1
-                    if sampled >= sample_limit:
-                        break
-            if sampled >= sample_limit:
-                break
-        return sampled > 0
 
     def _ensure_tool_registry(
         self,
@@ -1022,7 +853,6 @@ class AgenticSearch(BaseSearch):
             FileReadTool,
             KeywordSearchTool,
             KnowledgeQueryTool,
-            TitleLookupTool,
             ToolRegistry,
         )
 
@@ -1040,15 +870,11 @@ class AgenticSearch(BaseSearch):
             return self._tool_registry
 
         registry = ToolRegistry()
-        bm25_scorer = self._get_bm25_scorer()
 
         # Tool 1: Knowledge cache (zero cost)
         registry.register(KnowledgeQueryTool(self.knowledge_storage))
 
-        # Detect text-only corpus (extensionless files) to skip rga adapter cache
-        _rga_no_cache = self._detect_text_only_corpus(paths)
-
-        # Tool 2: Keyword search (low cost, BM25-reranked)
+        # Tool 2: Keyword search (low cost)
         registry.register(
             KeywordSearchTool(
                 retriever=self.grep_retriever,
@@ -1057,29 +883,13 @@ class AgenticSearch(BaseSearch):
                 max_results=10,
                 include=include,
                 exclude=exclude,
-                bm25_scorer=bm25_scorer,
-                max_count=self._rga_max_count,
-                rga_no_cache=_rga_no_cache,
             )
         )
 
-        # Tool 3: File read (medium cost, keyword-focused extraction)
-        # When BA-ReAct belief tracking is active, the deep_extract_fn
-        # enables lazy MCES activation for high-value large files.
-        registry.register(FileReadTool(
-            max_chars_per_file=30000,
-            bm25_scorer=bm25_scorer,
-            base_paths=paths,
-            deep_extract_fn=self._make_deep_extract_fn(),
-        ))
+        # Tool 3: File read (medium cost)
+        registry.register(FileReadTool(max_chars_per_file=30000))
 
-        # Tool 4: Title lookup (zero cost — direct index lookup)
-        if self._title_lookup_fn is not None:
-            registry.register(TitleLookupTool(
-                lookup_fn=self._title_lookup_fn,
-            ))
-
-        # Tool 5: Directory scan (optional, medium cost)
+        # Tool 4: Directory scan (optional, medium cost)
         if enable_dir_scan:
             from sirchmunk.agentic.dir_scan_tool import DirScanTool
             from sirchmunk.scan.dir_scanner import DirectoryScanner
@@ -1096,86 +906,6 @@ class AgenticSearch(BaseSearch):
         return registry
 
     # ------------------------------------------------------------------
-    # BA-ReAct: Lazy MCES deep extraction callback
-    # ------------------------------------------------------------------
-
-    def _make_deep_extract_fn(self):
-        """Create a closure that runs MCES deep evidence extraction.
-
-        The returned async callable is injected into ``FileReadTool`` and
-        invoked transparently when the belief state triggers deep extraction
-        for a high-value large file.  Results are cached on the
-        ``SearchContext.mces_cache`` for Phase 3 reuse.
-        """
-        from sirchmunk.learnings.evidence_processor import EvidenceSampler
-
-        llm = self.llm
-        evidence_cache = self._evidence_cache
-        log_callback = getattr(self, "log_callback", None)
-        embedding_util = getattr(self, "embedding_client", None)
-
-        async def _deep_extract(
-            doc_content: str,
-            keywords: list,
-            context,
-            file_path: str,
-        ):
-            query = getattr(context, "query", "") or ""
-            if not query:
-                return None
-
-            sampler = EvidenceSampler(
-                llm=llm,
-                doc_content=doc_content,
-                verbose=False,
-                log_callback=log_callback,
-                embedding_util=embedding_util,
-                cache=evidence_cache,
-            )
-            kw_dict = {k: 1.0 for k in keywords} if keywords else {}
-            roi = await sampler.get_roi(
-                query=query,
-                keywords=kw_dict,
-                confidence_threshold=7.0,
-            )
-
-            # Track LLM tokens consumed by MCES
-            for u in sampler.llm_usages:
-                tok = u.get("total_tokens", 0)
-                if tok == 0:
-                    tok = u.get("prompt_tokens", 0) + u.get("completion_tokens", 0)
-                context.add_llm_tokens(tok, usage=u)
-
-            # Cache RoiResult for Phase 3 cluster construction
-            context.mces_cache[file_path] = {
-                "summary": roi.summary,
-                "is_found": roi.is_found,
-                "snippets": roi.snippets,
-            }
-
-            # Update belief state with MCES scores
-            belief = getattr(context, "belief_state", None)
-            if belief:
-                best_score = max(
-                    (s.get("score", 0) for s in roi.snippets),
-                    default=0,
-                )
-                belief.update_from_mces(file_path, best_score, roi.is_found)
-
-            if not roi.is_found:
-                return None
-
-            parts = [roi.summary]
-            for s in roi.snippets[:3]:
-                score = s.get("score", 0)
-                snippet = s.get("snippet", "")[:500]
-                if snippet:
-                    parts.append(f"\n--- Evidence (score={score:.1f}) ---\n{snippet}")
-            return "\n".join(parts)
-
-        return _deep_extract
-
-    # ------------------------------------------------------------------
     # Unified search entry point
     # ------------------------------------------------------------------
 
@@ -1187,7 +917,7 @@ class AgenticSearch(BaseSearch):
         mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = "FAST",
         max_loops: int = 10,
         max_token_budget: int = 128000,
-        max_depth: Optional[int] = 8,
+        max_depth: Optional[int] = 5,
         top_k_files: int = 5,
         enable_dir_scan: bool = False,
         include: Optional[List[str]] = None,
@@ -1195,8 +925,6 @@ class AgenticSearch(BaseSearch):
         return_context: bool = False,
         spec_stale_hours: float = 72.0,
         chat_history: Optional[List[Dict[str, str]]] = None,
-        enable_thinking: bool = False,
-        enable_cross_lingual: bool = True,
     ) -> Union[str, SearchContext, List[Dict[str, Any]]]:
         """Perform intelligent search with multi-mode support.
 
@@ -1228,7 +956,7 @@ class AgenticSearch(BaseSearch):
         │ Step 4  LLM answer synthesis from evidence               │
         └──────────────────────────────────────────────────────────┘
 
-        DEEP architecture (ReAct-first iterative retrieval):
+        DEEP architecture (phases execute as parallel as possible):
 
         ┌──────────────────────────────────────────────────────────┐
         │ Phase 0a Direct document analysis (intent-gated,         │
@@ -1236,20 +964,25 @@ class AgenticSearch(BaseSearch):
         ├──────────────────────────────────────────────────────────┤
         │ Phase 0  Cluster reuse check (instant, short-circuit)    │
         ├──────────────────────────────────────────────────────────┤
-        │ Phase 1  Parallel warm-start probing (all concurrent):   │
+        │ Phase 1  Parallel probing (all concurrent):              │
         │  ├─ LLM keyword extraction                               │
         │  ├─ DirectoryScanner.scan() (filesystem only, fast)      │
         │  ├─ Knowledge cache similarity search                    │
         │  └─ Spec-path cache load                                 │
         ├──────────────────────────────────────────────────────────┤
-        │ Phase 2  ReAct-driven iterative retrieval:               │
-        │  └─ Agent loop with warm-start keywords + tools:         │
-        │     keyword_search (BM25-reranked), file_read (focused   │
-        │     extraction), knowledge_query, dir_scan (optional)    │
+        │ Phase 2  Parallel retrieval (depends on Phase 1):        │
+        │  ├─ keyword_search per extracted keyword (concurrent rga)│
+        │  └─ DirectoryScanner.rank() (LLM ranks candidates)      │
         ├──────────────────────────────────────────────────────────┤
-        │ Phase 3  Cluster construction from ReAct discoveries     │
+        │ Phase 3  Merge + evidence assembly:                      │
+        │  └─ knowledge_base.build() (parallel per-file Monte      │
+        │     Carlo evidence sampling)                             │
         ├──────────────────────────────────────────────────────────┤
-        │ Phase 4  Persistence (concurrent, quality-gated):        │
+        │ Phase 4  Summary / ReAct refinement:                     │
+        │  └─ If evidence sufficient → LLM summary                 │
+        │     Else → ReAct loop for adaptive follow-up             │
+        ├──────────────────────────────────────────────────────────┤
+        │ Phase 5  Persistence (concurrent, awaited):                │
         │  ├─ Save cluster + embeddings                            │
         │  └─ Save spec-path cache                                 │
         └──────────────────────────────────────────────────────────┘
@@ -1259,7 +992,7 @@ class AgenticSearch(BaseSearch):
             paths: Directories / files to search.  Falls back to
                 ``self.paths`` or the current working directory.
             mode: Search mode — ``"DEEP"``, ``"FAST"``, or ``"FILENAME_ONLY"``.
-            max_loops: Maximum ReAct iterations (DEEP mode, default: 5).
+            max_loops: Maximum ReAct iterations (DEEP mode, default: 10).
             max_token_budget: LLM token budget (DEEP mode, default: 128000).
             max_depth: Maximum directory depth for file search (default: 5).
                 Used in both FILENAME_ONLY and DEEP modes.
@@ -1273,12 +1006,6 @@ class AgenticSearch(BaseSearch):
                 that carries ``answer``, ``cluster`` (KnowledgeCluster),
                 and full pipeline telemetry (LLM usage, files read, etc.).
             spec_stale_hours: Hours before spec cache is stale (default: 72).
-            chat_history: Optional list of chat messages for intent detection (DEEP mode).
-            enable_thinking: If True, enable model reasoning/thinking for
-                complex processing steps (final answer synthesis, ReAct
-                reasoning). Simple extraction/classification steps always
-                run with thinking disabled. Default: False.
-            enable_cross_lingual: If True, enable cross-lingual keyword extraction and matching.
 
         Returns:
             - ``str``: Answer summary (default).
@@ -1286,9 +1013,6 @@ class AgenticSearch(BaseSearch):
               ``cluster``, and telemetry in a single object.
             - ``List[Dict]``: File matches in FILENAME_ONLY mode.
         """
-        # ---- Ensure background warm-up is complete ----
-        await self._ensure_warmup()
-
         paths = self.validate_search_paths(
             self._resolve_paths(paths),
         )
@@ -1300,52 +1024,6 @@ class AgenticSearch(BaseSearch):
                 ctx.answer = msg
                 return ctx
             return msg
-
-        # ---- Memory: strategy hint + similar-query transfer (zero-LLM) ----
-        _memory_extra_files: List[str] = []
-        _memory_extra_keywords: List[str] = []
-        # Strategy changes are high-impact → require strong confidence.
-        # File/keyword hints are supplementary → accept moderate confidence.
-        _STRATEGY_CONFIDENCE_MIN = 0.7
-        _HINT_CONFIDENCE_MIN = 0.4
-        _MEMORY_MAX_EXTRA_FILES = 5
-        _MEMORY_MAX_EXTRA_KEYWORDS = 8
-        if self._memory and mode != "FILENAME_ONLY":
-            try:
-                hint = self._memory.suggest_strategy(query)
-                if hint and hint.confidence >= _STRATEGY_CONFIDENCE_MIN:
-                    _loguru_logger.info(
-                        "[memory] Strategy hint applied: conf={:.2f} mode={}",
-                        hint.confidence, hint.mode,
-                    )
-                    if hint.mode:
-                        mode = hint.mode
-                    if hint.top_k_files is not None:
-                        top_k_files = hint.top_k_files
-                    if hint.max_loops is not None:
-                        max_loops = hint.max_loops
-                    if hint.enable_dir_scan is not None:
-                        enable_dir_scan = hint.enable_dir_scan
-            except Exception:
-                pass
-            try:
-                sim_hints = self._memory.get_similar_query_hints(query, top_k=3)
-                for sh in sim_hints:
-                    if sh.confidence >= _HINT_CONFIDENCE_MIN:
-                        _memory_extra_files.extend(sh.useful_files[:3])
-                        _memory_extra_keywords.extend(sh.keywords[:3])
-                _memory_extra_files = _memory_extra_files[:_MEMORY_MAX_EXTRA_FILES]
-                _memory_extra_keywords = _memory_extra_keywords[:_MEMORY_MAX_EXTRA_KEYWORDS]
-                if sim_hints:
-                    _loguru_logger.info(
-                        "[memory] Similar-query hints: {} hit(s), "
-                        "extra_files={}, extra_kw={}",
-                        len(sim_hints),
-                        len(_memory_extra_files),
-                        len(_memory_extra_keywords),
-                    )
-            except Exception:
-                pass
 
         # ---- Chat intent short-circuit (rule-based, no LLM cost) ----
         if mode != "FILENAME_ONLY" and self._is_chat_query(query):
@@ -1374,8 +1052,6 @@ class AgenticSearch(BaseSearch):
                 query=query, paths=paths, max_depth=max_depth,
                 top_k_files=top_k_files, enable_dir_scan=enable_dir_scan,
                 include=include, exclude=exclude,
-                enable_thinking=enable_thinking,
-                enable_cross_lingual=enable_cross_lingual,
             )
         else:
             answer, cluster, context = await self._search_deep(
@@ -1385,10 +1061,6 @@ class AgenticSearch(BaseSearch):
                 enable_dir_scan=enable_dir_scan,
                 include=include, exclude=exclude,
                 spec_stale_hours=spec_stale_hours,
-                enable_thinking=enable_thinking,
-                enable_cross_lingual=enable_cross_lingual,
-                memory_extra_files=_memory_extra_files,
-                memory_extra_keywords=_memory_extra_keywords,
             )
 
         # ---- Unified return wrapping ----
@@ -1412,7 +1084,7 @@ class AgenticSearch(BaseSearch):
         query: str,
         paths: List[str],
         *,
-        max_loops: int = 5,
+        max_loops: int = 10,
         max_token_budget: int = 128000,
         max_depth: Optional[int] = 5,
         top_k_files: int = 5,
@@ -1420,18 +1092,8 @@ class AgenticSearch(BaseSearch):
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         spec_stale_hours: float = 72.0,
-        enable_thinking: bool = False,
-        enable_cross_lingual: bool = True,
-        memory_extra_files: Optional[List[str]] = None,
-        memory_extra_keywords: Optional[List[str]] = None,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
-        """ReAct-first iterative retrieval pipeline (Phases 0a–4).
-
-        Phase 0a/0 provide short-circuit paths for cached knowledge.
-        Phase 1 extracts warm-start data (keywords, dir_scan, knowledge).
-        Phase 2 drives a ReAct agent loop with enhanced tools.
-        Phase 3 constructs a knowledge cluster from ReAct discoveries.
-        Phase 4 persists quality-gated results.
+        """Parallel multi-path retrieval pipeline (Phases 0a–5).
 
         Returns:
             ``(answer, cluster, context)`` tuple.
@@ -1452,7 +1114,7 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         # Phase 0: Cluster reuse (instant short-circuit)
         # When reuse_knowledge=True and a similar cluster is found, we
-        # return here — Phase 4 (Persistence) is not executed for that path.
+        # return here — Phase 5 (Persistence) is not executed for that path.
         # ==============================================================
         reused = await self._try_reuse_cluster(query)
         if reused is not None:
@@ -1470,7 +1132,7 @@ class AgenticSearch(BaseSearch):
         context.increment_loop()
 
         phase1_results = await asyncio.gather(
-            self._probe_keywords(query, enable_cross_lingual=enable_cross_lingual),
+            self._probe_keywords(query),
             self._probe_dir_scan(paths, enable_dir_scan),
             self._probe_knowledge_cache(query),
             self._load_spec_context(paths, stale_hours=spec_stale_hours),
@@ -1488,31 +1150,6 @@ class AgenticSearch(BaseSearch):
 
         query_keywords, initial_keywords = kw_result if isinstance(kw_result, tuple) else ({}, [])
 
-        # Memory: expand keywords with semantic bridge + filter noise
-        if self._memory and query_keywords:
-            try:
-                query_keywords = self._memory.expand_keywords(query_keywords)
-            except Exception:
-                pass
-            try:
-                clean_kws = self._memory.filter_noise_keywords(
-                    list(query_keywords.keys())
-                )
-                if clean_kws:
-                    query_keywords = {
-                        k: v for k, v in query_keywords.items()
-                        if k in clean_kws
-                    }
-                    initial_keywords = [
-                        k for k in initial_keywords if k in clean_kws
-                    ]
-            except Exception:
-                pass
-            # Merge similar-query keywords from memory hints
-            for mk in (memory_extra_keywords or []):
-                if mk and mk not in query_keywords:
-                    query_keywords[mk] = 0.3
-
         await self._logger.info(
             f"[Phase 1] Results: keywords={len(initial_keywords)}, "
             f"dir_scan={'OK' if scan_result else 'N/A'}, "
@@ -1520,68 +1157,92 @@ class AgenticSearch(BaseSearch):
             f"spec_cache={'YES' if spec_context else 'NO'}"
         )
 
-        # Memory → BeliefState: extract cross-session priors for warm-start
-        _memory_prior = None
-        _memory_bridge = None
-        if self._memory:
-            try:
-                from sirchmunk.memory.bridge import MemoryBridge
-                _memory_bridge = MemoryBridge(self._memory)
-                _candidate_files = list(set(memory_extra_files or []))
-                _memory_prior = _memory_bridge.extract_priors(
-                    query=query,
-                    candidate_files=_candidate_files or None,
-                    extra_files=memory_extra_files,
-                    extra_keywords=(
-                        list(query_keywords.keys()) if query_keywords else None
-                    ),
+        # ==============================================================
+        # Phase 2: Parallel retrieval — keyword search + dir_scan rank
+        # ==============================================================
+        await self._logger.info("[Phase 2] Parallel retrieval: rga keyword search + dir_scan LLM rank")
+        context.increment_loop()
+
+        phase2_tasks = []
+
+        if initial_keywords:
+            phase2_tasks.append(
+                self._retrieve_by_keywords(
+                    initial_keywords, paths,
+                    max_depth=max_depth, include=include, exclude=exclude,
                 )
-                if _memory_prior and not _memory_prior.is_empty:
-                    _loguru_logger.info(
-                        "[memory] Prior: files={}, dead={}, avoid={}, "
-                        "chain={}, conf={:.2f}",
-                        len(_memory_prior.path_scores)
-                        + len(_memory_prior.entity_paths)
-                        + len(_memory_prior.similar_query_files)
-                        + len(_memory_prior.extra_files),
-                        len(_memory_prior.dead_paths),
-                        len(_memory_prior.avoid_files),
-                        "yes" if _memory_prior.chain_hint else "no",
-                        _memory_prior.avg_confidence,
-                    )
-            except Exception:
-                pass
+            )
+        else:
+            phase2_tasks.append(self._async_noop([]))
 
-        # ==============================================================
-        # Phase 2: ReAct-driven iterative retrieval
-        # The agent receives Phase 1 warm-start data (keywords, spec
-        # context) and uses enhanced tools (BM25-reranked keyword search,
-        # keyword-focused file read) for multi-hop reasoning.
-        # ==============================================================
-        await self._logger.info("[Phase 2] Launching ReAct agent for iterative retrieval")
+        if scan_result is not None and enable_dir_scan:
+            phase2_tasks.append(
+                self._rank_dir_scan_candidates(query, scan_result)
+            )
+        else:
+            phase2_tasks.append(self._async_noop([]))
 
-        answer, context = await self._react_refinement(
-            query=query, paths=paths,
-            initial_keywords=initial_keywords, spec_context=spec_context,
-            enable_dir_scan=enable_dir_scan,
-            max_loops=max_loops, max_token_budget=max_token_budget,
-            max_depth=max_depth, include=include, exclude=exclude,
-            enable_thinking=enable_thinking,
-            memory_prior=_memory_prior,
+        phase2_results = await asyncio.gather(*phase2_tasks, return_exceptions=True)
+
+        keyword_files = phase2_results[0] if not isinstance(phase2_results[0], Exception) else []
+        dir_scan_files = phase2_results[1] if not isinstance(phase2_results[1], Exception) else []
+
+        for i, label in enumerate(["keyword_search", "dir_scan_rank"]):
+            if isinstance(phase2_results[i], Exception):
+                await self._logger.warning(f"[Phase 2] {label} failed: {phase2_results[i]}")
+
+        await self._logger.info(
+            f"[Phase 2] Results: keyword_files={len(keyword_files)}, "
+            f"dir_scan_files={len(dir_scan_files)}"
         )
 
         # ==============================================================
-        # Phase 3: Cluster construction from ReAct discoveries
+        # Phase 3: Merge file paths + build KnowledgeCluster
         # ==============================================================
-        cluster: Optional[KnowledgeCluster] = None
-        should_save: bool = False
+        context.increment_loop()
+        merged_files = self._merge_file_paths(
+            keyword_files=keyword_files,
+            dir_scan_files=dir_scan_files,
+            knowledge_hits=knowledge_hits,
+        )
+        await self._logger.info(f"[Phase 3] Merged {len(merged_files)} unique candidate files")
 
-        if answer and self._is_evidence_meaningful(answer):
-            cluster = await self._build_cluster_from_context(
-                query=query, answer=answer, context=context,
+        cluster: Optional[KnowledgeCluster] = None
+        if merged_files:
+            cluster = await self._build_cluster(
+                query=query, file_paths=merged_files,
                 query_keywords=query_keywords, top_k_files=top_k_files,
             )
-            should_save = cluster is not None
+
+        # ==============================================================
+        # Phase 4: Generate answer — cluster summary or ReAct refinement
+        # ==============================================================
+        context.increment_loop()
+        answer: str = ""
+        should_save: bool = True
+
+        if cluster and cluster.content:
+            await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
+            answer, should_save = await self._summarise_cluster(query, cluster)
+            if not cluster.search_results:
+                cluster.search_results = list(merged_files)
+        else:
+            await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
+            answer, context = await self._react_refinement(
+                query=query, paths=paths,
+                initial_keywords=initial_keywords, spec_context=spec_context,
+                enable_dir_scan=enable_dir_scan,
+                max_loops=max_loops, max_token_budget=max_token_budget,
+                max_depth=max_depth, include=include, exclude=exclude,
+            )
+
+            if not cluster:
+                cluster = await self._build_cluster_from_context(
+                    query=query, answer=answer, context=context,
+                    query_keywords=query_keywords, top_k_files=top_k_files,
+                )
+            elif answer and not cluster.content:
+                cluster.content = answer
 
         # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
@@ -1593,87 +1254,22 @@ class AgenticSearch(BaseSearch):
                 context.add_llm_tokens(total_tok, usage=usage)
 
         # ==============================================================
-        # Phase 4: Persistence (quality-gated)
+        # Phase 5: Persistence (quality-gated)
+        # Skipped when Phase 4 quality check says the answer is low-quality
+        # or when Phase 0 reused a cluster (early-returned above).
         # ==============================================================
-        phase4_tasks = []
+        phase5_tasks = []
         if cluster and should_save:
             self._add_query_to_cluster(cluster, query)
-            phase4_tasks.append(self._save_cluster_with_embedding(cluster))
-        else:
-            await self._logger.info("[Phase 4] Quality gate: skipping cluster save")
+            phase5_tasks.append(self._save_cluster_with_embedding(cluster))
+        elif not should_save:
+            await self._logger.info("[Phase 5] Quality gate: low-quality answer, skipping cluster save")
             cluster = None
-        phase4_tasks.append(self._save_spec_context(paths, context, scan_result=scan_result))
-        results = await asyncio.gather(*phase4_tasks, return_exceptions=True)
+        phase5_tasks.append(self._save_spec_context(paths, context, scan_result=scan_result))
+        results = await asyncio.gather(*phase5_tasks, return_exceptions=True)
         for r in results:
             if isinstance(r, Exception):
-                _loguru_logger.warning(f"[Phase 4] Persistence task failed: {r}")
-
-        # Memory: record feedback signal enriched with belief data
-        if self._memory:
-            try:
-                from sirchmunk.memory.schemas import FeedbackSignal
-                _now = datetime.now(timezone.utc)
-                _start = (
-                    context.start_time
-                    if context.start_time.tzinfo
-                    else context.start_time.replace(tzinfo=timezone.utc)
-                )
-                elapsed = max(0.0, (_now - _start).total_seconds())
-                _discovered = list(context.read_file_ids)
-                for log_entry in context.retrieval_logs:
-                    if log_entry.tool_name == "keyword_search":
-                        for p in log_entry.metadata.get("files_discovered", []):
-                            if p not in _discovered:
-                                _discovered.append(p)
-
-                belief_state = getattr(context, "belief_state", None)
-                _high_value = []
-                if belief_state:
-                    try:
-                        _high_value = belief_state.to_feedback_dict().get(
-                            "high_value_files", [],
-                        )
-                    except Exception:
-                        pass
-                _useful_count = (
-                    len(_high_value) if _high_value
-                    else (len(context.read_file_ids) if (answer and answer.strip()) else 0)
-                )
-
-                signal = FeedbackSignal(
-                    query=query,
-                    mode="DEEP",
-                    answer_found=bool(answer and answer.strip()),
-                    answer_text=(answer or "")[:2000],
-                    cluster_confidence=(
-                        getattr(cluster, "confidence", 0.0) if cluster else 0.0
-                    ),
-                    react_loops=context.loop_count,
-                    files_read_count=context.total_known_files,
-                    files_useful_count=_useful_count,
-                    total_tokens=context.total_llm_tokens,
-                    latency_sec=elapsed,
-                    keywords_used=list(query_keywords.keys()) if query_keywords else [],
-                    paths_searched=paths,
-                    files_read=list(context.read_file_ids),
-                    files_discovered=_discovered,
-                )
-
-                # Enrich with BA-ReAct belief data
-                if _memory_bridge and belief_state:
-                    try:
-                        _memory_bridge.enrich_feedback(signal, belief_state)
-                    except Exception as _enrich_err:
-                        _loguru_logger.debug(
-                            "[memory] Belief enrichment failed: {}", _enrich_err,
-                        )
-
-                task = asyncio.ensure_future(self._memory.record_feedback(signal))
-                self._pending_feedback.append(task)
-            except Exception as _sig_err:
-                _loguru_logger.debug(
-                    "[memory] Feedback signal construction failed: {}", _sig_err,
-                )
+                _loguru_logger.warning(f"[Phase 5] Persistence task failed: {r}")
 
         await self._logger.success(f"[search] Complete: {context.summary()}")
         return answer, cluster, context
@@ -1748,7 +1344,7 @@ class AgenticSearch(BaseSearch):
     @staticmethod
     def _is_chat_query(query: str) -> bool:
         """Return True for obvious conversational queries (rule-based, no LLM)."""
-        return bool(CHAT_QUERY_RE.match(query.strip()))
+        return bool(_CHAT_QUERY_RE.match(query.strip()))
 
     async def _respond_chat(
         self,
@@ -1763,11 +1359,11 @@ class AgenticSearch(BaseSearch):
         )
         ctx = context or SearchContext()
         messages = [
-            {"role": "system", "content": CHAT_RESPONSE_SYSTEM},
+            {"role": "system", "content": _CHAT_RESPONSE_SYSTEM},
             *(chat_history or []),
             {"role": "user", "content": query},
         ]
-        resp = await self.llm.achat(messages=messages, stream=False, enable_thinking=False)
+        resp = await self.llm.achat(messages=messages, stream=False)
         self.llm_usages.append(resp.usage)
         if resp.usage and isinstance(resp.usage, dict):
             ctx.add_llm_tokens(
@@ -1879,7 +1475,6 @@ class AgenticSearch(BaseSearch):
         resp = await self.llm.achat(
             messages=[{"role": "user", "content": prompt}],
             stream=True,
-            enable_thinking=False,
         )
         self.llm_usages.append(resp.usage)
         return resp.content or ""
@@ -1903,7 +1498,6 @@ class AgenticSearch(BaseSearch):
             resp = await self.llm.achat(
                 messages=[{"role": "user", "content": prompt}],
                 stream=True,
-                enable_thinking=False,
             )
             self.llm_usages.append(resp.usage)
             if resp.content:
@@ -1921,7 +1515,6 @@ class AgenticSearch(BaseSearch):
         resp = await self.llm.achat(
             messages=[{"role": "user", "content": prompt}],
             stream=True,
-            enable_thinking=False,
         )
         self.llm_usages.append(resp.usage)
         return resp.content or ""
@@ -1949,8 +1542,6 @@ class AgenticSearch(BaseSearch):
         enable_dir_scan: bool = False,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
-        enable_thinking: bool = False,
-        enable_cross_lingual: bool = True,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """Greedy search: 2-3 LLM calls, single best file, focused evidence.
 
@@ -1986,7 +1577,6 @@ class AgenticSearch(BaseSearch):
         resp = await self.llm.achat(
             messages=[{"role": "user", "content": prompt}],
             stream=False,
-            enable_thinking=False,
         )
         self.llm_usages.append(resp.usage)
         if resp.usage and isinstance(resp.usage, dict):
@@ -2037,15 +1627,13 @@ class AgenticSearch(BaseSearch):
 
         primary = analysis.get("primary", [])[:2]
         fallback = analysis.get("fallback", [])[:3]
+        primary_alt = analysis.get("primary_alt", [])[:2]
+        fallback_alt = analysis.get("fallback_alt", [])[:3]
 
-        # Cross-lingual keywords (disabled by default for monolingual datasets)
-        if enable_cross_lingual:
-            primary_alt = analysis.get("primary_alt", [])[:2]
-            fallback_alt = analysis.get("fallback_alt", [])[:3]
-            if primary_alt:
-                primary = primary + primary_alt
-            if fallback_alt:
-                fallback = fallback + fallback_alt
+        if primary_alt:
+            primary = primary + primary_alt
+        if fallback_alt:
+            fallback = fallback + fallback_alt
 
         if not primary and not fallback:
             await self._logger.warning("[FAST] No keywords extracted")
@@ -2133,14 +1721,10 @@ class AgenticSearch(BaseSearch):
             user_input=query,
             text_content=evidence,
         )
-        import time as _time
-        _t0 = _time.time()
         answer_resp = await self.llm.achat(
             messages=[{"role": "user", "content": answer_prompt}],
             stream=True,
-            enable_thinking=enable_thinking,
         )
-        await self._logger.info(f"[Timing] FAST answer synthesis: {_time.time()-_t0:.2f}s")
         self.llm_usages.append(answer_resp.usage)
         if answer_resp.usage and isinstance(answer_resp.usage, dict):
             context.add_llm_tokens(
@@ -2165,40 +1749,6 @@ class AgenticSearch(BaseSearch):
             _loguru_logger.warning(
                 f"[FAST] Failed to save cluster with embedding: {exc}"
             )
-
-        # Memory: record feedback signal (fire-and-forget)
-        if self._memory:
-            try:
-                from sirchmunk.memory.schemas import FeedbackSignal
-                _now = datetime.now(timezone.utc)
-                _start = (
-                    context.start_time
-                    if context.start_time.tzinfo
-                    else context.start_time.replace(tzinfo=timezone.utc)
-                )
-                elapsed = max(0.0, (_now - _start).total_seconds())
-                signal = FeedbackSignal(
-                    query=query,
-                    mode="FAST",
-                    answer_found=bool(answer and answer.strip()),
-                    answer_text=(answer or "")[:2000],
-                    files_read_count=len(context.read_file_ids),
-                    files_useful_count=len(
-                        context.read_file_ids
-                    ) if (answer and answer.strip()) else 0,
-                    total_tokens=context.total_llm_tokens,
-                    latency_sec=elapsed,
-                    keywords_used=keywords_used,
-                    paths_searched=paths,
-                    files_read=list(context.read_file_ids),
-                    files_discovered=[file_path] if file_path else [],
-                )
-                task = asyncio.ensure_future(self._memory.record_feedback(signal))
-                self._pending_feedback.append(task)
-            except Exception as _sig_err:
-                _loguru_logger.debug(
-                    "[memory] FAST feedback signal failed: {}", _sig_err,
-                )
 
         await self._logger.success("[FAST] Search complete (2 LLM calls)")
         return answer, cluster, context
@@ -2270,9 +1820,7 @@ class AgenticSearch(BaseSearch):
                 )
             return None
 
-        merged = GrepRetriever.merge_results(
-            all_raw, limit=20, max_files=self.grep_retriever._merge_max_files,
-        )
+        merged = GrepRetriever.merge_results(all_raw, limit=20)
         if not merged:
             return None
 
@@ -2430,71 +1978,42 @@ class AgenticSearch(BaseSearch):
     # ------------------------------------------------------------------
 
     async def _probe_keywords(
-        self, query: str, *, enable_cross_lingual: bool = True,
+        self, query: str,
     ) -> Tuple[Dict[str, float], List[str]]:
         """Extract multi-level keywords from the query via LLM.
 
         Also extracts cross-lingual alternative keywords from the
-        ``<KEYWORDS_ALT>`` block and merges them into the result list
-        when ``enable_cross_lingual`` is True.
-        Falls back to heuristic extraction if LLM output is unparseable.
-
-        Args:
-            query: User query to extract keywords from.
-            enable_cross_lingual: Whether to include translated keywords.
-                Disable for monolingual datasets like HotpotQA.
+        ``<KEYWORDS_ALT>`` block and merges them into the result list.
 
         Returns:
             Tuple of (keyword_idf_dict, keyword_list).
         """
         await self._logger.info("[Probe:Keywords] Extracting keywords...")
+        dynamic_prompt = generate_keyword_extraction_prompt(num_levels=2)
+        keyword_prompt = dynamic_prompt.format(user_input=query)
+        kw_response = await self.llm.achat(
+            messages=[{"role": "user", "content": keyword_prompt}],
+            stream=False,
+        )
+        self.llm_usages.append(kw_response.usage)
 
-        try:
-            dynamic_prompt = generate_keyword_extraction_prompt(num_levels=2)
-            keyword_prompt = dynamic_prompt.format(user_input=query)
-            import time as _time
-            _t0 = _time.time()
-            kw_response = await self.llm.achat(
-                messages=[{"role": "user", "content": keyword_prompt}],
-                stream=False,
-                enable_thinking=False,
-            )
-            await self._logger.info(f"[Timing] Keyword extraction: {_time.time()-_t0:.2f}s")
-            self.llm_usages.append(kw_response.usage)
+        keyword_sets = self._extract_and_validate_multi_level_keywords(
+            kw_response.content, num_levels=2,
+        )
 
-            keyword_sets = self._extract_and_validate_multi_level_keywords(
-                kw_response.content, num_levels=2,
-            )
+        alt_keywords = self._extract_alt_keywords(kw_response.content)
+        if alt_keywords:
+            await self._logger.info(f"[Probe:Keywords] Cross-lingual alt: {list(alt_keywords.keys())}")
 
-            keyword_sets = [
-                {k: v for k, v in ks.items() if not self._is_placeholder(k)}
-                for ks in keyword_sets
-            ]
+        for kw_set in keyword_sets:
+            if kw_set:
+                merged = {**kw_set, **alt_keywords}
+                kw_list = list(merged.keys())
+                await self._logger.info(f"[Probe:Keywords] Extracted: {kw_list}")
+                return merged, kw_list
 
-            # Cross-lingual keywords (disabled for monolingual datasets)
-            alt_keywords: Dict[str, float] = {}
-            if enable_cross_lingual:
-                alt_keywords = self._extract_alt_keywords(kw_response.content)
-                if alt_keywords:
-                    await self._logger.info(f"[Probe:Keywords] Cross-lingual alt: {list(alt_keywords.keys())}")
-
-            for kw_set in keyword_sets:
-                if kw_set:
-                    merged = {**kw_set, **alt_keywords}
-                    kw_list = list(merged.keys())
-                    await self._logger.info(f"[Probe:Keywords] Extracted: {kw_list}")
-                    return merged, kw_list
-
-            if alt_keywords:
-                return alt_keywords, list(alt_keywords.keys())
-        except Exception as exc:
-            await self._logger.info(f"[Phase 1] keywords probe failed: {exc}")
-
-        fallback = self._fallback_query_keywords(query)
-        if fallback:
-            kw_list = list(fallback.keys())
-            await self._logger.info(f"[Probe:Keywords] Heuristic fallback: {kw_list}")
-            return fallback, kw_list
+        if alt_keywords:
+            return alt_keywords, list(alt_keywords.keys())
 
         return {}, []
 
@@ -2621,8 +2140,6 @@ class AgenticSearch(BaseSearch):
         Returns:
             List of file paths from previously cached clusters.
         """
-        if not self.knowledge_storage:
-            return []
         try:
             clusters = await self.knowledge_storage.find(query, limit=3)
             if not clusters:
@@ -2660,7 +2177,10 @@ class AgenticSearch(BaseSearch):
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
     ) -> List[str]:
-        """Run keyword search via rga and return discovered file paths."""
+        """Run keyword search via rga and return discovered file paths.
+
+        Each keyword is searched concurrently (literal per-term strategy).
+        """
         from sirchmunk.agentic.tools import KeywordSearchTool
 
         tool = KeywordSearchTool(
@@ -2670,9 +2190,8 @@ class AgenticSearch(BaseSearch):
             max_results=20,
             include=include,
             exclude=exclude,
-            max_count=self._rga_max_count,
         )
-        ctx = SearchContext()
+        ctx = SearchContext()  # lightweight context for this probe
         result_text, meta = await tool.execute(context=ctx, keywords=keywords)
 
         # Extract discovered file paths from the tool's context logs
@@ -2767,84 +2286,6 @@ class AgenticSearch(BaseSearch):
 
         return merged
 
-    @staticmethod
-    def _bm25_rerank_files(
-        query: str,
-        file_paths: List[str],
-        top_k: int = 10,
-    ) -> Optional[List[str]]:
-        """Use BM25 to rerank candidate files by query relevance.
-
-        Reads first 2000 chars of each file as document representation,
-        scores them against the query using ``BM25Scorer``, and returns
-        the top-k most relevant file paths.  Falls back to None on error
-        (caller should keep the original list).
-        """
-        from sirchmunk.utils.bm25_util import BM25Scorer
-
-        docs: List[str] = []
-        valid_paths: List[str] = []
-        for fp in file_paths:
-            try:
-                text = Path(fp).read_text(encoding="utf-8", errors="ignore")[:2000]
-                if text.strip():
-                    docs.append(text)
-                    valid_paths.append(fp)
-            except Exception:
-                continue
-
-        if len(docs) < 2:
-            return None
-
-        try:
-            scorer = BM25Scorer()
-            k = min(top_k, len(docs))
-            indices = scorer.rerank(query, docs, k)
-            if indices is None:
-                return None
-            reranked = [valid_paths[i] for i in indices if 0 <= i < len(valid_paths)]
-            return reranked if reranked else None
-        except Exception:
-            return None
-
-    # Large-file threshold (chars): files above this size trigger
-    # keyword-guided snippet extraction before Monte Carlo sampling.
-    _SNIPPET_EXTRACTION_THRESHOLD = 30_000
-
-    @staticmethod
-    def _extract_keyword_snippets(
-        file_path: str,
-        keywords: Dict[str, float],
-        max_snippet_chars: int = 20_000,
-    ) -> Optional[str]:
-        """Extract keyword-relevant lines from a large file.
-
-        For wiki-style files (one JSON article per line), only keeps lines
-        that contain at least one keyword.  Returns None when the file is
-        small enough to process whole or when no keyword matches.
-        """
-        try:
-            raw = Path(file_path).read_text(encoding="utf-8", errors="ignore")
-            if len(raw) <= AgenticSearch._SNIPPET_EXTRACTION_THRESHOLD:
-                return None
-
-            kw_lower = [k.lower() for k in keywords]
-            matched_lines = []
-            total_chars = 0
-            for line in raw.splitlines():
-                ll = line.lower()
-                if any(k in ll for k in kw_lower):
-                    matched_lines.append(line)
-                    total_chars += len(line)
-                    if total_chars >= max_snippet_chars:
-                        break
-
-            if not matched_lines:
-                return None
-            return "\n".join(matched_lines)
-        except Exception:
-            return None
-
     async def _build_cluster(
         self,
         query: str,
@@ -2852,140 +2293,39 @@ class AgenticSearch(BaseSearch):
         query_keywords: Dict[str, float],
         top_k_files: int = 5,
         top_k_snippets: int = 5,
-        mces_cache: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Optional[KnowledgeCluster]:
         """Build a KnowledgeCluster via knowledge_base.build().
 
-        For files already processed by Lazy MCES during Phase 2 (cached in
-        ``mces_cache``), the cached evidence is reused directly — skipping
-        redundant re-extraction.  Remaining files go through the standard
-        keyword-snippet pre-filter + MCES pipeline.
+        Constructs the Request wrapper and delegates to the knowledge
+        base for parallel Monte Carlo evidence sampling.
         """
-        import tempfile
-
-        mces_cache = mces_cache or {}
-
         try:
-            # Partition files into cached (from Phase 2 MCES) and uncached
-            cached_evidences: List[EvidenceUnit] = []
-            uncached_paths: List[str] = []
-
-            for fp in file_paths[:top_k_files]:
-                cached = mces_cache.get(fp)
-                if cached:
-                    cached_evidences.append(EvidenceUnit(
-                        doc_id=FileInfo.get_cache_key(fp),
-                        file_or_url=Path(fp),
-                        summary=cached.get("summary", ""),
-                        is_found=cached.get("is_found", False),
-                        snippets=cached.get("snippets", []),
-                        extracted_at=datetime.now(tz=timezone.utc),
-                        conflict_group=[],
-                    ))
-                else:
-                    uncached_paths.append(fp)
-
-            if cached_evidences:
-                await self._logger.info(
-                    f"[Phase 3] Reusing {len(cached_evidences)} cached MCES results, "
-                    f"{len(uncached_paths)} files need fresh extraction"
-                )
-
-            # Process uncached files through the standard pipeline
-            mces_evidences: List[EvidenceUnit] = []
-            if uncached_paths:
-                request = Request(
-                    messages=[
-                        Message(
-                            role="user",
-                            content=[ContentItem(type="text", text=query)],
-                        ),
-                    ],
-                )
-
-                effective_paths: List[str] = []
-                temp_files: List[str] = []
-                for fp in uncached_paths:
-                    snippet_text = self._extract_keyword_snippets(fp, query_keywords)
-                    if snippet_text:
-                        tf = tempfile.NamedTemporaryFile(
-                            mode="w", suffix=".txt", delete=False, encoding="utf-8",
-                        )
-                        tf.write(snippet_text)
-                        tf.close()
-                        effective_paths.append(tf.name)
-                        temp_files.append(tf.name)
-                    else:
-                        effective_paths.append(fp)
-
-                retrieved_infos = [{"path": fp} for fp in effective_paths]
-
-                cluster = await self.knowledge_base.build(
-                    request=request,
-                    retrieved_infos=retrieved_infos,
-                    keywords=query_keywords,
-                    top_k_files=len(uncached_paths),
-                    top_k_snippets=top_k_snippets,
-                    verbose=self.verbose,
-                )
-                self.llm_usages.extend(self.knowledge_base.llm_usages)
-                self.knowledge_base.llm_usages.clear()
-
-                for tf_path in temp_files:
-                    try:
-                        os.remove(tf_path)
-                    except OSError:
-                        pass
-
-                if cluster:
-                    # Restore original paths in evidence units
-                    for ev in (getattr(cluster, "evidences", None) or []):
-                        for orig_fp, eff_fp in zip(uncached_paths, effective_paths):
-                            if str(getattr(ev, "file_or_url", "")) == eff_fp and eff_fp != orig_fp:
-                                ev.file_or_url = Path(orig_fp)
-                                break
-                    mces_evidences = list(cluster.evidences or [])
-
-            # Merge cached + freshly extracted evidence
-            all_evidences = cached_evidences + mces_evidences
-
-            if not all_evidences:
-                return None
-
-            # Build cluster from the merged evidence set
-            all_summaries = [ev.summary for ev in all_evidences if ev.summary]
-            combined_summary = "\n\n".join(all_summaries) if all_summaries else query
-
-            cluster_text = combined_summary or query
-            cluster_id = f"C{hashlib.sha256(cluster_text.encode('utf-8')).hexdigest()[:10]}"
-
-            cluster = KnowledgeCluster(
-                id=cluster_id,
-                name=query[:60],
-                description=[f"Search result for: {query}"],
-                content=combined_summary,
-                scripts=[],
-                resources=[],
-                patterns=[],
-                constraints=[],
-                evidences=all_evidences,
-                confidence=0.5,
-                abstraction_level=AbstractionLevel.TECHNIQUE,
-                landmark_potential=0.5,
-                hotness=0.5,
-                lifecycle=Lifecycle.EMERGING,
-                create_time=datetime.now(tz=timezone.utc),
-                last_modified=datetime.now(tz=timezone.utc),
-                version=1,
-                related_clusters=[],
+            request = Request(
+                messages=[
+                    Message(
+                        role="user",
+                        content=[ContentItem(type="text", text=query)],
+                    ),
+                ],
             )
+            retrieved_infos = [{"path": fp} for fp in file_paths]
 
-            n_ev = len(all_evidences)
-            n_cached = len(cached_evidences)
-            await self._logger.success(
-                f"[Phase 3] KnowledgeCluster built: {cluster.name} "
-                f"({n_ev} evidence units, {n_cached} from cache)"
+            cluster = await self.knowledge_base.build(
+                request=request,
+                retrieved_infos=retrieved_infos,
+                keywords=query_keywords,
+                top_k_files=top_k_files,
+                top_k_snippets=top_k_snippets,
+                verbose=self.verbose,
             )
+            self.llm_usages.extend(self.knowledge_base.llm_usages)
+            self.knowledge_base.llm_usages.clear()
+
+            if cluster:
+                await self._logger.success(
+                    f"[Phase 3] KnowledgeCluster built: {cluster.name} "
+                    f"({len(cluster.evidences)} evidence units)"
+                )
             return cluster
         except Exception as exc:
             await self._logger.warning(f"[Phase 3] knowledge_base.build() failed: {exc}")
@@ -2995,76 +2335,8 @@ class AgenticSearch(BaseSearch):
     # Phase 4: Answer generation
     # ------------------------------------------------------------------
 
-    _EMPTY_EVIDENCE_PATTERNS = re.compile(
-        r"(?i)"
-        r"(?:no\s+(?:data|information|evidence|results?|relevant)\s+found)"
-        r"|(?:no\s+(?:information\s+is\s+)?available)"
-        r"|(?:could\s+not\s+(?:find|determine|identify))"
-        r"|(?:nothing\s+(?:found|relevant))"
-        r"|(?:search\s+returned?\s+no)"
-        r"|(?:no\s+matching)"
-        r"|(?:insufficient\s+(?:data|evidence|information))"
-        # Chinese
-        r"|(?:资料缺失)"
-        r"|(?:未找到)"
-        r"|(?:没有找到)"
-        # French
-        r"|(?:aucun[e]?\s+(?:donn[ée]e|r[ée]ponse|information|r[ée]sultat)\s+trouv[ée])"
-        r"|(?:donn[ée]es?\s+insuffisantes?)"
-        # Spanish
-        r"|(?:datos?\s+insuficientes?)"
-        r"|(?:no\s+se\s+(?:encontr[oó]|hall[oó]))"
-        # German
-        r"|(?:keine\s+(?:daten|ergebnisse|informationen)\s+gefunden)"
-    )
-
-    @classmethod
-    def _is_evidence_meaningful(cls, content: str) -> bool:
-        """Return True only if content has real substance, not just placeholders."""
-        if not content:
-            return False
-        stripped = content.strip()
-        if len(stripped) < 80:
-            return False
-        if cls._EMPTY_EVIDENCE_PATTERNS.search(stripped[:300]):
-            return False
-        return True
-
-    @staticmethod
-    def _assemble_evidence_snippets(cluster: Any) -> str:
-        """Recover usable content from individual evidence summaries/snippets.
-
-        When the overall cluster content assembly fails (e.g. due to JSON
-        parsing errors in LLM scoring), individual evidence units may still
-        contain useful summaries or raw text snippets.  This method gathers
-        those fragments so a summary can be generated without a full
-        ReAct fallback, saving significant latency.
-
-        Returns an empty string if no meaningful content can be recovered.
-        """
-        if not cluster:
-            return ""
-        parts: List[str] = []
-        for ev in (getattr(cluster, "evidences", None) or []):
-            summary = getattr(ev, "summary", "")
-            if summary and len(summary.strip()) > 30:
-                parts.append(summary.strip())
-                continue
-            for snip in (getattr(ev, "snippets", None) or []):
-                text = snip.get("snippet", "") if isinstance(snip, dict) else str(snip)
-                if text and len(text.strip()) > 50:
-                    parts.append(text.strip())
-        if not parts:
-            return ""
-        combined = "\n\n".join(parts)
-        return combined if len(combined) > 100 else ""
-
     async def _summarise_cluster(
-        self,
-        query: str,
-        cluster: KnowledgeCluster,
-        *,
-        enable_thinking: bool = False,
+        self, query: str, cluster: KnowledgeCluster,
     ) -> Tuple[str, bool]:
         """Generate a final answer summary from a KnowledgeCluster.
 
@@ -3085,14 +2357,10 @@ class AgenticSearch(BaseSearch):
         )
 
         await self._logger.info("[Phase 4] Generating search result summary...")
-        import time as _time
-        _t0 = _time.time()
         response = await self.llm.achat(
             messages=[{"role": "user", "content": result_sum_prompt}],
             stream=True,
-            enable_thinking=enable_thinking,
         )
-        await self._logger.info(f"[Timing] Result summary: {_time.time()-_t0:.2f}s")
         self.llm_usages.append(response.usage)
 
         summary, should_save = self._parse_summary_response(response.content)
@@ -3110,15 +2378,11 @@ class AgenticSearch(BaseSearch):
         max_depth: Optional[int] = 5,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
-        enable_thinking: bool = False,
-        memory_prior: Any = None,
     ) -> Tuple[str, SearchContext]:
         """Fall back to ReAct loop when parallel probing yields insufficient evidence.
 
         The ReAct agent receives pre-extracted keywords and cached
         directory context so it doesn't waste turns re-discovering them.
-        When *memory_prior* is provided, the agent's BeliefState is
-        warm-started with cross-session priors from RetrievalMemory.
         """
         from sirchmunk.agentic.react_agent import ReActSearchAgent
 
@@ -3133,9 +2397,6 @@ class AgenticSearch(BaseSearch):
             tool_registry=registry,
             max_loops=max_loops,
             max_token_budget=max_token_budget,
-            enable_thinking=enable_thinking,
-            enable_decomposition=True,
-            memory_prior=memory_prior,
         )
 
         augmented_query = query
@@ -3177,29 +2438,15 @@ class AgenticSearch(BaseSearch):
                         discovered.append(p)
 
         if discovered:
-            mces_cache = getattr(context, "mces_cache", {})
             cluster = await self._build_cluster(
                 query=query,
                 file_paths=discovered,
                 query_keywords=query_keywords,
                 top_k_files=top_k_files,
-                mces_cache=mces_cache,
             )
             if cluster:
                 if not cluster.search_results:
                     cluster.search_results = list(discovered)
-                # When the evidence pipeline failed to find relevant content
-                # (e.g. due to JSON parse errors in scoring) but ReAct already
-                # produced a high-quality answer by reading the same files,
-                # use the ReAct answer as the authoritative cluster content.
-                any_found = any(
-                    getattr(ev, "is_found", False)
-                    for ev in (cluster.evidences or [])
-                )
-                if not any_found and answer and len(answer) > len(cluster.content or ""):
-                    cluster.content = answer
-                    cluster.name = query[:60]
-                    cluster.description = [f"Search result for: {query}"]
                 return cluster
 
         # Fallback: lightweight cluster from answer text

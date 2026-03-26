@@ -67,7 +67,7 @@ Output {num_levels} separate JSON-like dicts within their respective tags, follo
 {output_format_example}
 
 <KEYWORDS_ALT>
-{{{{"translated_keyword1": idf_value, "translated_keyword2": idf_value}}}}
+{{"translated_keyword1": idf_value, "translated_keyword2": idf_value}}
 </KEYWORDS_ALT>
 
 ### User Query:
@@ -211,43 +211,6 @@ Return JSON:
 - reasoning: Short reasoning in the SAME language as the query.
 
 JSON format only.
-"""
-
-
-BATCH_EVALUATE_EVIDENCE_SAMPLES = """
-You are a document retrieval assistant. Evaluate if each text snippet below contains clues to answer the user's question.
-
-### Language Constraint:
-Detect the language of the "Query" and respond in the same language.
-
-### Inputs:
-Query: "{query}"
-{snippets_block}
-
-### Output Format (STRICT - follow exactly):
-You MUST return a valid JSON array with one object per snippet, in the same order as the snippets above.
-Each object MUST have exactly these fields: "id" (integer), "score" (number 0-10), "reasoning" (string).
-
-Example for 3 snippets:
-```json
-[
-  {{"id": 1, "score": 7, "reasoning": "Contains relevant date information"}},
-  {{"id": 2, "score": 3, "reasoning": "Topic unrelated to query"}},
-  {{"id": 3, "score": 9, "reasoning": "Direct answer found"}}
-]
-```
-
-### Score Guidelines:
-- 0-3: Completely irrelevant to the query
-- 4-7: Contains relevant keywords/context but no direct answer
-- 8-10: Contains exact data, facts, or direct answer
-
-### Critical Rules:
-1. Output ONLY the JSON array - no explanations, no markdown formatting, no extra text
-2. The array must contain exactly one object per snippet, in order
-3. All id values must be integers starting from 1
-4. All score values must be numbers between 0 and 10
-5. Do NOT wrap the JSON in markdown code blocks
 """
 
 
