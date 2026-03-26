@@ -284,6 +284,9 @@ export default function HomePage() {
   }, [showSuggestions, showPathDropdown, showModeDropdown]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.nativeEvent.isComposing || e.key === "Process") {
+      return;
+    }
     if (showSuggestions && searchSuggestions.length > 0) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
