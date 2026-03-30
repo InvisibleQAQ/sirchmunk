@@ -222,6 +222,7 @@ class AgenticSearch(BaseSearch):
                     from sirchmunk.memory import RetrievalMemory
                     self._memory = RetrievalMemory(
                         work_path=str(self.work_path),
+                        llm=self.llm,
                         embedding_util=self.embedding_client,
                     )
                     self.grep_retriever.set_memory(self._memory)
@@ -276,16 +277,24 @@ class AgenticSearch(BaseSearch):
                 llm_judge_verdict=llm_judge_verdict,
             )
 
+    async def await_pending_feedback(self) -> None:
+        """Await all pending asynchronous feedback tasks.
+
+        Call before ``inject_evaluation`` to ensure heuristic outcomes
+        are persisted and available for delta correction.
+        """
+        if self._pending_feedback:
+            pending = [t for t in self._pending_feedback if not t.done()]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            self._pending_feedback.clear()
+
     async def flush_memory(self) -> None:
         """Await all pending feedback tasks and flush memory to disk.
 
         Must be called before process exit to guarantee feedback persistence.
         """
-        if self._pending_feedback:
-            done = [t for t in self._pending_feedback if not t.done()]
-            if done:
-                await asyncio.gather(*done, return_exceptions=True)
-            self._pending_feedback.clear()
+        await self.await_pending_feedback()
         if self._memory:
             try:
                 self._memory.close()

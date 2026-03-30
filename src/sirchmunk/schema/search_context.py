@@ -77,6 +77,7 @@ class SearchContext:
     llm_usages: List[Dict[str, Any]] = field(default_factory=list, init=False)
     read_file_ids: Set[str] = field(default_factory=set, init=False)
     discovered_files: Set[str] = field(default_factory=set, init=False)
+    article_titles_seen: Set[str] = field(default_factory=set, init=False)
     retrieval_logs: List[RetrievalLog] = field(default_factory=list, init=False)
     search_history: List[str] = field(default_factory=list, init=False)
     reasoning_texts: List[str] = field(default_factory=list, init=False)
@@ -134,6 +135,12 @@ class SearchContext:
         for p in paths:
             if p:
                 self.discovered_files.add(str(p))
+
+    def add_article_titles(self, titles: List[str]) -> None:
+        """Record wiki article titles actually seen during this session."""
+        for t in titles:
+            if t:
+                self.article_titles_seen.add(t)
 
     @property
     def total_known_files(self) -> int:
@@ -205,6 +212,7 @@ class SearchContext:
             "llm_call_count": len(self.llm_usages),
             "llm_usages": self.llm_usages,
             "read_file_ids": sorted(self.read_file_ids),
+            "article_titles_seen": sorted(self.article_titles_seen),
             "discovered_files_count": len(self.discovered_files),
             "retrieval_logs": [log.to_dict() for log in self.retrieval_logs],
             "search_history": self.search_history,

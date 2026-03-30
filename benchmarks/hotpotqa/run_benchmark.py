@@ -133,28 +133,51 @@ def _pct(v: float) -> str:
 
 
 def _load_checkpoint(path: Path) -> dict:
-    """Load a previous results JSON for checkpoint/resume.
+    """Load a previous results file (JSONL or legacy JSON) for resume.
 
     Returns {qid: result_dict} for all successfully evaluated questions.
     """
     if not path.exists():
         print(f"[resume] Warning: checkpoint file not found: {path}")
         return {}
-    with open(path) as f:
-        data = json.load(f)
-    results_map = {}
-    for r in data:
-        qid = r.get("_id")
-        if qid and not r.get("error"):
-            results_map[qid] = r
+
+    results_map: dict = {}
+    suffix = path.suffix.lower()
+
+    if suffix == ".jsonl":
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                qid = r.get("_id")
+                if qid and not r.get("error"):
+                    results_map[qid] = r
+    else:
+        with open(path) as f:
+            data = json.load(f)
+        for r in data:
+            qid = r.get("_id")
+            if qid and not r.get("error"):
+                results_map[qid] = r
     return results_map
 
 
 def _save_intermediate(results: list, output_dir: Path, tag: str):
-    """Save intermediate results for crash recovery."""
-    path = output_dir / f"checkpoint_{tag}.json"
+    """Save intermediate results as JSONL for crash recovery.
+
+    Strips ``retrieved_titles`` (which can be 10K+ entries) to just the
+    count, since the full list is only needed for the in-memory
+    ``ev_recall`` calculation and is regenerated on re-run.
+    """
+    path = output_dir / f"checkpoint_{tag}.jsonl"
     with open(path, "w") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+        for r in results:
+            compact = dict(r)
+            titles = compact.pop("retrieved_titles", [])
+            compact["retrieved_titles_count"] = len(titles)
+            f.write(json.dumps(compact, ensure_ascii=False) + "\n")
     return path
 
 
@@ -255,7 +278,9 @@ def print_report(metrics, results, total_time, judge_results, gpt_acc, cfg):
         r.get("telemetry", {}).get("loop_count", 0) for r in ok) / n
     avg_files = sum(
         len(r.get("telemetry", {}).get("files_read", [])) for r in ok) / n
-    avg_titles = sum(len(r.get("retrieved_titles", [])) for r in ok) / n
+    avg_titles = sum(
+        r.get("retrieved_titles_count", len(r.get("retrieved_titles", [])))
+        for r in ok) / n
     avg_sp = sum(len(r.get("predicted_sp", [])) for r in ok) / n
     total_llm_calls = sum(
         r.get("telemetry", {}).get("llm_calls", 0) for r in ok)
@@ -425,6 +450,7 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
 
     # --- Evaluation Feedback Injection (closes the memory learning loop) ---
     if searcher and cfg.enable_memory and cfg.enable_eval_feedback:
+        await searcher.await_pending_feedback()
         n_injected = 0
         for ps in metrics.get("per_sample", []):
             try:
@@ -552,11 +578,15 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
         "timestamp": timestamp,
     }
 
-    results_path = cfg.output_dir / f"results_{tag}.json"
+    results_path = cfg.output_dir / f"results_{tag}.jsonl"
     report_path = cfg.output_dir / f"report_{tag}.json"
 
     with open(results_path, "w") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+        for r in results:
+            compact = dict(r)
+            titles = compact.pop("retrieved_titles", [])
+            compact["retrieved_titles_count"] = len(titles)
+            f.write(json.dumps(compact, ensure_ascii=False) + "\n")
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 

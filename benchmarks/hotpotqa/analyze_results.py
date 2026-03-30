@@ -16,9 +16,23 @@ def trunc(s: str, n: int = 60) -> str:
     return (s[:n] + "…") if len(s) > n else s
 
 
-def analyze_file(results_path: Path, samples: list, label: str) -> dict:
+def _load_results(results_path: Path) -> list:
+    """Load results from JSONL or legacy JSON format."""
+    suffix = results_path.suffix.lower()
+    if suffix == ".jsonl":
+        results = []
+        with open(results_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    results.append(json.loads(line))
+        return results
     with open(results_path) as f:
-        results = json.load(f)
+        return json.load(f)
+
+
+def analyze_file(results_path: Path, samples: list, label: str) -> dict:
+    results = _load_results(results_path)
 
     n_total = len(results)
     n_errors = sum(1 for r in results if r.get("error"))

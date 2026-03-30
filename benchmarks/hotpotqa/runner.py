@@ -981,9 +981,8 @@ async def _extract_sp_with_llm(
     _rt = reasoning_texts or []
     context = "\n".join([question, answer] + _ev + _rt)
 
-    # Two-pass optimization: first pass collects all titles (skipping
-    # sentence parsing) for the evidence recall metric, then second
-    # pass only parses sentences for context-relevant articles.
+    # Article-level tracking: only collect titles that are relevant
+    # to the question/answer context (not all titles in all files).
     all_titles, _ = _parse_wiki_articles(files_read, relevant_titles=set())
     context_lower = context.lower()
     relevant = set()
@@ -1002,8 +1001,12 @@ async def _extract_sp_with_llm(
 
     candidates = _select_candidate_articles(articles, context)
 
+    # Article-level tracking: return only context-relevant titles,
+    # falling back to candidate titles if relevance filter was empty.
+    tracked_titles = relevant or set(articles.keys())
+
     if not candidates:
-        return all_titles, [], {}, ""
+        return tracked_titles, [], {}, ""
 
     candidates_text = _format_candidates_for_llm(candidates)
 
@@ -1070,11 +1073,11 @@ async def _extract_sp_with_llm(
                 if title in valid_titles and 0 <= sid < len(candidates[title]):
                     predicted_sp.append([title, sid])
 
-        return all_titles, predicted_sp, candidates, grounded_answer
+        return tracked_titles, predicted_sp, candidates, grounded_answer
 
     except Exception as e:
         logger.warning("SP LLM extraction failed: %s", e)
-        return all_titles, [], candidates, ""
+        return tracked_titles, [], candidates, ""
 
 
 # ---------------------------------------------------------------------------
@@ -1250,22 +1253,13 @@ async def run_single(
                 raw_answer = getattr(result, "answer", "") or str(result)
                 files_read = list(getattr(result, "read_file_ids", None) or set())
 
-                # Supplement from cluster evidences
+                # Supplement from cluster evidences (agent actually used these)
                 cluster = getattr(result, "cluster", None)
                 if cluster:
                     for ev in (getattr(cluster, "evidences", None) or []):
                         fp = str(getattr(ev, "file_or_url", ""))
                         if fp and fp not in files_read:
                             files_read.append(fp)
-
-                # Supplement from keyword search retrieval logs
-                _seen = set(files_read)
-                for log_entry in (getattr(result, "retrieval_logs", None) or []):
-                    meta = getattr(log_entry, "metadata", None) or {}
-                    for p in meta.get("files_discovered", []):
-                        if p and p not in _seen:
-                            files_read.append(p)
-                            _seen.add(p)
 
                 telemetry = {
                     "total_tokens": getattr(result, "total_llm_tokens", 0),

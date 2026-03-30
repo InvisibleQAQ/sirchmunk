@@ -270,7 +270,7 @@ class RetrievalMemory:
         try:
             params = {
                 "mode": signal.mode,
-                "top_k_files": 5,
+                "top_k_files": signal.files_read_count or 5,
                 "max_loops": signal.react_loops,
             }
             self._pattern_memory.record_outcome(

@@ -30,6 +30,7 @@ _RETRYABLE_ERRORS = (
 _DEFAULT_MAX_RETRIES = 3
 _DEFAULT_BASE_DELAY = 1.0   # seconds
 _DEFAULT_MAX_DELAY = 30.0   # seconds
+_DEFAULT_CALL_TIMEOUT = 300.0  # seconds — per-attempt hard timeout
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +180,7 @@ class OpenAIChat:
             max_retries: int = _DEFAULT_MAX_RETRIES,
             retry_base_delay: float = _DEFAULT_BASE_DELAY,
             retry_max_delay: float = _DEFAULT_MAX_DELAY,
+            call_timeout: float = _DEFAULT_CALL_TIMEOUT,
             provider: Optional[str] = None,
             **kwargs,
     ):
@@ -192,6 +194,8 @@ class OpenAIChat:
             max_retries: Maximum retries for transient API errors.
             retry_base_delay: Initial backoff delay in seconds (doubled each retry).
             retry_max_delay: Upper bound on backoff delay in seconds.
+            call_timeout: Per-attempt hard timeout in seconds.  Applies to both
+                sync and async calls.  ``0`` or negative disables the timeout.
             provider: Explicit provider name (e.g. ``"deepseek"``, ``"dashscope"``).
                 Overrides automatic URL-based detection.  Useful when the
                 ``base_url`` points to a proxy / gateway that hides the real
@@ -199,14 +203,16 @@ class OpenAIChat:
             **kwargs: Extra keyword arguments forwarded to the API ``create`` call.
         """
         self.base_url = base_url
-        self._client = OpenAI(api_key=api_key, base_url=base_url)
-        self._async_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        _timeout_kw = {"timeout": call_timeout} if call_timeout and call_timeout > 0 else {}
+        self._client = OpenAI(api_key=api_key, base_url=base_url, **_timeout_kw)
+        self._async_client = AsyncOpenAI(api_key=api_key, base_url=base_url, **_timeout_kw)
 
         self._model = model
         self._kwargs = kwargs
         self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay
         self._retry_max_delay = retry_max_delay
+        self._call_timeout = call_timeout if call_timeout and call_timeout > 0 else None
 
         if provider:
             self._provider = _PROVIDERS.get(provider, _DEFAULT_PROFILE)
@@ -498,7 +504,23 @@ class OpenAIChat:
 
         for attempt in range(self._max_retries + 1):
             try:
-                return await self._do_achat(messages, stream, request_kwargs)
+                coro = self._do_achat(messages, stream, request_kwargs)
+                if self._call_timeout:
+                    return await asyncio.wait_for(coro, timeout=self._call_timeout)
+                return await coro
+            except asyncio.TimeoutError:
+                last_exc = asyncio.TimeoutError(
+                    f"LLM call timed out after {self._call_timeout}s "
+                    f"(attempt {attempt + 1}/{self._max_retries + 1})"
+                )
+                if attempt >= self._max_retries:
+                    raise last_exc
+                delay = self._backoff_delay(attempt)
+                logger.warning(
+                    "[LLM] achat() attempt %d/%d timed out after %.0fs, retrying in %.1fs",
+                    attempt + 1, self._max_retries + 1, self._call_timeout, delay,
+                )
+                await asyncio.sleep(delay)
             except Exception as exc:
                 last_exc = exc
                 if not self._is_retryable(exc) or attempt >= self._max_retries:
