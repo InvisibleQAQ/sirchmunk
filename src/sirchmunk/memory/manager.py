@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import math
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,7 +50,6 @@ from .schemas import (
     SimilarQueryHint,
     StrategyHint,
     compute_params_hash,
-    compute_pattern_id,
     compute_pattern_id_at_level,
 )
 
@@ -294,7 +294,11 @@ class RetrievalMemory:
         with self._feedback_lock:
             self._feedback_count += 1
             count = self._feedback_count
-        confidence = self._compute_confidence(signal)
+        raw_confidence = self._compute_confidence(signal)
+        confidence = self._apply_reward_shaping(signal, raw_confidence)
+
+        # Persist heuristic confidence on the signal for inject_evaluation
+        signal.heuristic_confidence = confidence
 
         # 1. Raw signal storage
         try:
@@ -320,17 +324,20 @@ class RetrievalMemory:
         except Exception as exc:
             logger.debug(f"[memory:dispatch] PatternMemory failed: {exc}")
 
-        # 3. CorpusMemory — entity → path mappings (improved extraction)
+        # 3. CorpusMemory — entity → path mappings (batch)
         try:
             entities = CorpusMemory.extract_entities(signal.keywords_used)
             if entities and signal.files_read:
-                for entity in entities[:20]:
-                    for fp in signal.files_read[:20]:
-                        self._corpus_memory.record_entity_path(
-                            entity, fp,
-                            success=(confidence >= 0.5),
-                            confidence=confidence,
-                        )
+                pairs = [
+                    (entity, fp)
+                    for entity in entities[:20]
+                    for fp in signal.files_read[:20]
+                ]
+                self._corpus_memory.batch_record_entity_paths(
+                    pairs,
+                    success=(confidence >= 0.5),
+                    confidence=confidence,
+                )
         except Exception as exc:
             logger.debug(f"[memory:dispatch] CorpusMemory entity failed: {exc}")
 
@@ -343,13 +350,16 @@ class RetrievalMemory:
             except Exception as exc:
                 logger.debug(f"[memory:dispatch] cooccurrence failed: {exc}")
 
-        # 5. PathMemory — per-path retrieval stats
+        # 5. PathMemory — per-path retrieval stats (batch)
+        #    Track processed paths to avoid double-recording with belief_snapshot
+        path_recorded: set = set()
         try:
             useful_set = set(signal.files_discovered or [])
+            path_useful_map = {}
             for fp in signal.files_read[:50]:
-                self._path_memory.record_retrieval(
-                    fp, useful=(fp in useful_set or confidence >= 0.5),
-                )
+                path_useful_map[fp] = (fp in useful_set or confidence >= 0.5)
+                path_recorded.add(fp)
+            self._path_memory.batch_record_retrievals(path_useful_map)
         except Exception as exc:
             logger.debug(f"[memory:dispatch] PathMemory failed: {exc}")
 
@@ -372,27 +382,28 @@ class RetrievalMemory:
             except Exception as exc:
                 logger.debug(f"[memory:dispatch] PatternMemory chain failed: {exc}")
 
-        # 6. FailureMemory — noise keywords + dead paths + failed strategies
+        # 6. FailureMemory — noise keywords + dead paths + failed strategies (batch)
         try:
             actual_files_found = len(signal.files_discovered or [])
-            for kw in signal.keywords_used[:20]:
-                self._failure_memory.record_keyword_result(
-                    kw, files_found=actual_files_found,
-                    useful=(confidence >= 0.5),
-                )
-            for fp in signal.files_read[:50]:
-                self._failure_memory.record_path_result(
-                    fp, useful=(confidence >= 0.5),
-                )
+            is_useful = confidence >= 0.5
+            self._failure_memory.batch_record_keyword_results(
+                signal.keywords_used[:20], actual_files_found, is_useful,
+            )
+            useful_path_set = set() if not is_useful else set(signal.files_read[:50])
+            self._failure_memory.batch_record_path_results(
+                signal.files_read[:50],
+                useful_path_set if is_useful else set(),
+            )
 
             if confidence < 0.3:
                 features = PatternMemory.classify_query(signal.query)
-                pid = compute_pattern_id(
+                pid = compute_pattern_id_at_level(
                     features["query_type"],
                     features["complexity"],
                     features["entity_types"],
                     entity_count=features.get("entity_count", 0),
                     hop_hint=features.get("hop_hint", "single"),
+                    level=4,
                 )
                 ph = compute_params_hash({"mode": signal.mode})
                 self._failure_memory.record_strategy_failure(pid, ph)
@@ -400,40 +411,46 @@ class RetrievalMemory:
             logger.debug(f"[memory:dispatch] FailureMemory failed: {exc}")
 
         # 6b. BA-ReAct: fine-grained PathMemory from belief snapshot
+        #     Skip paths already recorded in step 5 to avoid double-counting.
         if signal.belief_snapshot:
             try:
-                for fp, belief in list(signal.belief_snapshot.items())[:30]:
-                    self._path_memory.record_retrieval(
-                        fp, useful=(belief >= 0.5),
-                    )
+                belief_map = {
+                    fp: (belief >= 0.5)
+                    for fp, belief in list(signal.belief_snapshot.items())[:30]
+                    if fp not in path_recorded
+                }
+                if belief_map:
+                    self._path_memory.batch_record_retrievals(belief_map)
             except Exception as exc:
                 logger.debug(
                     f"[memory:dispatch] belief→PathMemory failed: {exc}",
                 )
 
-        # 6c. BA-ReAct: dead-path candidates from belief tracking
+        # 6c. BA-ReAct: dead-path candidates from belief tracking (batch)
         if signal.dead_candidates:
             try:
-                for fp in signal.dead_candidates[:20]:
-                    self._failure_memory.record_path_result(
-                        fp, useful=False,
-                    )
+                self._failure_memory.batch_record_path_results(
+                    signal.dead_candidates[:20], set(),
+                )
             except Exception as exc:
                 logger.debug(
                     f"[memory:dispatch] belief→FailureMemory failed: {exc}",
                 )
 
-        # 6d. BA-ReAct: high-value files as entity-path associations
+        # 6d. BA-ReAct: high-value files as entity-path associations (batch)
         if signal.high_value_files and signal.keywords_used:
             try:
                 entities = CorpusMemory.extract_entities(
                     signal.keywords_used,
                 )
-                for entity in entities[:10]:
-                    for fp in signal.high_value_files[:10]:
-                        self._corpus_memory.record_entity_path(
-                            entity, fp, success=True,
-                        )
+                hv_pairs = [
+                    (entity, fp)
+                    for entity in entities[:10]
+                    for fp in signal.high_value_files[:10]
+                ]
+                self._corpus_memory.batch_record_entity_paths(
+                    hv_pairs, success=True,
+                )
             except Exception as exc:
                 logger.debug(
                     f"[memory:dispatch] belief→CorpusMemory failed: {exc}",
@@ -473,44 +490,14 @@ class RetrievalMemory:
                 pass
 
     def _update_sampling_params(self, signal: FeedbackSignal, confidence: float) -> None:
-        """Adapt pattern's search depth params based on convergence signals.
-
-        Connects memory to MCTS by adjusting recommended max_loops based on
-        whether the search converged efficiently or needed more depth.
-        """
-        react_loops = getattr(signal, 'react_loops', None) or 0
-        if react_loops <= 0:
-            return
-
-        features = self._pattern_memory.classify_query(signal.query)
-        pid = compute_pattern_id_at_level(
-            features.get("query_type", "unknown"),
-            features.get("complexity", "moderate"),
-            features.get("entity_types", []),
-            features.get("entity_count", 0),
-            features.get("hop_hint", 1),
-            level=4,
+        """Delegate to PatternMemory's thread-safe public method."""
+        self._pattern_memory.update_sampling_params(
+            query=signal.query,
+            react_loops=getattr(signal, 'react_loops', 0) or 0,
+            convergence=getattr(signal, 'convergence_achieved', False),
+            confidence=confidence,
+            total_tokens=getattr(signal, 'total_tokens', 0) or 0,
         )
-        pattern = self._pattern_memory._patterns.get(pid)
-        if not pattern:
-            return
-
-        current_loops = pattern.optimal_params.get("max_loops", 5)
-        convergence = getattr(signal, 'convergence_achieved', None)
-        total_tokens = getattr(signal, 'total_tokens', 0) or 0
-
-        # Convergence achieved efficiently → reduce depth next time
-        if convergence and confidence >= 0.5:
-            suggested = max(2, min(react_loops + 1, current_loops))
-            pattern.optimal_params["max_loops"] = int(
-                0.3 * suggested + 0.7 * current_loops
-            )
-        # Non-convergence with high token usage → increase search depth
-        elif not convergence and total_tokens > 100000:
-            suggested = min(10, current_loops + 1)
-            pattern.optimal_params["max_loops"] = int(
-                0.3 * suggested + 0.7 * current_loops
-            )
 
     @staticmethod
     def _compute_confidence(signal: FeedbackSignal) -> float:
@@ -567,6 +554,76 @@ class RetrievalMemory:
 
         return base
 
+    # ── Potential-function reward shaping ────────────────────────────
+
+    # Weights for the potential function Φ(s) = w1·coverage + w2·diversity + w3·novelty
+    _RS_W_COVERAGE = 0.05
+    _RS_W_DIVERSITY = 0.03
+    _RS_W_NOVELTY = 0.02
+
+    def _apply_reward_shaping(
+        self,
+        signal: FeedbackSignal,
+        base_confidence: float,
+    ) -> float:
+        """Apply potential-function–based reward shaping (Theorem 7 guarantee).
+
+        Shaped reward = R + γΦ(s') - Φ(s).  Since we observe Φ at a single
+        timestep (before dispatch), we approximate the shaping bonus as the
+        *instantaneous* intrinsic motivation signal rather than a temporal
+        difference.  This preserves the optimal policy (Ng et al., 1999).
+        """
+        bonus = 0.0
+
+        # 1. Coverage bonus — reward visiting under-explored patterns
+        try:
+            stats = self._pattern_memory.get_exploration_stats(signal.query)
+            if stats["pattern_sample_count"] < 3:
+                bonus += self._RS_W_COVERAGE  # new/rare pattern
+            coverage_frac = (
+                stats["explored_count"] / max(stats["total_patterns"], 1)
+            )
+            bonus += self._RS_W_COVERAGE * (1.0 - coverage_frac)
+        except Exception:
+            pass
+
+        # 2. Diversity bonus — entropy of mode distribution in recent feedbacks
+        try:
+            recent = self._feedback_memory.recent_signals(limit=20)
+            if recent:
+                mode_counts: Dict[str, int] = {}
+                for sig in recent:
+                    m = sig.get("mode", "DEEP")
+                    mode_counts[m] = mode_counts.get(m, 0) + 1
+                total = sum(mode_counts.values())
+                if total > 1:
+                    entropy = -sum(
+                        (c / total) * math.log2(c / total)
+                        for c in mode_counts.values() if c > 0
+                    )
+                    max_entropy = math.log2(max(len(mode_counts), 2))
+                    norm_entropy = entropy / max(max_entropy, 1e-9)
+                    bonus += self._RS_W_DIVERSITY * norm_entropy
+        except Exception:
+            pass
+
+        # 3. Novelty bonus — reward queries dissimilar to recent history
+        try:
+            similar = self._query_similarity.find_similar(
+                signal.query, top_k=1, min_similarity=0.0,
+            )
+            if similar:
+                max_sim = similar[0].similarity
+                novelty = 1.0 - max_sim
+            else:
+                novelty = 1.0
+            bonus += self._RS_W_NOVELTY * novelty
+        except Exception:
+            pass
+
+        shaped = max(0.0, min(1.0, base_confidence + bonus))
+        return shaped
+
     # ================================================================
     #  Evaluation injection (for benchmark harnesses)
     # ================================================================
@@ -604,43 +661,19 @@ class RetrievalMemory:
         # The first update happened in _dispatch_feedback with heuristic confidence.
         # Now we apply only the DELTA between ground-truth and heuristic.
         try:
-            features = PatternMemory.classify_query(query)
-            pid = compute_pattern_id_at_level(
-                features["query_type"],
-                features["complexity"],
-                features["entity_types"],
-                entity_count=features.get("entity_count", 0),
-                hop_hint=features.get("hop_hint", 1),
-                level=4,
+            old_heuristic_conf = self._feedback_memory.get_heuristic_confidence(query)
+            if old_heuristic_conf is None:
+                old_heuristic_conf = 0.55  # fallback for legacy signals
+            delta = ground_truth_conf - old_heuristic_conf
+
+            self._pattern_memory.apply_confidence_delta(
+                query, delta, ground_truth_conf, old_heuristic_conf,
             )
-            pattern = self._pattern_memory._patterns.get(pid)
-            if pattern:
-                # Estimate heuristic confidence (answer_found=True typical case)
-                # The original heuristic would have been ~0.5-0.6 for answer_found
-                # We use a conservative estimate since we don't have the exact signal
-                old_heuristic_conf = 0.55  # typical heuristic for answer_found
-                delta = ground_truth_conf - old_heuristic_conf
-                # Apply delta correction to α/β
-                if delta > 0:
-                    pattern.alpha += delta
-                else:
-                    pattern.beta_param += abs(delta)
-                # Update success tracking if ground-truth changes outcome
-                if ground_truth_conf >= 0.5 and old_heuristic_conf < 0.5:
-                    pattern.success_count += 1
-                    pattern.success_rate = (
-                        pattern.success_count / max(pattern.sample_count, 1)
-                    )
-                elif ground_truth_conf < 0.5 and old_heuristic_conf >= 0.5:
-                    pattern.success_count = max(0, pattern.success_count - 1)
-                    pattern.success_rate = (
-                        pattern.success_count / max(pattern.sample_count, 1)
-                    )
-                self._pattern_memory._mark_dirty()
-                logger.debug(
-                    f"[memory:inject] PatternMemory delta correction: "
-                    f"pid={pid[:8]}, delta={delta:.3f}, conf={ground_truth_conf:.3f}"
-                )
+            logger.debug(
+                f"[memory:inject] PatternMemory delta correction: "
+                f"delta={delta:.3f}, gt={ground_truth_conf:.3f}, "
+                f"heuristic={old_heuristic_conf:.3f}"
+            )
         except Exception as exc:
             logger.debug(f"[memory:inject] PatternMemory delta failed: {exc}")
 

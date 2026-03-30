@@ -238,6 +238,68 @@ class CorpusMemory(MemoryStore):
         except Exception as exc:
             logger.debug(f"CorpusMemory: entity_path record failed: {exc}")
 
+    def batch_record_entity_paths(
+        self,
+        entity_path_pairs: List[tuple],
+        success: bool = True,
+        confidence: float = 0.5,
+    ) -> None:
+        """Batch version of ``record_entity_path``.
+
+        Parameters
+        ----------
+        entity_path_pairs :
+            List of ``(entity, path)`` tuples.
+        """
+        if not entity_path_pairs:
+            return
+        entities_lower = [(e.lower(), p) for e, p in entity_path_pairs]
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Bulk-fetch existing rows
+        lookup_keys = list({f"{e}||{p}" for e, p in entities_lower})
+        existing: Dict[str, tuple] = {}
+        try:
+            all_entities = list({e for e, _ in entities_lower})
+            all_paths = list({p for _, p in entities_lower})
+            ep = ", ".join(["?" for _ in all_entities])
+            pp = ", ".join(["?" for _ in all_paths])
+            rows = self._db.fetch_all(
+                f"SELECT entity, path, hit_count, confidence FROM entity_index "
+                f"WHERE entity IN ({ep}) AND path IN ({pp})",
+                all_entities + all_paths,
+            )
+            if rows:
+                for r in rows:
+                    existing[f"{r[0]}||{r[1]}"] = (r[2], r[3])
+        except Exception:
+            pass
+
+        for entity_lower, path in entities_lower:
+            key = f"{entity_lower}||{path}"
+            try:
+                if key in existing:
+                    old_hits, old_conf = existing[key]
+                    delta = 0.05 * confidence if success else -0.05 * (1 - confidence)
+                    new_conf = max(0.0, min(1.0, old_conf + delta))
+                    self._db.execute(
+                        "UPDATE entity_index SET hit_count = ?, confidence = ?, "
+                        "last_hit = ? WHERE entity = ? AND path = ?",
+                        [old_hits + 1, new_conf, now, entity_lower, path],
+                    )
+                else:
+                    init_conf = min(0.8, confidence) if success else max(0.1, confidence * 0.5)
+                    self._db.insert_data("entity_index", {
+                        "entity": entity_lower,
+                        "entity_type": "unknown",
+                        "path": path,
+                        "confidence": init_conf,
+                        "hit_count": 1,
+                        "last_hit": now,
+                    })
+            except Exception:
+                pass
+
     # ── JSON semantic bridge ─────────────────────────────────────────
 
     def _load_bridge(self) -> None:

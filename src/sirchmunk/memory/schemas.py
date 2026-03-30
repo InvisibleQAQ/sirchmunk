@@ -187,6 +187,9 @@ class FeedbackSignal:
     high_value_files: Optional[List[str]] = None
     dead_candidates: Optional[List[str]] = None
 
+    # Computed by manager during dispatch (for inject_evaluation delta correction)
+    heuristic_confidence: Optional[float] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in self.__dict__.items()}
 
@@ -244,7 +247,7 @@ def compute_pattern_id_at_level(
     complexity: str,
     entity_types: list,
     entity_count: int,
-    hop_hint: int,
+    hop_hint: str,
     level: int = 4,
 ) -> str:
     """Compute pattern ID at a specific HMRPL resolution level.

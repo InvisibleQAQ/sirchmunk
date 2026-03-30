@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import os
 import random
-import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -24,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from .base import MemoryStore
+from .query_classifier import classify_query as _classify_query
 from .schemas import (
     QueryPattern,
     ReasoningChain,
@@ -31,35 +31,6 @@ from .schemas import (
     compute_pattern_id,
     compute_pattern_id_at_level,
 )
-
-# Heuristic word sets for lightweight query classification (no LLM needed)
-_COMPARISON_WORDS = frozenset({
-    "which", "both", "difference", "compare", "versus", "vs",
-    "better", "more", "less", "rather", "prefer", "between",
-})
-_FACTUAL_WORDS = frozenset({
-    "when", "where", "who", "what", "how many", "how much",
-})
-_DEFINITION_WORDS = frozenset({
-    "what is", "what are", "define", "definition", "meaning",
-})
-_PROCEDURAL_WORDS = frozenset({
-    "how to", "how do", "steps", "process", "procedure",
-})
-
-# Chinese query classification patterns
-_ZH_COMPARISON_RE = re.compile(r"哪个更|对比|区别|比较|和.+哪个|还是.+好")
-_ZH_FACTUAL_RE = re.compile(r"谁|什么时候|哪里|多少|几个|在哪")
-_ZH_DEFINITION_RE = re.compile(r"什么是|是什么|定义|含义|意思是")
-_ZH_PROCEDURAL_RE = re.compile(r"如何|怎么|怎样|步骤|流程|方法是")
-_ZH_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
-
-# Pre-compiled regex for classify_query entity extraction
-_EN_NAMED_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b")
-_YEAR_RE = re.compile(r"\b\d{4}\b")
-_LOCATION_RE = re.compile(r"\b(?:city|country|state|river|mountain)\b")
-_CJK_LOC_RE = re.compile(r"[\u4e00-\u9fff]{2,}(?:市|省|县|国|河|山|湖)")
-_CJK_TITLE_RE = re.compile(r"《[^》]+》")
 
 # HMRPL: minimum samples required per resolution level for confident predictions
 _MIN_SAMPLES_BY_LEVEL = {4: 3, 3: 3, 2: 2, 1: 2, 0: 1}
@@ -77,7 +48,7 @@ class PatternMemory(MemoryStore):
     _EMA_ALPHA = 0.3
     _SAVE_MIN_INTERVAL = 5.0  # seconds between disk writes
 
-    def __init__(self, base_dir: Path):
+    def __init__(self, base_dir: Path, embedding_util: Any = None):
         self._base_dir = base_dir
         self._patterns_file = base_dir / "query_patterns.json"
         self._chains_file = base_dir / "reasoning_chains.json"
@@ -86,6 +57,8 @@ class PatternMemory(MemoryStore):
         self._lock = threading.RLock()
         self._dirty = False
         self._last_save_time: float = 0.0
+        self._embedding_util = embedding_util
+        self._pattern_embeddings: Dict[str, List[float]] = {}
 
     # ── MemoryStore protocol ──────────────────────────────────────────
 
@@ -219,102 +192,9 @@ class PatternMemory(MemoryStore):
     def classify_query(query: str) -> Dict[str, Any]:
         """Extract lightweight feature vector from a query string.
 
-        Supports both English and Chinese queries.
-
-        Returns dict with ``query_type``, ``complexity``, ``entity_types``,
-        ``entity_count``, and ``hop_hint``.
+        Delegates to :func:`sirchmunk.memory.query_classifier.classify_query`.
         """
-        q_lower = query.lower().strip()
-        words = q_lower.split()
-        has_cjk = bool(_ZH_CJK_RE.search(query))
-
-        # --- Query type ---
-        query_type = "factual"
-        if has_cjk:
-            if _ZH_DEFINITION_RE.search(query):
-                query_type = "definition"
-            elif _ZH_PROCEDURAL_RE.search(query):
-                query_type = "procedural"
-            elif _ZH_COMPARISON_RE.search(query):
-                query_type = "comparison"
-            elif _ZH_FACTUAL_RE.search(query):
-                query_type = "factual"
-            else:
-                query_type = "bridge"
-        else:
-            if any(w in q_lower for w in _DEFINITION_WORDS):
-                query_type = "definition"
-            elif any(w in q_lower for w in _PROCEDURAL_WORDS):
-                query_type = "procedural"
-            elif any(w in words for w in _COMPARISON_WORDS):
-                query_type = "comparison"
-            elif any(w in q_lower for w in _FACTUAL_WORDS):
-                query_type = "factual"
-            else:
-                query_type = "bridge"
-
-        # --- Complexity ---
-        if has_cjk:
-            char_count = len(query.strip())
-            if char_count <= 10:
-                complexity = "simple"
-            elif char_count <= 30:
-                complexity = "moderate"
-            else:
-                complexity = "complex"
-        else:
-            if len(words) <= 6:
-                complexity = "simple"
-            elif len(words) <= 15:
-                complexity = "moderate"
-            else:
-                complexity = "complex"
-
-        # --- Entity types + entity count ---
-        entity_types: List[str] = []
-        entity_count = 0
-
-        en_named = _EN_NAMED_RE.findall(query)
-        if en_named:
-            entity_types.append("named_entity")
-            entity_count += len(en_named)
-
-        year_matches = _YEAR_RE.findall(query)
-        if year_matches:
-            entity_types.append("date")
-            entity_count += len(year_matches)
-
-        if _LOCATION_RE.search(q_lower):
-            entity_types.append("location")
-
-        if has_cjk:
-            cjk_entities = _CJK_LOC_RE.findall(query)
-            if cjk_entities:
-                if "location" not in entity_types:
-                    entity_types.append("location")
-                entity_count += len(cjk_entities)
-            cjk_names = _CJK_TITLE_RE.findall(query)
-            if cjk_names:
-                entity_types.append("title")
-                entity_count += len(cjk_names)
-
-        # Bucket entity_count for stable hashing
-        ec_bucket = min(entity_count, 3)
-
-        # --- Hop hint ---
-        hop_hint = "single"
-        if query_type == "comparison" or entity_count >= 2:
-            hop_hint = "multi"
-        elif query_type == "bridge":
-            hop_hint = "multi" if entity_count >= 1 else "single"
-
-        return {
-            "query_type": query_type,
-            "complexity": complexity,
-            "entity_types": entity_types,
-            "entity_count": ec_bucket,
-            "hop_hint": hop_hint,
-        }
+        return _classify_query(query)
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -372,7 +252,7 @@ class PatternMemory(MemoryStore):
 
         if not pattern:
             # CTS-WT warm transfer for cold-start
-            warm_hint = self._suggest_warm_transfer(features)
+            warm_hint = self._suggest_warm_transfer(features, query=query)
             if warm_hint:
                 return warm_hint
             return None
@@ -451,47 +331,91 @@ class PatternMemory(MemoryStore):
         # Clamp to reasonable bounds
         return max(10000, min(budget, 150000))
 
-    def _find_similar_patterns(self, features: Dict[str, Any], k: int = 5) -> List[Tuple[float, QueryPattern]]:
-        """Find k most similar patterns by heuristic feature similarity.
+    def _find_similar_patterns(
+        self,
+        features: Dict[str, Any],
+        k: int = 5,
+        query_embedding: Optional[List[float]] = None,
+    ) -> List[Tuple[float, QueryPattern]]:
+        """Find k most similar patterns by feature + optional embedding similarity.
 
-        Uses same scoring as _soft_match but returns top-k with lower
-        threshold (0.3 vs 0.6) to enable warm transfer aggregation.
+        When ``query_embedding`` is provided (from ``EmbeddingUtil``), a
+        weighted combination of heuristic feature score (60%) and cosine
+        similarity (40%) is used.  Otherwise falls back to pure heuristic.
         """
         candidates: List[Tuple[float, QueryPattern]] = []
         for pattern in self._patterns.values():
             if pattern.sample_count < 1:
                 continue
-            score = 0.0
-            # Same scoring dimensions as existing _soft_match
+            # Heuristic feature score
+            hscore = 0.0
             if pattern.query_type == features.get("query_type"):
-                score += 0.4
+                hscore += 0.4
             if pattern.complexity == features.get("complexity"):
-                score += 0.2
+                hscore += 0.2
             if pattern.hop_hint == features.get("hop_hint"):
-                score += 0.2
-            # Entity type overlap
+                hscore += 0.2
             pat_types = set(pattern.entity_types or [])
             feat_types = set(features.get("entity_types", []))
             if pat_types and feat_types:
                 overlap = len(pat_types & feat_types) / max(len(pat_types | feat_types), 1)
-                score += 0.2 * overlap
+                hscore += 0.2 * overlap
 
-            if score >= 0.3:  # lower threshold for warm transfer
+            # Embedding cosine similarity (if available)
+            if query_embedding and pattern.pattern_id in self._pattern_embeddings:
+                pat_emb = self._pattern_embeddings[pattern.pattern_id]
+                csim = self._cosine_sim(query_embedding, pat_emb)
+                score = 0.6 * hscore + 0.4 * max(csim, 0.0)
+            else:
+                score = hscore
+
+            if score >= 0.3:
                 candidates.append((score, pattern))
 
-        # Return top-k sorted by score descending
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[:k]
 
-    def _suggest_warm_transfer(self, features: Dict[str, Any]) -> Optional[StrategyHint]:
+    @staticmethod
+    def _cosine_sim(a: List[float], b: List[float]) -> float:
+        dot = sum(x * y for x, y in zip(a, b))
+        na = sum(x * x for x in a) ** 0.5
+        nb = sum(x * x for x in b) ** 0.5
+        if na == 0 or nb == 0:
+            return 0.0
+        return dot / (na * nb)
+
+    def _encode_query(self, query: str) -> Optional[List[float]]:
+        """Encode query text into an embedding vector (returns None if unavailable)."""
+        if self._embedding_util is None:
+            return None
+        try:
+            vec = self._embedding_util.encode(query)
+            if vec is not None:
+                return vec if isinstance(vec, list) else vec.tolist()
+        except Exception:
+            pass
+        return None
+
+    def set_embedding_util(self, embedding_util: Any) -> None:
+        """Inject embedding util after deferred warm-up."""
+        self._embedding_util = embedding_util
+
+    def _suggest_warm_transfer(
+        self,
+        features: Dict[str, Any],
+        query: str = "",
+    ) -> Optional[StrategyHint]:
         """CTS-WT: Warm transfer from similar patterns for cold-start queries.
 
         Aggregates Beta posteriors from k nearest patterns weighted by
-        feature similarity, then samples from the aggregate distribution.
-        Zero LLM cost — uses heuristic feature similarity only.
+        feature similarity (+ optional embedding similarity), then samples
+        from the aggregate distribution.
         """
+        query_embedding = self._encode_query(query) if query else None
         with self._lock:
-            similar = self._find_similar_patterns(features, k=5)
+            similar = self._find_similar_patterns(
+                features, k=5, query_embedding=query_embedding,
+            )
 
         if not similar:
             return None
@@ -640,6 +564,12 @@ class PatternMemory(MemoryStore):
         )
         now = datetime.now(timezone.utc).isoformat()
 
+        # Cache embedding for CTS-WT (non-blocking, best-effort)
+        if pid not in self._pattern_embeddings:
+            emb = self._encode_query(query)
+            if emb is not None:
+                self._pattern_embeddings[pid] = emb
+
         with self._lock:
             pattern = self._patterns.get(pid)
             if not pattern:
@@ -698,8 +628,9 @@ class PatternMemory(MemoryStore):
                         and not ancestor.children_ids):
                     self._try_split_pattern(ancestor, mode, params, now)
 
-                # HMRPL: Auto-merge children if they've converged
-                self._try_merge_children(ancestor)
+                # HMRPL: Auto-merge children (rate-limited to every 10 visits)
+                if ancestor.total_visits % 10 == 0:
+                    self._try_merge_children(ancestor)
 
                 # Link parent-child relationship
                 if ancestor_level == current_level - 1:
@@ -758,7 +689,8 @@ class PatternMemory(MemoryStore):
         """Merge children stats back to parent if they have similar success rates.
 
         Merges when all children exist and have success rates within epsilon.
-        This helps consolidate learning when finer granularity doesn't help.
+        Correctly syncs **all** statistics (sample_count, success_count, α, β)
+        so that derived invariants are maintained.
         """
         if not pattern.children_ids or len(pattern.children_ids) < 2:
             return
@@ -774,17 +706,153 @@ class PatternMemory(MemoryStore):
         rate_range = max(success_rates) - min(success_rates)
 
         if rate_range <= epsilon:
-            # All children have similar success rates; merge by averaging
             total_samples = sum(c.sample_count for c in children)
             total_success = sum(c.success_count for c in children)
             total_alpha = sum(c.alpha for c in children)
             total_beta = sum(c.beta_param for c in children)
+            n = len(children)
 
-            # Update parent with averaged stats (weighted by sample count)
             if total_samples > 0:
+                pattern.sample_count = total_samples
+                pattern.success_count = total_success
                 pattern.success_rate = total_success / total_samples
-                pattern.alpha = total_alpha / len(children)
-                pattern.beta_param = total_beta / len(children)
+                pattern.alpha = total_alpha / n
+                pattern.beta_param = total_beta / n
+                pattern.total_visits = sum(c.total_visits for c in children)
+                pattern.avg_reward = (
+                    sum(c.avg_reward * c.total_visits for c in children)
+                    / max(pattern.total_visits, 1)
+                )
+
+    # ── Public mutation API (lock-safe, for use by RetrievalMemory) ────
+
+    def apply_confidence_delta(
+        self,
+        query: str,
+        delta: float,
+        ground_truth_conf: float,
+        old_heuristic_conf: float,
+    ) -> None:
+        """Apply a delta correction to a pattern's Beta posterior.
+
+        Called by ``inject_evaluation`` when ground-truth replaces the
+        heuristic confidence.  Thread-safe.
+        """
+        features = self.classify_query(query)
+        pid = compute_pattern_id_at_level(
+            features["query_type"],
+            features["complexity"],
+            features["entity_types"],
+            features.get("entity_count", 0),
+            features.get("hop_hint", "single"),
+            level=4,
+        )
+        with self._lock:
+            pattern = self._patterns.get(pid)
+            if not pattern:
+                return
+            if delta > 0:
+                pattern.alpha += delta
+            else:
+                pattern.beta_param += abs(delta)
+            # Correct success tracking if the outcome class flipped
+            if ground_truth_conf >= 0.5 > old_heuristic_conf:
+                pattern.success_count += 1
+                pattern.success_rate = (
+                    pattern.success_count / max(pattern.sample_count, 1)
+                )
+            elif ground_truth_conf < 0.5 <= old_heuristic_conf:
+                pattern.success_count = max(0, pattern.success_count - 1)
+                pattern.success_rate = (
+                    pattern.success_count / max(pattern.sample_count, 1)
+                )
+        self._mark_dirty()
+
+    def update_sampling_params(
+        self,
+        query: str,
+        react_loops: int,
+        convergence: bool,
+        confidence: float,
+        total_tokens: int,
+    ) -> None:
+        """Adapt search depth params based on convergence signals.
+
+        Connects memory to MCTS by adjusting recommended ``max_loops``.
+        Thread-safe (acquires internal lock).
+        """
+        if react_loops <= 0:
+            return
+
+        features = self.classify_query(query)
+        pid = compute_pattern_id_at_level(
+            features.get("query_type", "unknown"),
+            features.get("complexity", "moderate"),
+            features.get("entity_types", []),
+            features.get("entity_count", 0),
+            features.get("hop_hint", "single"),
+            level=4,
+        )
+        with self._lock:
+            pattern = self._patterns.get(pid)
+            if not pattern:
+                return
+            current_loops = pattern.optimal_params.get("max_loops", 5)
+            if convergence and confidence >= 0.5:
+                suggested = max(2, min(react_loops + 1, current_loops))
+                pattern.optimal_params["max_loops"] = int(
+                    0.3 * suggested + 0.7 * current_loops
+                )
+            elif not convergence and total_tokens > 100_000:
+                suggested = min(10, current_loops + 1)
+                pattern.optimal_params["max_loops"] = int(
+                    0.3 * suggested + 0.7 * current_loops
+                )
+        self._mark_dirty()
+
+    def get_exploration_stats(self, query: str) -> Dict[str, Any]:
+        """Return exploration statistics for reward shaping.
+
+        Thread-safe.  Returns dict with ``pattern_sample_count``,
+        ``total_patterns``, and ``explored_count``.
+        """
+        features = self.classify_query(query)
+        pid = compute_pattern_id_at_level(
+            features["query_type"],
+            features["complexity"],
+            features["entity_types"],
+            features.get("entity_count", 0),
+            features.get("hop_hint", "single"),
+            level=4,
+        )
+        with self._lock:
+            pattern = self._patterns.get(pid)
+            total = len(self._patterns)
+            explored = sum(
+                1 for p in self._patterns.values()
+                if p.sample_count >= self._MIN_SAMPLES_FOR_CONFIDENT
+            )
+        return {
+            "pattern_sample_count": pattern.sample_count if pattern else 0,
+            "total_patterns": total,
+            "explored_count": explored,
+        }
+
+    def _chain_pid(self, query: str) -> str:
+        """Compute the canonical pattern ID used for chain lookup/storage.
+
+        Uses ``compute_pattern_id_at_level`` (same as ``record_outcome``) so
+        that chains are co-located with the patterns they belong to.
+        """
+        features = self.classify_query(query)
+        return compute_pattern_id_at_level(
+            features["query_type"],
+            features["complexity"],
+            features["entity_types"],
+            features.get("entity_count", 0),
+            features.get("hop_hint", "single"),
+            level=4,
+        )
 
     def record_chain(
         self,
@@ -793,14 +861,7 @@ class PatternMemory(MemoryStore):
         success: bool,
     ) -> None:
         """Record (or update) a reasoning chain trace."""
-        features = self.classify_query(query)
-        pid = compute_pattern_id(
-            features["query_type"],
-            features["complexity"],
-            features["entity_types"],
-            entity_count=features.get("entity_count", 0),
-            hop_hint=features.get("hop_hint", "single"),
-        )
+        pid = self._chain_pid(query)
         now = datetime.now(timezone.utc).isoformat()
         tid = f"{pid}_chain"
 
@@ -826,14 +887,7 @@ class PatternMemory(MemoryStore):
 
     def get_chain_hint(self, query: str) -> Optional[List[Dict[str, str]]]:
         """Return a reasoning chain template if available and reliable."""
-        features = self.classify_query(query)
-        pid = compute_pattern_id(
-            features["query_type"],
-            features["complexity"],
-            features["entity_types"],
-            entity_count=features.get("entity_count", 0),
-            hop_hint=features.get("hop_hint", "single"),
-        )
+        pid = self._chain_pid(query)
         tid = f"{pid}_chain"
 
         with self._lock:

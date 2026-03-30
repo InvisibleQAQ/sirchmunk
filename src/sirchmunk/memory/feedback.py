@@ -61,6 +61,7 @@ class FeedbackMemory(MemoryStore):
             "em_score": "FLOAT",
             "f1_score": "FLOAT",
             "llm_judge_verdict": "VARCHAR",
+            "heuristic_confidence": "FLOAT",
             "timestamp": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         })
 
@@ -77,6 +78,7 @@ class FeedbackMemory(MemoryStore):
         for col, dtype in [
             ("answer_text", "VARCHAR DEFAULT ''"),
             ("files_discovered_json", "VARCHAR DEFAULT '[]'"),
+            ("heuristic_confidence", "FLOAT"),
         ]:
             if col in existing:
                 continue
@@ -164,6 +166,7 @@ class FeedbackMemory(MemoryStore):
                 "em_score": signal.em_score,
                 "f1_score": signal.f1_score,
                 "llm_judge_verdict": signal.llm_judge_verdict,
+                "heuristic_confidence": signal.heuristic_confidence,
                 "timestamp": signal.timestamp,
             })
         except Exception as exc:
@@ -199,6 +202,24 @@ class FeedbackMemory(MemoryStore):
         except Exception as exc:
             logger.debug(f"FeedbackMemory: inject_evaluation failed: {exc}")
             return False
+
+    def get_heuristic_confidence(self, query: str) -> Optional[float]:
+        """Retrieve the heuristic confidence stored during initial dispatch.
+
+        Returns the heuristic_confidence for the most recent signal matching
+        *query*, or ``None`` if unavailable.
+        """
+        try:
+            row = self._db.fetch_one(
+                "SELECT heuristic_confidence FROM signals "
+                "WHERE query = ? ORDER BY timestamp DESC LIMIT 1",
+                [query],
+            )
+            if row and row[0] is not None:
+                return float(row[0])
+        except Exception:
+            pass
+        return None
 
     def recent_signals(
         self,

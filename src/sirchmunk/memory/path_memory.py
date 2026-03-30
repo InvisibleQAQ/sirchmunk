@@ -194,6 +194,81 @@ class PathMemory(MemoryStore):
         except Exception as exc:
             logger.debug(f"PathMemory: record_retrieval failed: {exc}")
 
+    def batch_record_retrievals(
+        self,
+        path_useful_map: Dict[str, bool],
+    ) -> None:
+        """Batch version of ``record_retrieval`` — one SELECT for all paths.
+
+        Parameters
+        ----------
+        path_useful_map :
+            ``{path: useful}`` mapping for each file to record.
+        """
+        if not path_useful_map:
+            return
+        paths = list(path_useful_map.keys())
+        with self._counter_lock:
+            self._total_queries += len(paths)
+            total_queries = self._total_queries
+        now = datetime.now(timezone.utc).isoformat()
+
+        try:
+            placeholders = ", ".join(["?" for _ in paths])
+            rows = self._db.fetch_all(
+                f"SELECT path, total_retrievals, useful_retrievals, last_useful "
+                f"FROM path_stats WHERE path IN ({placeholders})",
+                paths,
+            )
+            existing = {
+                r[0]: {"total": r[1], "useful": r[2], "last_useful": str(r[3]) if r[3] else None}
+                for r in rows
+            } if rows else {}
+        except Exception:
+            existing = {}
+
+        for fp, useful in path_useful_map.items():
+            try:
+                if fp in existing:
+                    info = existing[fp]
+                    total = info["total"] + 1
+                    useful_count = info["useful"] + (1 if useful else 0)
+                    ratio = useful_count / max(total, 1)
+                    last_useful_for_score = now if useful else info["last_useful"]
+                    score = self._compute_hot_score(
+                        ratio, total, last_useful_for_score,
+                        total_queries=total_queries,
+                    )
+                    update_cols: Dict[str, Any] = {
+                        "total_retrievals": total,
+                        "useful_retrievals": useful_count,
+                        "useful_ratio": ratio,
+                        "hot_score": score,
+                    }
+                    if useful:
+                        update_cols["last_useful"] = now
+                    self._db.update_data(
+                        "path_stats", update_cols, "path = ?", [fp],
+                    )
+                else:
+                    ratio = 1.0 if useful else 0.0
+                    score = self._compute_hot_score(
+                        ratio, 1, now if useful else None,
+                        total_queries=total_queries,
+                    )
+                    self._db.insert_data("path_stats", {
+                        "path": fp,
+                        "total_retrievals": 1,
+                        "useful_retrievals": 1 if useful else 0,
+                        "useful_ratio": ratio,
+                        "avg_file_size": 0.0,
+                        "entity_density": 0.0,
+                        "last_useful": now if useful else None,
+                        "hot_score": score,
+                    })
+            except Exception:
+                pass
+
     @staticmethod
     def _compute_hot_score(
         useful_ratio: float,

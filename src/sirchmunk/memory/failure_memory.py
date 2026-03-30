@@ -340,6 +340,104 @@ class FailureMemory(MemoryStore):
             return "modify"
         return "monitor"
 
+    def batch_record_keyword_results(
+        self,
+        keywords: List[str],
+        files_found: int,
+        useful: bool,
+    ) -> None:
+        """Batch version of ``record_keyword_result`` — one SELECT for all."""
+        if not keywords:
+            return
+        keys = [k.lower() for k in keywords]
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            placeholders = ", ".join(["?" for _ in keys])
+            rows = self._db.fetch_all(
+                f"SELECT keyword, avg_files_found, avg_useful_ratio, sample_count "
+                f"FROM noise_keywords WHERE keyword IN ({placeholders})",
+                keys,
+            )
+            existing = {r[0]: (r[1], r[2], r[3]) for r in rows} if rows else {}
+        except Exception:
+            existing = {}
+
+        alpha = 0.3
+        for key in keys:
+            try:
+                if key in existing:
+                    old_files, old_ratio, old_count = existing[key]
+                    new_count = old_count + 1
+                    new_files = alpha * files_found + (1 - alpha) * old_files
+                    new_ratio = alpha * (1.0 if useful else 0.0) + (1 - alpha) * old_ratio
+                    rec = self._classify_noise(new_ratio, new_count)
+                    self._db.update_data(
+                        "noise_keywords",
+                        {
+                            "avg_files_found": new_files,
+                            "avg_useful_ratio": new_ratio,
+                            "sample_count": new_count,
+                            "recommendation": rec,
+                            "updated_at": now,
+                        },
+                        "keyword = ?", [key],
+                    )
+                else:
+                    ratio = 1.0 if useful else 0.0
+                    self._db.insert_data("noise_keywords", {
+                        "keyword": key,
+                        "avg_files_found": float(files_found),
+                        "avg_useful_ratio": ratio,
+                        "sample_count": 1,
+                        "recommendation": "monitor",
+                        "updated_at": now,
+                    })
+            except Exception:
+                pass
+
+    def batch_record_path_results(
+        self,
+        paths: List[str],
+        useful_set: set,
+    ) -> None:
+        """Batch version of ``record_path_result`` — one SELECT for all."""
+        if not paths:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            placeholders = ", ".join(["?" for _ in paths])
+            rows = self._db.fetch_all(
+                f"SELECT path, times_retrieved, times_useful FROM dead_paths "
+                f"WHERE path IN ({placeholders})",
+                paths,
+            )
+            existing = {r[0]: (r[1], r[2]) for r in rows} if rows else {}
+        except Exception:
+            existing = {}
+
+        for fp in paths:
+            useful = fp in useful_set
+            try:
+                if fp in existing:
+                    self._db.update_data(
+                        "dead_paths",
+                        {
+                            "times_retrieved": existing[fp][0] + 1,
+                            "times_useful": existing[fp][1] + (1 if useful else 0),
+                            "last_checked": now,
+                        },
+                        "path = ?", [fp],
+                    )
+                else:
+                    self._db.insert_data("dead_paths", {
+                        "path": fp,
+                        "times_retrieved": 1,
+                        "times_useful": 1 if useful else 0,
+                        "last_checked": now,
+                    })
+            except Exception:
+                pass
+
     # ── Dead paths ────────────────────────────────────────────────────
 
     def filter_dead_paths(self, paths: List[str]) -> List[str]:
