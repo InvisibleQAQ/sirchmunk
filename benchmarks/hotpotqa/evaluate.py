@@ -322,6 +322,7 @@ def evaluate_predictions(
             "pred": pred,
             "type": q_type,
             "level": q_level,
+            "llm_calls": r.get("telemetry", {}).get("llm_calls", 0),
             **{k: round(v, 4) if isinstance(v, float) else v
                for k, v in row.items()},
         })

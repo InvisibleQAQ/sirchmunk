@@ -21,6 +21,7 @@ collapsing SP precision to near zero.
 """
 
 import asyncio
+import hashlib
 import json as json_mod
 import logging
 import os
@@ -40,6 +41,8 @@ logger = logging.getLogger(__name__)
 # Global index: normalized_title -> list of file paths containing articles with that title
 _WIKI_TITLE_INDEX: Dict[str, List[str]] = {}
 _TITLE_INDEX_BUILT = False
+
+_TITLE_CACHE_FILENAME = ".title_index_cache.json"
 
 
 def _normalize_title(title: str) -> str:
@@ -63,12 +66,76 @@ def _find_corpus_files(wiki_corpus_dir: Path) -> List[Path]:
     return [f for f in wiki_files if f.is_file() and f.suffix not in (".bz2",)]
 
 
-def build_title_index(wiki_corpus_dir: Path, progress_interval: int = 2000) -> int:
+def _compute_corpus_fingerprint(
+    wiki_corpus_dir: Path,
+    corpus_files: List[Path],
+) -> str:
+    """Lightweight fingerprint from file count + directory mtime.
+
+    Avoids scanning every file's content — sufficient for static corpora
+    like HotpotQA wiki dumps where the set of files doesn't change.
+    """
+    n_files = len(corpus_files)
+    try:
+        dir_mtime = wiki_corpus_dir.stat().st_mtime
+    except OSError:
+        dir_mtime = 0
+    sig = f"{n_files}:{dir_mtime}:{wiki_corpus_dir}"
+    return hashlib.md5(sig.encode()).hexdigest()
+
+
+def _try_load_cache(
+    cache_file: Path,
+    fingerprint: str,
+) -> Optional[Dict[str, List[str]]]:
+    """Load the cached title index if it exists and the fingerprint matches."""
+    if not cache_file.exists():
+        return None
+    try:
+        raw = json_mod.loads(cache_file.read_text(encoding="utf-8"))
+        if raw.get("fingerprint") == fingerprint:
+            return raw.get("index", {})
+    except (json_mod.JSONDecodeError, OSError, KeyError):
+        pass
+    return None
+
+
+def _save_cache(
+    cache_file: Path,
+    fingerprint: str,
+    index: Dict[str, List[str]],
+) -> None:
+    """Persist the title index to disk for subsequent runs."""
+    try:
+        tmp = cache_file.with_suffix(".tmp")
+        tmp.write_text(
+            json_mod.dumps(
+                {"fingerprint": fingerprint, "index": index},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(str(tmp), str(cache_file))
+    except OSError as exc:
+        print(f"[TitleIndex] Warning: failed to write cache: {exc}")
+
+
+def build_title_index(
+    wiki_corpus_dir: Path,
+    cache_dir: Optional[Path] = None,
+    progress_interval: int = 2000,
+) -> int:
     """Build title->filepath index from Wikipedia corpus files.
 
-    Scans corpus files (JSONL or HotpotQA wiki_* dumps), parses article
-    titles, and builds a normalised title -> filepath mapping for O(1)
-    lookup.  Called once at startup.
+    On first invocation, scans all corpus files and persists the result
+    to a JSON cache file.  Subsequent runs (even across process restarts)
+    load the cache in < 1 s if the corpus fingerprint has not changed.
+
+    Parameters
+    ----------
+    cache_dir :
+        Directory for the cache file.  Falls back to *wiki_corpus_dir*
+        (or its parent if read-only).
 
     Returns:
         Number of unique titles indexed.
@@ -83,18 +150,37 @@ def build_title_index(wiki_corpus_dir: Path, progress_interval: int = 2000) -> i
         _TITLE_INDEX_BUILT = True
         return 0
 
-    print(f"[TitleIndex] Building title→filepath index from: {wiki_corpus_dir}")
-    start_time = time.time()
-    files_processed = 0
-    titles_indexed = 0
-
     corpus_files = _find_corpus_files(wiki_corpus_dir)
-    print(f"[TitleIndex] Found {len(corpus_files)} corpus files to index")
-
     if not corpus_files:
         print("[TitleIndex] No corpus files found — title_lookup will be unavailable")
         _TITLE_INDEX_BUILT = True
         return 0
+
+    fingerprint = _compute_corpus_fingerprint(wiki_corpus_dir, corpus_files)
+
+    # Resolve cache file location (prefer cache_dir, fall back to corpus dir)
+    _cache_base = cache_dir or wiki_corpus_dir
+    try:
+        _cache_base.mkdir(parents=True, exist_ok=True)
+        cache_file = _cache_base / _TITLE_CACHE_FILENAME
+    except OSError:
+        cache_file = wiki_corpus_dir / _TITLE_CACHE_FILENAME
+
+    # Attempt to load from disk cache
+    cached = _try_load_cache(cache_file, fingerprint)
+    if cached is not None:
+        _WIKI_TITLE_INDEX.update(cached)
+        _TITLE_INDEX_BUILT = True
+        print(f"[TitleIndex] Loaded cached index: {len(_WIKI_TITLE_INDEX)} unique titles "
+              f"({len(corpus_files)} corpus files, cache={cache_file.name})")
+        return len(_WIKI_TITLE_INDEX)
+
+    # Cache miss — full rebuild
+    print(f"[TitleIndex] Building title→filepath index from: {wiki_corpus_dir}")
+    print(f"[TitleIndex] Found {len(corpus_files)} corpus files to index")
+    start_time = time.time()
+    files_processed = 0
+    titles_indexed = 0
 
     for fpath in corpus_files:
         try:
@@ -127,6 +213,9 @@ def build_title_index(wiki_corpus_dir: Path, progress_interval: int = 2000) -> i
     elapsed = time.time() - start_time
     print(f"[TitleIndex] Complete: {len(_WIKI_TITLE_INDEX)} unique titles from "
           f"{files_processed} files in {elapsed:.1f}s")
+
+    _save_cache(cache_file, fingerprint, _WIKI_TITLE_INDEX)
+    print(f"[TitleIndex] Cache saved to: {cache_file}")
 
     _TITLE_INDEX_BUILT = True
     return len(_WIKI_TITLE_INDEX)
@@ -980,8 +1069,8 @@ async def run_batch(
     from sirchmunk.search import AgenticSearch
     from sirchmunk.llm.openai_chat import OpenAIChat
 
-    # Build title→filepath index at startup (one-time cost)
-    build_title_index(cfg.wiki_corpus_dir)
+    # Build title→filepath index at startup (cached across runs)
+    build_title_index(cfg.wiki_corpus_dir, cache_dir=cfg.output_dir)
 
     # Resolve ugrep corpus path: explicit config or fall back to wiki_corpus_dir
     _ugrep_cp = cfg.ugrep_corpus_path or cfg.wiki_corpus_dir

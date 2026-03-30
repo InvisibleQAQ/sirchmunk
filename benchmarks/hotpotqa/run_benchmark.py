@@ -257,11 +257,16 @@ def print_report(metrics, results, total_time, judge_results, gpt_acc, cfg):
         len(r.get("telemetry", {}).get("files_read", [])) for r in ok) / n
     avg_titles = sum(len(r.get("retrieved_titles", [])) for r in ok) / n
     avg_sp = sum(len(r.get("predicted_sp", [])) for r in ok) / n
+    total_llm_calls = sum(
+        r.get("telemetry", {}).get("llm_calls", 0) for r in ok)
+    avg_llm_calls = total_llm_calls / n
 
     print(f"\n  Efficiency")
     print(f"  {'─' * 40}")
     print(f"    Avg latency:         {avg_time:>8.2f} s/query")
     print(f"    Avg tokens:          {avg_tokens:>8.0f} /query")
+    print(f"    Avg LLM calls:       {avg_llm_calls:>8.1f} /query")
+    print(f"    Total LLM calls:     {total_llm_calls:>8d}")
     print(f"    Avg loops (hops):    {avg_loops:>8.1f}")
     print(f"    Avg files read:      {avg_files:>8.1f}")
     print(f"    Avg titles retrieved:{avg_titles:>8.0f}")
@@ -520,6 +525,12 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
             "avg_tokens": round(
                 sum(r.get("telemetry", {}).get("total_tokens", 0)
                     for r in results) / max(len(results), 1)),
+            "avg_llm_calls": round(
+                sum(r.get("telemetry", {}).get("llm_calls", 0)
+                    for r in results) / max(len(results), 1), 1),
+            "total_llm_calls": sum(
+                r.get("telemetry", {}).get("llm_calls", 0)
+                for r in results),
             "avg_loops": round(
                 sum(r.get("telemetry", {}).get("loop_count", 0)
                     for r in results) / max(len(results), 1), 1),
