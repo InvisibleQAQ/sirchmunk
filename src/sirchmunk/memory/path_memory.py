@@ -10,6 +10,7 @@ Backed by the shared ``corpus.duckdb`` (table ``path_stats``).
 from __future__ import annotations
 
 import math
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +29,8 @@ class PathMemory(MemoryStore):
 
     def __init__(self, db: "DuckDBManager"):
         self._db = db
+        self._total_queries: int = 0
+        self._counter_lock = threading.Lock()
 
     # ── MemoryStore protocol ──────────────────────────────────────────
 
@@ -126,6 +129,9 @@ class PathMemory(MemoryStore):
         file_size: float = 0.0,
     ) -> None:
         """Record one retrieval event for *path*."""
+        with self._counter_lock:
+            self._total_queries += 1
+            total_queries = self._total_queries
         now = datetime.now(timezone.utc).isoformat()
         try:
             existing = self._db.fetch_one(
@@ -154,6 +160,7 @@ class PathMemory(MemoryStore):
 
                 score = self._compute_hot_score(
                     ratio, total, last_useful_for_score,
+                    total_queries=total_queries,
                 )
                 update_cols = {
                     "total_retrievals": total,
@@ -172,6 +179,7 @@ class PathMemory(MemoryStore):
                 ratio = 1.0 if useful else 0.0
                 score = self._compute_hot_score(
                     ratio, 1, now if useful else None,
+                    total_queries=total_queries,
                 )
                 self._db.insert_data("path_stats", {
                     "path": path,
@@ -191,8 +199,13 @@ class PathMemory(MemoryStore):
         useful_ratio: float,
         total: int,
         last_useful_iso: Optional[str],
+        total_queries: int = 0,
     ) -> float:
-        """hot_score = useful_ratio × log₂(1 + total) × recency_factor."""
+        """Hot score with UCB exploration bonus.
+
+        Combines exploitation (historical usefulness) with exploration (UCB term)
+        to avoid permanently ignoring under-explored paths.
+        """
         recency = 1.0
         if last_useful_iso:
             try:
@@ -203,4 +216,14 @@ class PathMemory(MemoryStore):
                 recency = max(0.0, 1.0 - days / 90.0)
             except (ValueError, TypeError):
                 pass
-        return useful_ratio * math.log2(1 + total) * recency
+
+        # Exploitation: original formula
+        exploitation = useful_ratio * math.log2(1 + total) * recency
+
+        # UCB exploration bonus
+        if total_queries > 0 and total > 0:
+            exploration = 0.5 * math.sqrt(math.log(total_queries + 1) / total)
+        else:
+            exploration = 0.5  # encourage trying new/unseen paths
+
+        return exploitation + exploration

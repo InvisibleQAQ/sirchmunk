@@ -50,6 +50,7 @@ from .schemas import (
     StrategyHint,
     compute_params_hash,
     compute_pattern_id,
+    compute_pattern_id_at_level,
 )
 
 
@@ -457,13 +458,59 @@ class RetrievalMemory:
         except Exception as exc:
             logger.debug(f"[memory:dispatch] QuerySimilarity failed: {exc}")
 
-        # 8. Periodic maintenance
+        # 8. MCTS-Memory Integration: adapt search depth params based on convergence
+        try:
+            self._update_sampling_params(signal, confidence)
+        except Exception as exc:
+            logger.debug(f"[memory:dispatch] _update_sampling_params failed: {exc}")
+
+        # 9. Periodic maintenance
         if count % self._MAINTENANCE_INTERVAL == 0:
             try:
                 self.decay_all()
                 self.cleanup_all()
             except Exception:
                 pass
+
+    def _update_sampling_params(self, signal: FeedbackSignal, confidence: float) -> None:
+        """Adapt pattern's search depth params based on convergence signals.
+
+        Connects memory to MCTS by adjusting recommended max_loops based on
+        whether the search converged efficiently or needed more depth.
+        """
+        react_loops = getattr(signal, 'react_loops', None) or 0
+        if react_loops <= 0:
+            return
+
+        features = self._pattern_memory.classify_query(signal.query)
+        pid = compute_pattern_id_at_level(
+            features.get("query_type", "unknown"),
+            features.get("complexity", "moderate"),
+            features.get("entity_types", []),
+            features.get("entity_count", 0),
+            features.get("hop_hint", 1),
+            level=4,
+        )
+        pattern = self._pattern_memory._patterns.get(pid)
+        if not pattern:
+            return
+
+        current_loops = pattern.optimal_params.get("max_loops", 5)
+        convergence = getattr(signal, 'convergence_achieved', None)
+        total_tokens = getattr(signal, 'total_tokens', 0) or 0
+
+        # Convergence achieved efficiently → reduce depth next time
+        if convergence and confidence >= 0.5:
+            suggested = max(2, min(react_loops + 1, current_loops))
+            pattern.optimal_params["max_loops"] = int(
+                0.3 * suggested + 0.7 * current_loops
+            )
+        # Non-convergence with high token usage → increase search depth
+        elif not convergence and total_tokens > 100000:
+            suggested = min(10, current_loops + 1)
+            pattern.optimal_params["max_loops"] = int(
+                0.3 * suggested + 0.7 * current_loops
+            )
 
     @staticmethod
     def _compute_confidence(signal: FeedbackSignal) -> float:
@@ -473,32 +520,52 @@ class RetrievalMemory:
         1. Explicit EM/F1 scores (when injected by benchmark evaluation).
         2. LLM judge verdict.
         3. User verdict.
-        4. Heuristic based on ``answer_found`` and ``cluster_confidence``.
+        4. Enhanced heuristic based on multiple signal features.
         """
+        # Priority 1: Explicit EM/F1 scores
         if signal.em_score is not None and signal.f1_score is not None:
-            return 0.5 * signal.em_score + 0.5 * min(signal.f1_score, 1.0)
+            base = 0.5 * signal.em_score + 0.5 * min(signal.f1_score, 1.0)
+        elif signal.f1_score is not None:
+            base = min(signal.f1_score, 1.0)
+        elif signal.em_score is not None:
+            base = float(signal.em_score)
+        # Priority 2: LLM judge verdict
+        elif signal.llm_judge_verdict == "CORRECT":
+            base = 0.9
+        elif signal.llm_judge_verdict == "INCORRECT":
+            base = 0.1
+        # Priority 3: User verdict
+        elif signal.user_verdict == "thumbs_up":
+            base = 0.95
+        elif signal.user_verdict == "thumbs_down":
+            base = 0.05
+        # Priority 4: Enhanced multi-feature heuristic
+        elif signal.answer_found:
+            base = 0.4  # lower base, more room for differentiation
+            # cluster_confidence contribution (continuous)
+            if signal.cluster_confidence is not None and signal.cluster_confidence > 0:
+                base += 0.2 * min(signal.cluster_confidence, 1.0)
+            else:
+                base += 0.1  # default mid-value
+            # Files efficiency: fewer files read = more precise retrieval
+            if signal.files_read_count and signal.files_read_count > 0:
+                file_efficiency = (signal.files_useful_count or 0) / signal.files_read_count
+                base += 0.15 * file_efficiency
+            # Loop efficiency: fewer loops = better strategy
+            if signal.react_loops and signal.react_loops > 0:
+                loop_efficiency = max(0, 1.0 - signal.react_loops / 10)
+                base += 0.1 * loop_efficiency
+            base = min(base, 0.95)
+        else:
+            base = 0.15  # slightly lower default for unfound
 
-        if signal.f1_score is not None:
-            return min(signal.f1_score, 1.0)
-        if signal.em_score is not None:
-            return float(signal.em_score)
+        # Efficiency shaping: bonus for token efficiency
+        if signal.total_tokens and signal.total_tokens > 0:
+            budget_ratio = min(signal.total_tokens / 65000, 2.0)
+            efficiency_bonus = max(0, (1.0 - budget_ratio) * 0.1)  # max ±0.1
+            base = min(1.0, base + efficiency_bonus)
 
-        if signal.llm_judge_verdict == "CORRECT":
-            return 0.9
-        if signal.llm_judge_verdict == "INCORRECT":
-            return 0.1
-        if signal.user_verdict == "thumbs_up":
-            return 0.95
-        if signal.user_verdict == "thumbs_down":
-            return 0.05
-
-        if signal.answer_found:
-            base = 0.5
-            if signal.cluster_confidence > 0:
-                base = max(base, min(signal.cluster_confidence, 0.9))
-            return base
-
-        return 0.2
+        return base
 
     # ================================================================
     #  Evaluation injection (for benchmark harnesses)
@@ -517,8 +584,13 @@ class RetrievalMemory:
         ground-truth evaluation is available.  Propagates the refined
         confidence to **all** relevant memory layers, including the
         ``QuerySimilarityIndex`` (closing the feedback loop).
+
+        NOTE: Does NOT call record_outcome() again to avoid double-counting
+        α/β updates. Instead, applies a delta correction based on the
+        difference between the heuristic confidence (from _dispatch_feedback)
+        and the ground-truth confidence (from EM/F1).
         """
-        conf = 0.5 * em_score + 0.5 * min(f1_score, 1.0)
+        ground_truth_conf = 0.5 * em_score + 0.5 * min(f1_score, 1.0)
 
         # 1. FeedbackMemory: persist raw scores
         try:
@@ -528,36 +600,69 @@ class RetrievalMemory:
         except Exception as exc:
             logger.debug(f"[memory:inject] FeedbackMemory failed: {exc}")
 
-        # 2. PatternMemory: strategy outcome with ground-truth confidence
+        # 2. PatternMemory: apply delta correction instead of full record_outcome
+        # The first update happened in _dispatch_feedback with heuristic confidence.
+        # Now we apply only the DELTA between ground-truth and heuristic.
         try:
-            self._pattern_memory.record_outcome(
-                query=query,
-                confidence=conf,
-                mode="DEEP",
-                params={"max_loops": 5, "top_k_files": 5},
+            features = PatternMemory.classify_query(query)
+            pid = compute_pattern_id_at_level(
+                features["query_type"],
+                features["complexity"],
+                features["entity_types"],
+                entity_count=features.get("entity_count", 0),
+                hop_hint=features.get("hop_hint", 1),
+                level=4,
             )
+            pattern = self._pattern_memory._patterns.get(pid)
+            if pattern:
+                # Estimate heuristic confidence (answer_found=True typical case)
+                # The original heuristic would have been ~0.5-0.6 for answer_found
+                # We use a conservative estimate since we don't have the exact signal
+                old_heuristic_conf = 0.55  # typical heuristic for answer_found
+                delta = ground_truth_conf - old_heuristic_conf
+                # Apply delta correction to α/β
+                if delta > 0:
+                    pattern.alpha += delta
+                else:
+                    pattern.beta_param += abs(delta)
+                # Update success tracking if ground-truth changes outcome
+                if ground_truth_conf >= 0.5 and old_heuristic_conf < 0.5:
+                    pattern.success_count += 1
+                    pattern.success_rate = (
+                        pattern.success_count / max(pattern.sample_count, 1)
+                    )
+                elif ground_truth_conf < 0.5 and old_heuristic_conf >= 0.5:
+                    pattern.success_count = max(0, pattern.success_count - 1)
+                    pattern.success_rate = (
+                        pattern.success_count / max(pattern.sample_count, 1)
+                    )
+                self._pattern_memory._mark_dirty()
+                logger.debug(
+                    f"[memory:inject] PatternMemory delta correction: "
+                    f"pid={pid[:8]}, delta={delta:.3f}, conf={ground_truth_conf:.3f}"
+                )
         except Exception as exc:
-            logger.debug(f"[memory:inject] PatternMemory failed: {exc}")
+            logger.debug(f"[memory:inject] PatternMemory delta failed: {exc}")
 
         # 3. QuerySimilarityIndex: propagate confidence (closes the loop)
         try:
-            updated = self._query_similarity.update_confidence(query, conf)
+            updated = self._query_similarity.update_confidence(query, ground_truth_conf)
             if updated:
                 logger.debug(
                     "[memory:inject] QuerySimilarity confidence "
                     "updated for '{}' → {:.3f}",
-                    query[:50], conf,
+                    query[:50], ground_truth_conf,
                 )
         except Exception as exc:
             logger.debug(f"[memory:inject] QuerySimilarity update failed: {exc}")
 
         # 4. For clearly failed queries, record avoid_files (negative memory)
-        if conf < 0.25:
+        if ground_truth_conf < 0.25:
             try:
                 self._query_similarity.record_avoid_files(query)
                 logger.debug(
                     "[memory:inject] Recorded avoid_files for '{}' (conf={:.3f})",
-                    query[:50], conf,
+                    query[:50], ground_truth_conf,
                 )
             except Exception as exc:
                 logger.debug(f"[memory:inject] avoid_files failed: {exc}")

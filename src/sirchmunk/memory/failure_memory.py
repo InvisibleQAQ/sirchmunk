@@ -31,8 +31,6 @@ class FailureMemory(MemoryStore):
     failed strategy combinations.
     """
 
-    _NOISE_SKIP_THRESHOLD = 0.1
-    _NOISE_MODIFY_THRESHOLD = 0.25
     _NOISE_MIN_SAMPLES = 3
     _DEAD_PATH_MIN_RETRIEVALS = 5
 
@@ -324,11 +322,21 @@ class FailureMemory(MemoryStore):
             return False
 
     def _classify_noise(self, useful_ratio: float, sample_count: int) -> str:
-        if sample_count < self._NOISE_MIN_SAMPLES:
+        """Bayesian noise classification using Beta posterior.
+
+        Uses Beta(1,1) uniform prior, updated with observed useful_ratio.
+        Posterior mean thresholds replace hard cutoffs for smoother decisions.
+        """
+        if sample_count < 1:
             return "monitor"
-        if useful_ratio <= self._NOISE_SKIP_THRESHOLD:
+        # Beta posterior: prior Beta(1,1) + observed data
+        alpha = 1.0 + useful_ratio * sample_count
+        beta_val = 1.0 + (1.0 - useful_ratio) * sample_count
+        posterior_mean = alpha / (alpha + beta_val)
+        # Require at least 2 samples for actionable decisions (down from 3)
+        if sample_count >= 2 and posterior_mean <= 0.1:
             return "skip"
-        if useful_ratio <= self._NOISE_MODIFY_THRESHOLD:
+        if sample_count >= 2 and posterior_mean <= 0.25:
             return "modify"
         return "monitor"
 

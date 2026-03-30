@@ -28,6 +28,8 @@ class StrategyHint:
     keyword_strategy: Optional[str] = None
     confidence: float = 0.0
     source_pattern_id: Optional[str] = None
+    token_budget: Optional[int] = None    # suggested token budget
+    resolution_level: int = 4             # which HMRPL level produced this hint
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -62,6 +64,12 @@ class QueryPattern:
     beta_param: float = 1.0
     created_at: str = ""
     updated_at: str = ""
+    # HMRPL hierarchical fields
+    resolution_level: int = 4          # HMRPL level (0=coarsest, 4=finest)
+    parent_id: Optional[str] = None    # parent pattern for hierarchical tree
+    children_ids: List[str] = field(default_factory=list)  # child pattern IDs
+    avg_reward: float = 0.0            # shaped reward running average
+    total_visits: int = 0              # global visit counter N for UCB
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in self.__dict__.items()}
@@ -229,6 +237,33 @@ def compute_pattern_id(
         sort_keys=True,
     )
     return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def compute_pattern_id_at_level(
+    query_type: str,
+    complexity: str,
+    entity_types: list,
+    entity_count: int,
+    hop_hint: int,
+    level: int = 4,
+) -> str:
+    """Compute pattern ID at a specific HMRPL resolution level.
+    
+    L0=type only, L1=type+complexity, L2=+hop, L3=+entity_count, L4=full (with entity_types).
+    Coarser levels aggregate more patterns for better statistical power.
+    """
+    parts = [query_type]
+    if level >= 1:
+        parts.append(complexity)
+    if level >= 2:
+        parts.append(str(hop_hint))
+    if level >= 3:
+        parts.append(str(entity_count))
+    if level >= 4:
+        sorted_types = sorted(set(entity_types)) if entity_types else []
+        parts.append(",".join(sorted_types) if sorted_types else "none")
+    sig = "|".join(parts)
+    return hashlib.md5(sig.encode()).hexdigest()[:16]
 
 
 def compute_params_hash(params: Dict[str, Any]) -> str:
