@@ -18,16 +18,20 @@
 
 设计遵循**认知科学中的多系统记忆模型**：短期工作记忆（SearchContext）负责单次会话状态，长期记忆（RetrievalMemory）负责跨会话的模式积累和知识沉淀。
 
-长期记忆进一步分为五个职责独立、存储独立的层：
+长期记忆进一步分为四个职责独立、存储独立的层：
 
 ```
 RetrievalMemory/
-├── PatternMemory        查询模式 → 策略映射        (JSON)
-├── CorpusMemory         语料库认知：实体-路径索引    (DuckDB + JSON)
-├── PathMemory           路径热度与效用统计          (DuckDB)
-├── FailureMemory        失败模式：噪声词、死路径     (DuckDB)
-└── FeedbackMemory       反馈信号存储               (DuckDB)
+├── PatternMemory        查询模式 → 策略映射 + Meta-RL 元学习  (JSON)
+├── CorpusMemory         语料库认知：实体-路径索引              (DuckDB + JSON)
+├── FailureMemory        失败模式：噪声词、死路径                (DuckDB)
+└── FeedbackMemory       反馈信号存储                          (DuckDB)
 ```
+
+> **注**：PathMemory（路径热度）和 QuerySimilarityIndex（相似查询迁移）已被移除。
+> 这两层是实例级记忆，会过拟合到具体 case（例如将历史检索的具体文件路径转移到
+> 不相关的新查询中），与 Meta-RL 架构的策略级学习理念冲突。现有的
+> CorpusMemory（实体→路径）和 FailureMemory（死路径）已覆盖必要的语料库级先验。
 
 分层原则：
 
@@ -57,14 +61,7 @@ RetrievalMemory/
 - **语义桥接**（JSON）：`term → [SemanticExpansion(target, relation, confidence)]`，用于关键词自动扩展
 - **扩展策略**：仅当 `confidence ≥ 0.4` 且 `hit_count ≥ 2` 时才激活扩展，权重 = 原始权重 × 置信度 × 0.7
 
-#### 3. PathMemory — 路径热度记忆
-
-**方法论**：对每个文件路径维护"热度分数"，反映其在历史检索中的频率、效用率和新鲜度。在 BM25 重排阶段可作为 boost factor。
-
-- **热度公式**：`hot_score = useful_ratio × log₂(1 + total_retrievals) × recency_factor`
-- **新鲜度因子**：`recency = max(0, 1 - days_since_last_useful / 90)`，90 天无用则衰减到 0
-
-#### 4. FailureMemory — 失败模式记忆
+#### 3. FailureMemory — 失败模式记忆
 
 **方法论**：记住什么不该做——比"记住什么该做"更高效。三个子模块分别追踪噪声关键词、死路径和失败策略组合。
 
@@ -72,7 +69,7 @@ RetrievalMemory/
 - **死路径**：当某路径被检索 ≥ 5 次但从未有用时，从候选集中过滤
 - **失败策略**：`(pattern_id, params_hash) → failure_count`，避免重复尝试已知失败的参数组合
 
-#### 5. FeedbackMemory — 反馈信号存储
+#### 4. FeedbackMemory — 反馈信号存储
 
 **方法论**：作为闭环的"感知层"，收集每次检索的 `FeedbackSignal`（隐式信号如 answer_found、latency、tokens，显式信号如 user_verdict、EM/F1 分数）。本层只负责存储，信号分发由 Manager 负责。
 
@@ -129,11 +126,12 @@ Memory 在 `AgenticSearch.search()` 管线中的介入点：
 {work_path}/memory/
 ├── pattern_memory/
 │   ├── query_patterns.json        # 查询模式 → 策略映射
-│   └── reasoning_chains.json      # 推理链模板
+│   ├── reasoning_chains.json      # 推理链模板
+│   ├── trajectories.json          # Meta-RL 抽象轨迹
+│   └── distillations.json         # LLM 蒸馏策略规则
 ├── semantic_bridge.json           # 语义桥接（同义词/别名扩展）
-├── corpus.duckdb                  # entity_index, path_stats,
-│                                  # noise_keywords, dead_paths,
-│                                  # failed_strategies
+├── corpus.duckdb                  # entity_index, noise_keywords,
+│                                  # dead_paths, failed_strategies
 └── feedback.duckdb                # signals（反馈信号时序表）
 ```
 

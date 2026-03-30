@@ -1313,15 +1313,8 @@ class AgenticSearch(BaseSearch):
                 return ctx
             return msg
 
-        # ---- Memory: strategy hint + similar-query transfer (zero-LLM) ----
-        _memory_extra_files: List[str] = []
-        _memory_extra_keywords: List[str] = []
-        # Strategy changes are high-impact → require strong confidence.
-        # File/keyword hints are supplementary → accept moderate confidence.
+        # ---- Memory: strategy hint (zero-LLM) ----
         _STRATEGY_CONFIDENCE_MIN = 0.7
-        _HINT_CONFIDENCE_MIN = 0.4
-        _MEMORY_MAX_EXTRA_FILES = 5
-        _MEMORY_MAX_EXTRA_KEYWORDS = 8
         if self._memory and mode != "FILENAME_ONLY":
             try:
                 hint = self._memory.suggest_strategy(query)
@@ -1335,38 +1328,17 @@ class AgenticSearch(BaseSearch):
                     if hint.top_k_files is not None:
                         top_k_files = hint.top_k_files
                     if hint.max_loops is not None:
-                        # Only trust max_loops reduction when pattern has fine-grained data
                         if hint.resolution_level is not None and hint.resolution_level <= 1:
-                            # Coarse pattern — don't reduce loops below default
                             max_loops = max(max_loops, hint.max_loops)
                         else:
                             max_loops = hint.max_loops
                     if hint.enable_dir_scan is not None:
                         enable_dir_scan = hint.enable_dir_scan
-                    # Memory-learned token budget — cap resource usage with safety floor
                     if hint.token_budget is not None and hint.token_budget > 0:
                         max_token_budget = max(hint.token_budget, 20000)
                     _loguru_logger.debug(
                         "[memory] strategy hint applied: mode={}, resolution_level={}, token_budget={}",
                         hint.mode, hint.resolution_level, hint.token_budget,
-                    )
-            except Exception:
-                pass
-            try:
-                sim_hints = self._memory.get_similar_query_hints(query, top_k=3)
-                for sh in sim_hints:
-                    if sh.confidence >= _HINT_CONFIDENCE_MIN:
-                        _memory_extra_files.extend(sh.useful_files[:3])
-                        _memory_extra_keywords.extend(sh.keywords[:3])
-                _memory_extra_files = _memory_extra_files[:_MEMORY_MAX_EXTRA_FILES]
-                _memory_extra_keywords = _memory_extra_keywords[:_MEMORY_MAX_EXTRA_KEYWORDS]
-                if sim_hints:
-                    _loguru_logger.info(
-                        "[memory] Similar-query hints: {} hit(s), "
-                        "extra_files={}, extra_kw={}",
-                        len(sim_hints),
-                        len(_memory_extra_files),
-                        len(_memory_extra_keywords),
                     )
             except Exception:
                 pass
@@ -1411,8 +1383,6 @@ class AgenticSearch(BaseSearch):
                 spec_stale_hours=spec_stale_hours,
                 enable_thinking=enable_thinking,
                 enable_cross_lingual=enable_cross_lingual,
-                memory_extra_files=_memory_extra_files,
-                memory_extra_keywords=_memory_extra_keywords,
             )
 
         # ---- Unified return wrapping ----
@@ -1446,8 +1416,6 @@ class AgenticSearch(BaseSearch):
         spec_stale_hours: float = 72.0,
         enable_thinking: bool = False,
         enable_cross_lingual: bool = True,
-        memory_extra_files: Optional[List[str]] = None,
-        memory_extra_keywords: Optional[List[str]] = None,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """ReAct-first iterative retrieval pipeline (Phases 0a–4).
 
@@ -1532,11 +1500,6 @@ class AgenticSearch(BaseSearch):
                     ]
             except Exception:
                 pass
-            # Merge similar-query keywords from memory hints
-            for mk in (memory_extra_keywords or []):
-                if mk and mk not in query_keywords:
-                    query_keywords[mk] = 0.3
-
         await self._logger.info(
             f"[Phase 1] Results: keywords={len(initial_keywords)}, "
             f"dir_scan={'OK' if scan_result else 'N/A'}, "
@@ -1551,28 +1514,51 @@ class AgenticSearch(BaseSearch):
             try:
                 from sirchmunk.memory.bridge import MemoryBridge
                 _memory_bridge = MemoryBridge(self._memory)
-                _candidate_files = list(set(memory_extra_files or []))
                 _memory_prior = _memory_bridge.extract_priors(
                     query=query,
-                    candidate_files=_candidate_files or None,
-                    extra_files=memory_extra_files,
                     extra_keywords=(
                         list(query_keywords.keys()) if query_keywords else None
                     ),
                 )
                 if _memory_prior and not _memory_prior.is_empty:
                     _loguru_logger.info(
-                        "[memory] Prior: files={}, dead={}, avoid={}, "
-                        "chain={}, conf={:.2f}",
-                        len(_memory_prior.path_scores)
-                        + len(_memory_prior.entity_paths)
-                        + len(_memory_prior.similar_query_files)
-                        + len(_memory_prior.extra_files),
+                        "[memory] Prior: entity_paths={}, dead={}, "
+                        "chain={}, strategy_rules={}",
+                        len(_memory_prior.entity_paths),
                         len(_memory_prior.dead_paths),
-                        len(_memory_prior.avoid_files),
                         "yes" if _memory_prior.chain_hint else "no",
-                        _memory_prior.avg_confidence,
+                        len(_memory_prior.strategy_rules),
                     )
+            except Exception:
+                pass
+
+        # ==============================================================
+        # Phase 1.5: Memory-Augmented Planning (MAP)
+        # Generate a search plan from distilled meta-knowledge.
+        # High-confidence plans drive guided execution; lower ones
+        # serve as warm-start hints for the ReAct agent.
+        # ==============================================================
+        _search_plan = None
+        if self._memory:
+            try:
+                _search_plan = await self._memory.plan_search(query)
+                if _search_plan:
+                    _loguru_logger.info(
+                        "[MAP] Plan: conf={:.2f}, steps={}, strategy={}",
+                        _search_plan.confidence,
+                        len(_search_plan.plan_steps),
+                        _search_plan.keyword_strategy,
+                    )
+                    # Inject plan into MemoryPrior for BeliefState access
+                    if _memory_prior is not None:
+                        _memory_prior.search_plan = _search_plan
+                    # Adaptive loop budget from meta-knowledge
+                    learned_budget = self._memory.get_optimal_loop_budget(query)
+                    if learned_budget and learned_budget < max_loops:
+                        max_loops = max(learned_budget, 3)
+                        _loguru_logger.debug(
+                            "[MAP] Adaptive loop budget: %d", max_loops,
+                        )
             except Exception:
                 pass
 
@@ -1592,6 +1578,7 @@ class AgenticSearch(BaseSearch):
             max_depth=max_depth, include=include, exclude=exclude,
             enable_thinking=enable_thinking,
             memory_prior=_memory_prior,
+            search_plan=_search_plan,
         )
 
         # ==============================================================
@@ -1698,6 +1685,25 @@ class AgenticSearch(BaseSearch):
                 _loguru_logger.debug(
                     "[memory] Feedback signal construction failed: {}", _sig_err,
                 )
+
+        # Meta-RL: record abstract trajectory for strategy distillation.
+        # Outcome is heuristic confidence (ground-truth injected later).
+        if self._memory:
+            try:
+                _heuristic_outcome = 0.5
+                if answer and answer.strip():
+                    _heuristic_outcome = 0.6
+                    if cluster and getattr(cluster, "confidence", 0) > 0.5:
+                        _heuristic_outcome = 0.75
+                self._memory.record_trajectory(query, context, _heuristic_outcome)
+            except Exception:
+                pass
+            # Trigger strategy distillation when enough trajectories accumulate
+            try:
+                if self._memory.should_distill(query):
+                    asyncio.ensure_future(self._memory.trigger_distillation(query))
+            except Exception:
+                pass
 
         await self._logger.success(f"[search] Complete: {context.summary()}")
         return answer, cluster, context
@@ -3136,6 +3142,7 @@ class AgenticSearch(BaseSearch):
         exclude: Optional[List[str]] = None,
         enable_thinking: bool = False,
         memory_prior: Any = None,
+        search_plan: Any = None,
     ) -> Tuple[str, SearchContext]:
         """Fall back to ReAct loop when parallel probing yields insufficient evidence.
 
@@ -3143,6 +3150,8 @@ class AgenticSearch(BaseSearch):
         directory context so it doesn't waste turns re-discovering them.
         When *memory_prior* is provided, the agent's BeliefState is
         warm-started with cross-session priors from RetrievalMemory.
+        When *search_plan* is provided, the agent may use guided
+        execution (high confidence) or inject the plan as a hint.
         """
         from sirchmunk.agentic.react_agent import ReActSearchAgent
 
@@ -3160,6 +3169,7 @@ class AgenticSearch(BaseSearch):
             enable_thinking=enable_thinking,
             enable_decomposition=True,
             memory_prior=memory_prior,
+            search_plan=search_plan,
         )
 
         augmented_query = query

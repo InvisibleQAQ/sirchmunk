@@ -1,18 +1,19 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """RetrievalMemory — unified orchestrator for all memory layers.
 
-Creates, initialises, and coordinates the five memory stores plus the
-optional ``QuerySimilarityIndex``.  Provides a high-level API consumed
-by :class:`AgenticSearch`:
+Creates, initialises, and coordinates the memory stores.  Provides a
+high-level API consumed by :class:`AgenticSearch`:
 
 *  **Lookup** (sync, ~0 ms): ``suggest_strategy``, ``expand_keywords``,
    ``get_entity_paths``, ``filter_noise_keywords``, ``filter_dead_paths``,
-   ``get_path_scores``, ``get_chain_hint``, ``get_similar_query_hints``.
+   ``get_chain_hint``.
 *  **Record** (async): ``record_feedback`` — stores the raw signal in
    ``FeedbackMemory`` then dispatches incremental updates to the other
    layers using a *gradient confidence* (0-1) instead of binary success.
 *  **Inject** (sync): ``inject_evaluation`` — back-fills EM/F1 scores
    and re-dispatches gradient updates.
+*  **Meta-RL** (async): ``plan_search``, ``record_trajectory``,
+   ``trigger_distillation`` — strategy-level learning.
 *  **Maintenance** (sync): ``decay_all``, ``cleanup_all``, ``stats``.
 
 Storage layout::
@@ -20,9 +21,10 @@ Storage layout::
     {work_path}/memory/
     ├── pattern_memory/
     │   ├── query_patterns.json
-    │   └── reasoning_chains.json
+    │   ├── reasoning_chains.json
+    │   ├── trajectories.json      (Meta-RL abstract trajectories)
+    │   └── distillations.json     (LLM-distilled strategy rules)
     ├── semantic_bridge.json
-    ├── query_similarity.json
     ├── corpus.duckdb
     └── feedback.duckdb
 """
@@ -32,7 +34,6 @@ import atexit
 import asyncio
 import math
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -42,12 +43,13 @@ from .base import MemoryStore
 from .corpus_memory import CorpusMemory
 from .failure_memory import FailureMemory
 from .feedback import FeedbackMemory
-from .path_memory import PathMemory
 from .pattern_memory import PatternMemory
-from .query_similarity import QuerySimilarityIndex
 from .schemas import (
+    AbstractTrajectory,
+    AbstractTrajectoryStep,
     FeedbackSignal,
-    SimilarQueryHint,
+    SearchPlan,
+    StrategyDistillation,
     StrategyHint,
     compute_params_hash,
     compute_pattern_id_at_level,
@@ -60,15 +62,6 @@ class RetrievalMemory:
     Designed for graceful degradation: if any individual store fails to
     initialise, the others still function.  All lookup methods return
     safe defaults on error so the search pipeline is never blocked.
-
-    Parameters
-    ----------
-    embedding_util : optional
-        ``EmbeddingUtil`` instance for query-similarity embeddings.
-        When ``None``, ``QuerySimilarityIndex`` falls back to BM25.
-    tokenizer : optional
-        ``TokenizerUtil`` instance for BM25 tokenisation inside the
-        similarity index.
     """
 
     _MAINTENANCE_INTERVAL = 50
@@ -86,8 +79,6 @@ class RetrievalMemory:
         self._memory_dir = self._work_path / "memory"
         self._memory_dir.mkdir(parents=True, exist_ok=True)
         self._llm = llm
-        self._embedding_util = embedding_util
-        self._tokenizer = tokenizer
 
         # ── Create backing stores ─────────────────────────────────────
         from sirchmunk.storage.duckdb import DuckDBManager
@@ -110,19 +101,12 @@ class RetrievalMemory:
             db=self._corpus_db,
             bridge_file=self._memory_dir / "semantic_bridge.json",
         )
-        self._path_memory = PathMemory(db=self._corpus_db)
         self._failure_memory = FailureMemory(db=self._corpus_db)
         self._feedback_memory = FeedbackMemory(db=self._feedback_db)
-        self._query_similarity = QuerySimilarityIndex(
-            index_file=self._memory_dir / "query_similarity.json",
-            embedding_util=embedding_util,
-            tokenizer=tokenizer,
-        )
 
         self._stores: List[MemoryStore] = [
             self._pattern_memory,
             self._corpus_memory,
-            self._path_memory,
             self._failure_memory,
             self._feedback_memory,
         ]
@@ -148,7 +132,19 @@ class RetrievalMemory:
 
         self._feedback_count = 0
         self._feedback_lock = threading.Lock()
-        self._belief_cache: Dict[str, Dict[str, float]] = {}
+
+        # Meta-RL: planner + distiller (require LLM)
+        self._planner = None
+        self._distiller = None
+        self._trajectory_counter = 0
+        if llm is not None:
+            try:
+                from .planner import MemoryAugmentedPlanner
+                from .strategy_distiller import StrategyDistiller
+                self._planner = MemoryAugmentedPlanner(llm)
+                self._distiller = StrategyDistiller(llm)
+            except Exception as exc:
+                logger.debug(f"RetrievalMemory: MAP/distiller init skipped: {exc}")
 
         # ── Register atexit to flush dirty state ──────────────────────
         atexit.register(self._atexit_flush)
@@ -164,22 +160,6 @@ class RetrievalMemory:
             self._pattern_memory.close()
         except Exception:
             pass
-        try:
-            self._query_similarity.close()
-        except Exception:
-            pass
-
-    # ── Embedding util setter (for deferred warm-up) ──────────────────
-
-    def set_embedding_util(self, embedding_util: Any) -> None:
-        """Inject embedding util after background warm-up completes."""
-        self._embedding_util = embedding_util
-        self._query_similarity._embedding_util = embedding_util
-
-    def set_tokenizer(self, tokenizer: Any) -> None:
-        """Inject tokenizer after background warm-up completes."""
-        self._tokenizer = tokenizer
-        self._query_similarity._tokenizer = tokenizer
 
     # ================================================================
     #  Lookup API  (sync, called on the hot path)
@@ -223,13 +203,6 @@ class RetrievalMemory:
         except Exception:
             return paths
 
-    def get_path_scores(self, paths: List[str]) -> Dict[str, float]:
-        """PathMemory → hot_score per path for rerank boosting."""
-        try:
-            return self._path_memory.get_path_scores(paths)
-        except Exception:
-            return {}
-
     def get_chain_hint(
         self,
         query: str,
@@ -239,20 +212,6 @@ class RetrievalMemory:
             return self._pattern_memory.get_chain_hint(query)
         except Exception:
             return None
-
-    def get_similar_query_hints(
-        self,
-        query: str,
-        top_k: int = 3,
-        min_similarity: float = 0.45,
-    ) -> List[SimilarQueryHint]:
-        """QuerySimilarityIndex → hints from similar historical queries."""
-        try:
-            return self._query_similarity.find_similar(
-                query, top_k=top_k, min_similarity=min_similarity,
-            )
-        except Exception:
-            return []
 
     def extract_entities(self, keywords: List[str]) -> List[str]:
         """Delegate to CorpusMemory's improved entity extractor."""
@@ -351,20 +310,7 @@ class RetrievalMemory:
             except Exception as exc:
                 logger.debug(f"[memory:dispatch] cooccurrence failed: {exc}")
 
-        # 5. PathMemory — per-path retrieval stats (batch)
-        #    Track processed paths to avoid double-recording with belief_snapshot
-        path_recorded: set = set()
-        try:
-            useful_set = set(signal.files_discovered or [])
-            path_useful_map = {}
-            for fp in signal.files_read[:50]:
-                path_useful_map[fp] = (fp in useful_set or confidence >= 0.5)
-                path_recorded.add(fp)
-            self._path_memory.batch_record_retrievals(path_useful_map)
-        except Exception as exc:
-            logger.debug(f"[memory:dispatch] PathMemory failed: {exc}")
-
-        # 5b. PatternMemory — reasoning chain (abstracted trace)
+        # 5. PatternMemory — reasoning chain (abstracted trace)
         if confidence >= 0.5 and signal.files_read and signal.keywords_used:
             try:
                 steps: List[Dict[str, str]] = []
@@ -411,27 +357,7 @@ class RetrievalMemory:
         except Exception as exc:
             logger.debug(f"[memory:dispatch] FailureMemory failed: {exc}")
 
-        # Cache belief_snapshot for later use by inject_evaluation → record_avoid_files
-        if signal.belief_snapshot:
-            self._belief_cache[signal.query] = dict(signal.belief_snapshot)
-
-        # 6b. BA-ReAct: fine-grained PathMemory from belief snapshot
-        #     Skip paths already recorded in step 5 to avoid double-counting.
-        if signal.belief_snapshot:
-            try:
-                belief_map = {
-                    fp: (belief >= 0.5)
-                    for fp, belief in list(signal.belief_snapshot.items())[:30]
-                    if fp not in path_recorded
-                }
-                if belief_map:
-                    self._path_memory.batch_record_retrievals(belief_map)
-            except Exception as exc:
-                logger.debug(
-                    f"[memory:dispatch] belief→PathMemory failed: {exc}",
-                )
-
-        # 6c. BA-ReAct: dead-path candidates from belief tracking (batch)
+        # 6b. BA-ReAct: dead-path candidates from belief tracking (batch)
         if signal.dead_candidates:
             try:
                 self._failure_memory.batch_record_path_results(
@@ -461,27 +387,7 @@ class RetrievalMemory:
                     f"[memory:dispatch] belief→CorpusMemory failed: {exc}",
                 )
 
-        # 7. QuerySimilarityIndex — record for future similarity lookup
-        # Prefer high_value_files (belief-confirmed useful), then discovered, then read
-        _useful = (
-            signal.high_value_files
-            or signal.files_discovered
-            or signal.files_read
-            or []
-        )
-        try:
-            self._query_similarity.record(
-                query=signal.query,
-                confidence=confidence,
-                mode=signal.mode,
-                keywords=signal.keywords_used,
-                useful_files=_useful,
-                answer_snippet=(signal.answer_text or "")[:300],
-            )
-        except Exception as exc:
-            logger.debug(f"[memory:dispatch] QuerySimilarity failed: {exc}")
-
-        # 8. MCTS-Memory Integration: adapt search depth params based on convergence
+        # 7. MCTS-Memory Integration: adapt search depth params based on convergence
         try:
             self._update_sampling_params(signal, confidence)
         except Exception as exc:
@@ -562,10 +468,9 @@ class RetrievalMemory:
 
     # ── Potential-function reward shaping ────────────────────────────
 
-    # Weights for the potential function Φ(s) = w1·coverage + w2·diversity + w3·novelty
+    # Weights for the potential function Φ(s) = w1·coverage + w2·diversity
     _RS_W_COVERAGE = 0.05
     _RS_W_DIVERSITY = 0.03
-    _RS_W_NOVELTY = 0.02
 
     def _apply_reward_shaping(
         self,
@@ -613,20 +518,6 @@ class RetrievalMemory:
         except Exception:
             pass
 
-        # 3. Novelty bonus — reward queries dissimilar to recent history
-        try:
-            similar = self._query_similarity.find_similar(
-                signal.query, top_k=1, min_similarity=0.0,
-            )
-            if similar:
-                max_sim = similar[0].similarity
-                novelty = 1.0 - max_sim
-            else:
-                novelty = 1.0
-            bonus += self._RS_W_NOVELTY * novelty
-        except Exception:
-            pass
-
         shaped = max(0.0, min(1.0, base_confidence + bonus))
         return shaped
 
@@ -644,9 +535,8 @@ class RetrievalMemory:
         """Back-fill EM/F1 on the most recent signal and re-dispatch.
 
         Called by benchmark harnesses *after* the search completes and
-        ground-truth evaluation is available.  Propagates the refined
-        confidence to **all** relevant memory layers, including the
-        ``QuerySimilarityIndex`` (closing the feedback loop).
+        ground-truth evaluation is available.  Applies a delta correction
+        to PatternMemory (closing the feedback loop).
 
         NOTE: Does NOT call record_outcome() again to avoid double-counting
         α/β updates. Instead, applies a delta correction based on the
@@ -683,32 +573,145 @@ class RetrievalMemory:
         except Exception as exc:
             logger.debug(f"[memory:inject] PatternMemory delta failed: {exc}")
 
-        # 3. QuerySimilarityIndex: propagate confidence (closes the loop)
-        try:
-            updated = self._query_similarity.update_confidence(query, ground_truth_conf)
-            if updated:
-                logger.debug(
-                    "[memory:inject] QuerySimilarity confidence "
-                    "updated for '{}' → {:.3f}",
-                    query[:50], ground_truth_conf,
-                )
-        except Exception as exc:
-            logger.debug(f"[memory:inject] QuerySimilarity update failed: {exc}")
 
-        # 4. For clearly failed queries, selectively record avoid_files
-        #    Pass belief_snapshot so only low-belief files are blacklisted
-        if ground_truth_conf < 0.25:
-            try:
-                belief_snapshot = self._belief_cache.pop(query, None)
-                self._query_similarity.record_avoid_files(
-                    query, belief_snapshot=belief_snapshot,
+    # ================================================================
+    #  Meta-RL API: planning, trajectory recording, distillation
+    # ================================================================
+
+    async def plan_search(self, query: str) -> Optional[SearchPlan]:
+        """Generate a search plan via the Memory-Augmented Planner.
+
+        Requires an LLM to be configured.  Returns None on cold start
+        (no distilled rules available) or when the planner is unavailable.
+        """
+        if self._planner is None:
+            return None
+        try:
+            mk = self._pattern_memory.get_meta_knowledge(query)
+            plan = await self._planner.plan(query, mk)
+            if plan:
+                logger.info(
+                    "[MAP] Plan generated: conf=%.2f, steps=%d, strategy=%s",
+                    plan.confidence, len(plan.plan_steps), plan.keyword_strategy,
                 )
-                logger.debug(
-                    "[memory:inject] Recorded avoid_files for '{}' (conf={:.3f})",
-                    query[:50], ground_truth_conf,
+            return plan
+        except Exception as exc:
+            logger.debug(f"[MAP] plan_search failed: {exc}")
+            return None
+
+    def get_meta_knowledge(self, query: str) -> Dict[str, Any]:
+        """Expose PatternMemory meta-knowledge for external consumers."""
+        try:
+            return self._pattern_memory.get_meta_knowledge(query)
+        except Exception:
+            return {}
+
+    def record_trajectory(
+        self,
+        query: str,
+        context: Any,
+        outcome: float,
+    ) -> None:
+        """Abstract a SearchContext into a strategy-level trajectory.
+
+        Strips instance-specific data (file paths, keywords, answers)
+        and stores only the strategy-level action sequence.  Increments
+        the trajectory counter and may trigger distillation.
+
+        Parameters
+        ----------
+        query : str
+            The search query.
+        context : SearchContext
+            The completed search context with logs and metadata.
+        outcome : float
+            Evaluation score (0-1), e.g. EM or heuristic confidence.
+        """
+        features = PatternMemory.classify_query(query)
+        steps: List[AbstractTrajectoryStep] = []
+        for log in getattr(context, "retrieval_logs", []):
+            step = AbstractTrajectoryStep(
+                action=log.tool_name,
+                strategy=log.metadata.get("strategy", "unknown"),
+                result_type=log.metadata.get("result_type", "unknown"),
+                files_found=len(log.metadata.get("files_discovered", [])),
+            )
+            steps.append(step)
+
+        trajectory = AbstractTrajectory(
+            query_type=features["query_type"],
+            complexity=features["complexity"],
+            hop_hint=features.get("hop_hint", "single"),
+            entity_count=features.get("entity_count", 0),
+            answer_format=features.get("answer_format", "entity"),
+            steps=steps,
+            loops_used=getattr(context, "loop_count", 0),
+            total_tokens=getattr(context, "total_llm_tokens", 0),
+            outcome=outcome,
+        )
+
+        try:
+            self._pattern_memory.store_trajectory(trajectory)
+        except Exception as exc:
+            logger.debug(f"[memory] store_trajectory failed: {exc}")
+
+        # Record loop outcome for Bayesian loop budget learning
+        try:
+            self._pattern_memory.record_loop_outcome(
+                query,
+                loops_used=trajectory.loops_used,
+                success=(outcome >= 0.5),
+            )
+        except Exception:
+            pass
+
+        self._trajectory_counter += 1
+
+    def should_distill(self, query: str) -> bool:
+        """Check whether enough new trajectories warrant a distillation."""
+        features = PatternMemory.classify_query(query)
+        try:
+            pending = self._pattern_memory.pending_trajectory_count(
+                features["query_type"], features["complexity"],
+            )
+            return pending >= self._pattern_memory.distillation_batch_size
+        except Exception:
+            return False
+
+    async def trigger_distillation(self, query: str) -> Optional[StrategyDistillation]:
+        """Run LLM-powered strategy distillation for the query type.
+
+        Aggregates recent trajectories for the query's type + complexity,
+        sends them to the distiller, and stores the result in PatternMemory.
+        """
+        if self._distiller is None:
+            return None
+        features = PatternMemory.classify_query(query)
+        qt = features["query_type"]
+        cx = features["complexity"]
+        try:
+            trajectories = self._pattern_memory.get_recent_trajectories(qt, cx)
+            if len(trajectories) < 3:
+                return None
+            distill = await self._distiller.distill(trajectories, qt, cx)
+            if distill:
+                self._pattern_memory.store_distillation(distill)
+                logger.info(
+                    "[distill] %d rules + %d warnings for %s/%s (n=%d)",
+                    len(distill.rules), len(distill.failure_warnings),
+                    qt, cx, distill.sample_count,
                 )
-            except Exception as exc:
-                logger.debug(f"[memory:inject] avoid_files failed: {exc}")
+            return distill
+        except Exception as exc:
+            logger.debug(f"[distill] trigger_distillation failed: {exc}")
+            return None
+
+    def get_optimal_loop_budget(self, query: str) -> Optional[int]:
+        """Return the learned optimal loop budget for this query type."""
+        try:
+            return self._pattern_memory.get_optimal_loop_budget(query)
+        except Exception:
+            return None
 
     # ================================================================
     #  Maintenance API
@@ -744,10 +747,6 @@ class RetrievalMemory:
                 combined[store.name] = store.stats()
             except Exception:
                 combined[store.name] = {"error": "unavailable"}
-        try:
-            combined["QuerySimilarity"] = self._query_similarity.stats()
-        except Exception:
-            combined["QuerySimilarity"] = {"error": "unavailable"}
         return combined
 
     def close(self) -> None:
@@ -757,10 +756,6 @@ class RetrievalMemory:
                 store.close()
             except Exception:
                 pass
-        try:
-            self._query_similarity.close()
-        except Exception:
-            pass
         for db in (self._corpus_db, self._feedback_db):
             try:
                 db.close()

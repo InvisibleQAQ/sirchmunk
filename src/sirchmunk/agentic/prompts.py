@@ -105,6 +105,63 @@ Output ONLY valid JSON (no extra text):
 """
 
 
+MAP_PLANNING_PROMPT = """\
+You are a search strategy planner.  Given a query and meta-knowledge \
+distilled from past searches, generate an optimal retrieval plan.
+
+Query: {query}
+
+Query features — type: {query_type}, complexity: {complexity}, \
+entity_count: {entity_count}, hop_hint: {hop_hint}
+
+Strategy rules (learned):
+{strategy_rules}
+
+Failure warnings:
+{failure_warnings}
+
+Statistical priors — success_rate: {success_rate:.0%}, \
+avg_loops: {avg_loops:.1f}, avg_tokens: {avg_tokens:.0f}
+
+Output ONLY valid JSON (no extra text):
+{{"plan_steps": ["step1", "step2", ...], \
+"keyword_strategy": "direct|bridge_first|parallel_entities|decompose_compound|broad_then_narrow", \
+"expected_hops": <int 1-5>, \
+"confidence": <float 0.0-1.0>, \
+"warnings": ["w1", ...], \
+"reasoning_type": "simple|bridge|comparison|multi_constraint", \
+"answer_format": "entity|yes_no|number|date|description"}}
+
+Rules:
+- Each plan_step is a concrete search action, e.g. "keyword_search for [entity]".
+- Confidence reflects how well the learned rules match this specific query.
+- 2-5 steps for simple queries, 3-7 for complex/bridge queries.
+"""
+
+
+STRATEGY_DISTILLATION_PROMPT = """\
+Analyze these {n_trajectories} search trajectories for queries of type \
+"{query_type}" (complexity: {complexity}).  Extract GENERALIZABLE strategy \
+rules — no instance-specific answers, entities, or file paths.
+
+Trajectories:
+{trajectories_text}
+
+Output ONLY valid JSON (no extra text):
+{{"rules": ["rule1", ...], \
+"failure_warnings": ["warning1", ...], \
+"best_keyword_strategy": \
+"direct|bridge_first|parallel_entities|decompose_compound|broad_then_narrow", \
+"avg_loops": <float>, \
+"success_rate": <float 0.0-1.0>}}
+
+Rules:
+- Focus on STRATEGY patterns (e.g. "Search bridge entity first for X-of-Y").
+- Include failure warnings (e.g. "Broad keywords without entity names fail").
+- Max 10 rules, max 5 warnings.  Keep each concise and actionable.
+"""
+
+
 DIR_SCAN_ANALYSIS_PROMPT = """You are a document triage specialist. Analyze the directory scan results below and identify the most relevant files for answering the user's query.
 
 ## User Query

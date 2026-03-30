@@ -132,6 +132,9 @@ class ReActSearchAgent:
         log_callback: Optional async logging callback.
     """
 
+    _GUIDED_CONFIDENCE_THRESHOLD = 0.7
+    _GUIDED_EVIDENCE_TRUNCATION = 4000
+
     def __init__(
         self,
         llm: OpenAIChat,
@@ -143,6 +146,7 @@ class ReActSearchAgent:
         enable_decomposition: bool = True,
         enable_belief_tracking: bool = True,
         memory_prior: Any = None,
+        search_plan: Any = None,
     ) -> None:
         self.llm = llm
         self.registry = tool_registry
@@ -152,6 +156,7 @@ class ReActSearchAgent:
         self.enable_decomposition = enable_decomposition
         self.enable_belief_tracking = enable_belief_tracking
         self._memory_prior = memory_prior
+        self._search_plan = search_plan
         self._logger = create_logger(log_callback=log_callback, enable_async=True)
 
     # ---- Public API ----
@@ -185,6 +190,18 @@ class ReActSearchAgent:
                 belief.warm_start(self._memory_prior)
             context.belief_state = belief
 
+        # MAP guided execution: when a high-confidence plan is available,
+        # execute plan steps as direct tool calls then synthesize once.
+        plan = self._search_plan
+        if (
+            plan is not None
+            and getattr(plan, "confidence", 0) >= self._GUIDED_CONFIDENCE_THRESHOLD
+            and getattr(plan, "plan_steps", None)
+        ):
+            guided_result = await self._try_guided_execution(query, context, plan)
+            if guided_result is not None:
+                return guided_result, context
+
         # Build tool descriptions for the system prompt
         tool_descriptions = _build_tool_descriptions(self.registry)
 
@@ -198,6 +215,13 @@ class ReActSearchAgent:
         user_message = self._build_user_message(query, images)
         if decomposition_hint:
             user_message += f"\n\n{decomposition_hint}"
+
+        # Inject MAP plan as a low-confidence hint (plan didn't meet
+        # guided-execution threshold but still provides useful guidance)
+        if plan is not None and getattr(plan, "plan_steps", None):
+            plan_hint = self._format_plan_hint(plan)
+            if plan_hint:
+                user_message += f"\n\n{plan_hint}"
 
         messages: List[Dict[str, Any]] = [
             {
@@ -592,6 +616,158 @@ class ReActSearchAgent:
             title = meta.get("title", "")
             if paths and title:
                 belief.update_from_search([title])
+
+    async def _try_guided_execution(
+        self,
+        query: str,
+        context: SearchContext,
+        plan: Any,
+    ) -> Optional[str]:
+        """Execute a high-confidence MAP plan as direct tool calls.
+
+        Bypasses per-step LLM reasoning — tool calls are issued
+        programmatically from plan_steps.  A single LLM call at the
+        end synthesizes the answer from all collected evidence.
+
+        Returns the answer string on success, or None to fall back to
+        full ReAct.
+        """
+        await self._logger.info(
+            f"[ReAct:Guided] Executing MAP plan (conf={plan.confidence:.2f}, "
+            f"steps={len(plan.plan_steps)})"
+        )
+        tool_names = self.registry.tool_names
+        evidence_parts: List[str] = []
+
+        for i, step_desc in enumerate(plan.plan_steps[:self.max_loops], 1):
+            context.increment_loop()
+            tool_name, tool_args = self._parse_plan_step(step_desc, tool_names)
+            if tool_name is None:
+                await self._logger.info(f"[ReAct:Guided] Step {i} unparseable, skipping: {step_desc[:80]}")
+                continue
+
+            await self._logger.info(
+                f"[ReAct:Guided] Step {i}/{len(plan.plan_steps)}: "
+                f"{tool_name}({json.dumps(tool_args, ensure_ascii=False)[:120]})"
+            )
+
+            try:
+                result_text, meta = await self.registry.execute(
+                    tool_name=tool_name, context=context, **tool_args,
+                )
+                self._update_beliefs(context, tool_name, meta)
+            except Exception as exc:
+                await self._logger.warning(f"[ReAct:Guided] Step {i} failed: {exc}")
+                continue
+
+            if result_text and "No results" not in result_text:
+                truncated = result_text[:self._GUIDED_EVIDENCE_TRUNCATION]
+                evidence_parts.append(
+                    f"[Step {i}: {tool_name}]\n{truncated}"
+                )
+
+        if not evidence_parts:
+            await self._logger.warning("[ReAct:Guided] No evidence collected, falling back to full ReAct")
+            return None
+
+        # Single LLM call for answer synthesis
+        synthesis_prompt = (
+            f"Based on the following evidence, answer the question: {query}\n\n"
+            + "\n\n".join(evidence_parts)
+            + "\n\nProvide your answer in <ANSWER>...</ANSWER> tags."
+        )
+        try:
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": synthesis_prompt}],
+                stream=False,
+            )
+            content = resp.content or ""
+            usage = resp.usage or {}
+            total_tok = usage.get("total_tokens", 0)
+            if total_tok == 0:
+                total_tok = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+            context.add_llm_tokens(total_tok, usage=usage if usage else None)
+            context.add_reasoning(content)
+
+            answer = _extract_answer(content)
+            if answer:
+                await self._logger.success(
+                    f"[ReAct:Guided] Answer synthesized from {len(evidence_parts)} evidence blocks"
+                )
+                return answer
+
+            await self._logger.warning("[ReAct:Guided] Synthesis produced no answer, falling back")
+            return None
+        except Exception as exc:
+            await self._logger.warning(f"[ReAct:Guided] Synthesis LLM call failed: {exc}")
+            return None
+
+    @staticmethod
+    def _parse_plan_step(
+        step_desc: str,
+        available_tools: List[str],
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Parse a natural-language plan step into a tool call.
+
+        Heuristically maps step descriptions to tool calls:
+        - "Search/keyword_search for X" → keyword_search(keywords=[X])
+        - "Read file about X" → file_read(keywords=[X])
+        - "Look up title X" → title_lookup(title=X)
+        """
+        step_lower = step_desc.lower()
+
+        quoted = re.findall(r'["\']([^"\']+)["\']', step_desc)
+        bracketed = re.findall(r'\[([^\]]+)\]', step_desc)
+        entities = quoted or bracketed
+
+        if not entities:
+            words = step_desc.split()
+            keywords_start = None
+            for trigger in ("for", "about", "on", "regarding"):
+                if trigger in words:
+                    idx = words.index(trigger)
+                    keywords_start = idx + 1
+                    break
+            if keywords_start and keywords_start < len(words):
+                entities = [" ".join(words[keywords_start:keywords_start + 4])]
+
+        if not entities:
+            return None, {}
+
+        if ("title_lookup" in available_tools
+                and any(k in step_lower for k in ("title lookup", "title_lookup", "look up title"))):
+            return "title_lookup", {"title": entities[0]}
+
+        if "keyword_search" in available_tools and any(
+            k in step_lower for k in ("search", "keyword", "find")
+        ):
+            return "keyword_search", {"keywords": entities[:3]}
+
+        if "file_read" in available_tools and any(
+            k in step_lower for k in ("read", "extract", "examine")
+        ):
+            return "file_read", {"keywords": entities[:2]}
+
+        if "keyword_search" in available_tools:
+            return "keyword_search", {"keywords": entities[:3]}
+
+        return None, {}
+
+    @staticmethod
+    def _format_plan_hint(plan: Any) -> str:
+        """Format a MAP plan as a text hint for the ReAct system prompt."""
+        steps = getattr(plan, "plan_steps", [])
+        if not steps:
+            return ""
+        lines = [f"[Memory-augmented plan — confidence {plan.confidence:.0%}]"]
+        for i, s in enumerate(steps[:5], 1):
+            lines.append(f"  {i}. {s}")
+        warnings = getattr(plan, "warnings", [])
+        if warnings:
+            lines.append("Warnings:")
+            for w in warnings[:3]:
+                lines.append(f"  ⚠ {w}")
+        return "\n".join(lines)
 
     @staticmethod
     def _prune_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

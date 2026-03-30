@@ -28,9 +28,12 @@ Design notes
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from .schemas import SearchPlan
 
 
 # ------------------------------------------------------------------
@@ -43,10 +46,12 @@ class MemoryPrior:
 
     All fields default to empty so callers can safely access any attribute
     without ``None`` checks.
-    """
 
-    path_scores: Dict[str, float] = field(default_factory=dict)
-    """PathMemory hot_scores — files historically useful for similar queries."""
+    Only strategy-level and corpus-level priors are retained.  Instance-
+    level priors (file hotness, similar-query files) were removed because
+    they overfit to specific past queries and conflict with the Meta-RL
+    architecture that learns generalizable strategies.
+    """
 
     entity_paths: Dict[str, float] = field(default_factory=dict)
     """CorpusMemory entity→file confidence scores."""
@@ -54,31 +59,23 @@ class MemoryPrior:
     dead_paths: Set[str] = field(default_factory=set)
     """FailureMemory-confirmed persistently useless file paths."""
 
-    similar_query_files: Dict[str, float] = field(default_factory=dict)
-    """Files that proved useful for semantically similar past queries."""
-
     chain_hint: Optional[List[Dict[str, str]]] = None
     """PatternMemory reasoning-chain template (e.g. search→read→compare)."""
 
-    extra_files: Dict[str, float] = field(default_factory=dict)
-    """Explicitly transferred file paths from similar-query memory hints."""
+    search_plan: Optional["SearchPlan"] = None
+    """MAP-generated search plan (when meta-knowledge is available)."""
 
-    avoid_files: Set[str] = field(default_factory=set)
-    """Files that led to incorrect answers in past sessions."""
-
-    avg_confidence: float = 0.0
-    """Weighted average confidence across all memory sources (0-1)."""
+    strategy_rules: List[str] = field(default_factory=list)
+    """Distilled strategy rules relevant to this query type."""
 
     @property
     def is_empty(self) -> bool:
         return (
-            not self.path_scores
-            and not self.entity_paths
+            not self.entity_paths
             and not self.dead_paths
-            and not self.similar_query_files
             and self.chain_hint is None
-            and not self.extra_files
-            and not self.avoid_files
+            and self.search_plan is None
+            and not self.strategy_rules
         )
 
 
@@ -103,33 +100,28 @@ class MemoryBridge:
         query: str,
         *,
         candidate_files: Optional[List[str]] = None,
-        extra_files: Optional[List[str]] = None,
         extra_keywords: Optional[List[str]] = None,
     ) -> MemoryPrior:
         """Query all memory layers and build a warm-start prior.
+
+        Only strategy-level and corpus-level priors are extracted.
+        Instance-level priors (file hotness, similar-query files) are
+        intentionally excluded — the Meta-RL MAP planner provides
+        superior guidance at the strategy level.
 
         Parameters
         ----------
         query : str
             The user's search query.
         candidate_files : list[str], optional
-            File paths discovered so far (e.g. from dir_scan).
-        extra_files : list[str], optional
-            Explicitly suggested files from similar-query memory hints.
+            File paths discovered so far (for dead-path filtering).
         extra_keywords : list[str], optional
             Keywords extracted from the query (used for entity extraction).
         """
         prior = MemoryPrior()
         mem = self._memory
 
-        # 1. PathMemory: historical file hotness
-        if candidate_files:
-            try:
-                prior.path_scores = mem.get_path_scores(candidate_files)
-            except Exception:
-                pass
-
-        # 2. CorpusMemory: entity → file path index
+        # 1. CorpusMemory: entity → file path index
         try:
             entities = mem.extract_entities(extra_keywords or [])
             if entities:
@@ -139,7 +131,7 @@ class MemoryBridge:
         except Exception:
             pass
 
-        # 3. FailureMemory: dead paths
+        # 2. FailureMemory: dead paths
         if candidate_files:
             try:
                 alive = mem.filter_dead_paths(candidate_files)
@@ -147,56 +139,27 @@ class MemoryBridge:
             except Exception:
                 pass
 
-        # 4. QuerySimilarityIndex: transfer from similar historical queries
-        _hint_confidences: list = []
-        try:
-            hints = mem.get_similar_query_hints(query, top_k=3)
-            for hint in hints:
-                _hint_confidences.append(hint.confidence)
-                if hint.confidence >= 0.4:
-                    for fp in hint.useful_files[:5]:
-                        existing = prior.similar_query_files.get(fp, 0.0)
-                        prior.similar_query_files[fp] = max(
-                            existing, hint.confidence,
-                        )
-                # Only propagate avoid_files from near-exact matches
-                # (similarity >= 0.95) to prevent over-generalization
-                if hint.similarity >= 0.95:
-                    for fp in getattr(hint, "avoid_files", None) or []:
-                        prior.avoid_files.add(fp)
-        except Exception:
-            pass
-
-        # 5. PatternMemory: reasoning chain template
+        # 3. PatternMemory: reasoning chain template
         try:
             prior.chain_hint = mem.get_chain_hint(query)
         except Exception:
             pass
 
-        # 6. Extra files from caller (similar-query hints)
-        if extra_files:
-            for fp in extra_files:
-                prior.extra_files[fp] = 0.5
-
-        # Compute aggregate confidence from available signals
-        if _hint_confidences:
-            prior.avg_confidence = sum(_hint_confidences) / len(_hint_confidences)
+        # 4. Meta-knowledge: distilled strategy rules for the ReAct agent
+        try:
+            mk = mem.get_meta_knowledge(query)
+            prior.strategy_rules = mk.get("distilled_rules", [])
+        except Exception:
+            pass
 
         if not prior.is_empty:
-            n_priors = (
-                len(prior.path_scores)
-                + len(prior.entity_paths)
-                + len(prior.similar_query_files)
-                + len(prior.extra_files)
-            )
             logger.info(
-                "[MemoryBridge] extracted {} file priors, {} dead, "
-                "{} avoid, chain_hint={}, avg_conf={:.2f}",
-                n_priors,
+                "[MemoryBridge] extracted {} entity priors, {} dead, "
+                "chain_hint={}, strategy_rules={}",
+                len(prior.entity_paths),
                 len(prior.dead_paths),
-                len(prior.avoid_files),
                 "yes" if prior.chain_hint else "no",
-                prior.avg_confidence,
+                len(prior.strategy_rules),
             )
 
         return prior

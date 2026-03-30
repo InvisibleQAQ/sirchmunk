@@ -81,54 +81,20 @@ class BeliefState:
     # Memory warm-start
     # ------------------------------------------------------------------
 
-    # Minimum aggregate confidence to apply any warm-start priors
-    _WARM_START_MIN_CONFIDENCE: float = 0.3
-
-    # Elevated cap for high-confidence priors (confirmed correct in prior runs)
-    _MAX_WARM_BELIEF_HIGH: float = 0.65
-
     def warm_start(self, prior: "MemoryPrior") -> None:
         """Initialize beliefs from cross-session memory priors.
 
-        Uses confidence-scaled dampening: when ``prior.avg_confidence``
-        is low, the effective cap shrinks proportionally, reducing the
-        influence of uncertain or stale memory data.
-
-        For high-confidence priors (>= 0.8), the belief cap is raised
-        to ``_MAX_WARM_BELIEF_HIGH`` so that confirmed-correct files
-        have a stronger initial advantage.
-
-        Layering order (later layers can boost but not exceed the cap):
-        1. PathMemory hot_scores (weakest — historical frequency)
-        2. Entity-path index (moderate — content-level association)
-        3. Similar-query transfer (strongest — outcome-confirmed)
-        4. Extra files (explicit hint — treated as moderate prior)
-        5. Avoid files (negative memory — suppressed belief)
+        Only corpus-level and strategy-level priors are applied:
+        1. Dead paths (negative memory — FailureMemory-confirmed)
+        2. Entity-path priors (corpus-level entity→file associations)
+        3. Reasoning chain hint (strategy-level pattern)
         """
         self._dead_paths = set(prior.dead_paths) if prior.dead_paths else set()
         self._chain_hint = prior.chain_hint
 
-        # Merge avoid_files into dead_paths for unified suppression
-        avoid = getattr(prior, "avoid_files", None) or set()
-        self._dead_paths |= set(avoid)
+        cap = self._MAX_WARM_BELIEF
 
-        if prior.avg_confidence < self._WARM_START_MIN_CONFIDENCE:
-            return
-
-        # High-confidence priors get a higher cap (越用越准)
-        conf_scale = min(1.0, prior.avg_confidence / 0.8)
-        base_cap = self._MAX_WARM_BELIEF
-        if prior.avg_confidence >= 0.8:
-            base_cap = self._MAX_WARM_BELIEF_HIGH
-        cap = base_cap * conf_scale
-
-        # Layer 1: path hotness (dampened by 0.4)
-        for fp, score in prior.path_scores.items():
-            if fp not in self._dead_paths:
-                self._beliefs[fp] = min(cap, score * 0.4)
-                self._memory_priors[fp] = score
-
-        # Layer 2: entity-based priors (Bayesian combination, dampened)
+        # Entity-based priors (Bayesian combination, dampened)
         for fp, score in prior.entity_paths.items():
             if fp not in self._dead_paths:
                 existing = self._beliefs.get(fp, 0.0)
@@ -137,23 +103,6 @@ class BeliefState:
                 self._memory_priors[fp] = max(
                     self._memory_priors.get(fp, 0.0), score,
                 )
-
-        # Layer 3: similar-query file transfer (confidence-proportional)
-        for fp, score in prior.similar_query_files.items():
-            if fp not in self._dead_paths:
-                existing = self._beliefs.get(fp, 0.0)
-                weight = 0.5 if prior.avg_confidence >= 0.8 else 0.3
-                self._beliefs[fp] = max(existing, min(cap, score * weight))
-
-        # Layer 4: explicitly suggested extra files
-        for fp, score in prior.extra_files.items():
-            if fp not in self._dead_paths:
-                existing = self._beliefs.get(fp, 0.0)
-                self._beliefs[fp] = max(existing, min(cap, score))
-
-        # Layer 5: negative beliefs for avoid_files
-        for fp in avoid:
-            self._beliefs[fp] = 0.02
 
     # ------------------------------------------------------------------
     # Belief updates

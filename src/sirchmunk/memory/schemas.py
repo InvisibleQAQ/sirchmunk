@@ -71,6 +71,15 @@ class QueryPattern:
     avg_reward: float = 0.0            # shaped reward running average
     total_visits: int = 0              # global visit counter N for UCB
 
+    # Meta-RL fields: contextual bandit + loop budget + distilled rules
+    distilled_rules: List[str] = field(default_factory=list)
+    failure_warnings: List[str] = field(default_factory=list)
+    best_keyword_strategy: str = ""
+    # loop_count (str) → [success_count, total_count] for Bayesian loop budget
+    loop_budget_stats: Dict[str, List[int]] = field(default_factory=dict)
+    # strategy_name → [alpha, beta] for Thompson Sampling over strategy arms
+    strategy_arms: Dict[str, List[float]] = field(default_factory=dict)
+
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in self.__dict__.items()}
 
@@ -195,20 +204,138 @@ class FeedbackSignal:
 
 
 # ────────────────────────────────────────────────────────────────────
-#  Similar query hint (output of QuerySimilarityIndex lookup)
+#  Meta-RL: Search strategy & planning models
 # ────────────────────────────────────────────────────────────────────
 
-@dataclass
-class SimilarQueryHint:
-    """Hints transferred from a semantically similar historical query."""
+class SearchStrategy:
+    """Named search strategies for the contextual bandit.
 
-    query: str
-    similarity: float = 0.0
+    Each constant is a meta-action in the meta-RL framework:
+    π_meta(strategy | query_features).  Strategies are corpus-agnostic
+    and transfer across independent samples.
+    """
+
+    DIRECT = "direct"
+    BRIDGE_FIRST = "bridge_first"
+    PARALLEL_ENTITIES = "parallel_entities"
+    DECOMPOSE_COMPOUND = "decompose_compound"
+    BROAD_THEN_NARROW = "broad_then_narrow"
+
+    ALL = (DIRECT, BRIDGE_FIRST, PARALLEL_ENTITIES,
+           DECOMPOSE_COMPOUND, BROAD_THEN_NARROW)
+
+
+@dataclass
+class SearchPlan:
+    """Output of the Memory-Augmented Planner (MAP).
+
+    A structured search plan that can drive either guided execution
+    (high confidence) or serve as a warm-start hint for full ReAct
+    (lower confidence).
+    """
+
+    plan_steps: List[str] = field(default_factory=list)
+    keyword_strategy: str = "direct"
+    expected_hops: int = 2
     confidence: float = 0.0
-    mode: Optional[str] = None
-    keywords: List[str] = field(default_factory=list)
-    useful_files: List[str] = field(default_factory=list)
-    avoid_files: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    reasoning_type: str = "simple"
+    answer_format: str = "entity"
+    source: str = "planner"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {k: v for k, v in self.__dict__.items()}
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "SearchPlan":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class AbstractTrajectoryStep:
+    """One step in a strategy-level trajectory (no instance-specific data).
+
+    Records WHAT strategy was used at each step, not WHICH specific
+    keywords or files.  This makes trajectories transferable across
+    independent samples.
+    """
+
+    action: str = ""
+    strategy: str = ""
+    result_type: str = ""
+    files_found: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.__dict__.copy()
+
+
+@dataclass
+class AbstractTrajectory:
+    """Strategy-level search trajectory for experience replay.
+
+    Stores the abstracted sequence of decisions (not instance data)
+    so that the distiller can learn generalizable rules.
+    """
+
+    query_type: str = "factual"
+    complexity: str = "moderate"
+    hop_hint: str = "single"
+    entity_count: int = 0
+    answer_format: str = "entity"
+    steps: List[AbstractTrajectoryStep] = field(default_factory=list)
+    loops_used: int = 0
+    total_tokens: int = 0
+    outcome: float = 0.0
+    timestamp: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            **{k: v for k, v in self.__dict__.items() if k != "steps"},
+            "steps": [s.to_dict() for s in self.steps],
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "AbstractTrajectory":
+        steps_raw = d.get("steps", [])
+        steps = [
+            AbstractTrajectoryStep(**s) if isinstance(s, dict) else s
+            for s in steps_raw
+        ]
+        filtered = {k: v for k, v in d.items()
+                    if k in cls.__dataclass_fields__ and k != "steps"}
+        obj = cls(**filtered)
+        obj.steps = steps
+        return obj
+
+
+@dataclass
+class StrategyDistillation:
+    """LLM-distilled meta-knowledge for a query type.
+
+    Produced by :class:`StrategyDistiller` from a batch of
+    :class:`AbstractTrajectory` entries.  Consumed by
+    :class:`MemoryAugmentedPlanner` to generate informed search plans.
+    """
+
+    query_type: str = "factual"
+    complexity: str = "moderate"
+    rules: List[str] = field(default_factory=list)
+    failure_warnings: List[str] = field(default_factory=list)
+    best_keyword_strategy: str = ""
+    sample_count: int = 0
+    success_rate: float = 0.0
+    avg_loops: float = 0.0
+    avg_tokens: float = 0.0
+    distilled_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {k: v for k, v in self.__dict__.items()}
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "StrategyDistillation":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
 # ────────────────────────────────────────────────────────────────────

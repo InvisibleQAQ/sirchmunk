@@ -25,8 +25,11 @@ from loguru import logger
 from .base import MemoryStore
 from .query_classifier import classify_query as _classify_query
 from .schemas import (
+    AbstractTrajectory,
     QueryPattern,
     ReasoningChain,
+    SearchStrategy,
+    StrategyDistillation,
     StrategyHint,
     compute_pattern_id,
     compute_pattern_id_at_level,
@@ -45,15 +48,25 @@ class PatternMemory(MemoryStore):
 
     _MIN_SAMPLES_FOR_CONFIDENT = 3
     _MIN_SUCCESS_RATE = 0.4
+    _SUCCESS_THRESHOLD = 0.5
     _EMA_ALPHA = 0.3
     _SAVE_MIN_INTERVAL = 5.0  # seconds between disk writes
+
+    _MAX_TRAJECTORIES = 200
+    _DISTILLATION_BATCH_SIZE = 10
+    _LOOP_BUDGET_MIN_OBS = 3
+    _LOOP_BUDGET_SUCCESS_RATE = 0.5
 
     def __init__(self, base_dir: Path, embedding_util: Any = None):
         self._base_dir = base_dir
         self._patterns_file = base_dir / "query_patterns.json"
         self._chains_file = base_dir / "reasoning_chains.json"
+        self._trajectories_file = base_dir / "trajectories.json"
+        self._distillations_file = base_dir / "distillations.json"
         self._patterns: Dict[str, QueryPattern] = {}
         self._chains: Dict[str, ReasoningChain] = {}
+        self._trajectories: List[AbstractTrajectory] = []
+        self._distillations: Dict[str, StrategyDistillation] = {}
         self._lock = threading.RLock()
         self._dirty = False
         self._last_save_time: float = 0.0
@@ -134,6 +147,12 @@ class PatternMemory(MemoryStore):
             self._chains = self._load_json(
                 self._chains_file, ReasoningChain.from_dict,
             )
+            self._trajectories = self._load_json_list(
+                self._trajectories_file, AbstractTrajectory.from_dict,
+            )
+            self._distillations = self._load_json(
+                self._distillations_file, StrategyDistillation.from_dict,
+            )
             self._dirty = False
 
     @staticmethod
@@ -146,6 +165,17 @@ class PatternMemory(MemoryStore):
         except Exception as exc:
             logger.warning(f"PatternMemory: failed to load {path.name}: {exc}")
             return {}
+
+    @staticmethod
+    def _load_json_list(path: Path, factory):
+        if not path.exists():
+            return []
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            return [factory(item) for item in raw]
+        except Exception as exc:
+            logger.warning(f"PatternMemory: failed to load {path.name}: {exc}")
+            return []
 
     def _mark_dirty(self) -> None:
         """Mark data as changed and flush if enough time has elapsed."""
@@ -167,6 +197,16 @@ class PatternMemory(MemoryStore):
                 self._chains_file,
                 {k: v.to_dict() for k, v in self._chains.items()},
             )
+            if self._trajectories:
+                self._atomic_write(
+                    self._trajectories_file,
+                    [t.to_dict() for t in self._trajectories[-self._MAX_TRAJECTORIES:]],
+                )
+            if self._distillations:
+                self._atomic_write(
+                    self._distillations_file,
+                    {k: v.to_dict() for k, v in self._distillations.items()},
+                )
             self._dirty = False
             self._last_save_time = time.monotonic()
 
@@ -516,7 +556,7 @@ class PatternMemory(MemoryStore):
         This is a helper for record_outcome() to avoid code duplication when
         propagating updates to ancestor patterns in the HMRPL hierarchy.
         """
-        success = confidence >= 0.5
+        success = confidence >= self._SUCCESS_THRESHOLD
         now = datetime.now(timezone.utc).isoformat()
 
         pattern.sample_count += 1
@@ -556,7 +596,7 @@ class PatternMemory(MemoryStore):
         else:
             new_avg_tokens = pattern.optimal_params.get("avg_tokens")
 
-        if success and pattern.success_rate >= 0.5:
+        if success and pattern.success_rate >= self._SUCCESS_THRESHOLD:
             pattern.optimal_mode = mode
             pattern.optimal_params = params
             # Preserve avg_tokens in new optimal_params
@@ -932,6 +972,237 @@ class PatternMemory(MemoryStore):
                     and chain.success_count / chain.total_count >= 0.4):
                 return chain.steps
         return None
+
+    @property
+    def distillation_batch_size(self) -> int:
+        """Minimum trajectories needed before distillation is triggered."""
+        return self._DISTILLATION_BATCH_SIZE
+
+    def _classify_and_pid(self, query: str) -> Tuple[Dict[str, Any], str]:
+        """Classify a query and compute its L4 pattern ID.
+
+        Reduces boilerplate across Meta-RL methods that all need the same
+        (features, pattern_id) pair.
+        """
+        features = self.classify_query(query)
+        pid = compute_pattern_id_at_level(
+            features["query_type"], features["complexity"],
+            features["entity_types"],
+            features.get("entity_count", 0),
+            features.get("hop_hint", "single"),
+            level=4,
+        )
+        return features, pid
+
+    # ── Meta-RL: trajectory storage + distillation + loop budget ─────
+
+    def store_trajectory(self, trajectory: AbstractTrajectory) -> None:
+        """Append an abstracted trajectory for future distillation."""
+        with self._lock:
+            self._trajectories.append(trajectory)
+            if len(self._trajectories) > self._MAX_TRAJECTORIES:
+                self._trajectories = self._trajectories[-self._MAX_TRAJECTORIES:]
+        self._mark_dirty()
+
+    def get_recent_trajectories(
+        self,
+        query_type: str,
+        complexity: str,
+        limit: int = 20,
+    ) -> List[AbstractTrajectory]:
+        """Return recent trajectories matching the given type + complexity."""
+        with self._lock:
+            matched = [
+                t for t in reversed(self._trajectories)
+                if t.query_type == query_type and t.complexity == complexity
+            ]
+        return matched[:limit]
+
+    def pending_trajectory_count(self, query_type: str, complexity: str) -> int:
+        """Count trajectories accumulated since last distillation."""
+        with self._lock:
+            key = f"{query_type}|{complexity}"
+            distill = self._distillations.get(key)
+            if not distill:
+                return sum(
+                    1 for t in self._trajectories
+                    if t.query_type == query_type and t.complexity == complexity
+                )
+            return sum(
+                1 for t in self._trajectories
+                if (t.query_type == query_type
+                    and t.complexity == complexity
+                    and t.timestamp > distill.distilled_at)
+            )
+
+    def store_distillation(self, distill: StrategyDistillation) -> None:
+        """Persist a distillation and propagate rules to matching patterns."""
+        key = f"{distill.query_type}|{distill.complexity}"
+        with self._lock:
+            self._distillations[key] = distill
+            for p in self._patterns.values():
+                if p.query_type == distill.query_type:
+                    p.distilled_rules = list(distill.rules)
+                    p.failure_warnings = list(distill.failure_warnings)
+                    if distill.best_keyword_strategy:
+                        p.best_keyword_strategy = distill.best_keyword_strategy
+        self._mark_dirty()
+
+    def get_distillation(
+        self,
+        query_type: str,
+        complexity: str,
+    ) -> Optional[StrategyDistillation]:
+        """Return the most recent distillation for a query type."""
+        key = f"{query_type}|{complexity}"
+        with self._lock:
+            return self._distillations.get(key)
+
+    def record_loop_outcome(
+        self,
+        query: str,
+        loops_used: int,
+        success: bool,
+    ) -> None:
+        """Update Bayesian loop budget statistics for the pattern.
+
+        Tracks success/total counts per loop depth.  The optimal
+        loop budget is the smallest depth with success_rate >= threshold
+        (minimum effective depth principle).
+        """
+        _, pid = self._classify_and_pid(query)
+        key = str(loops_used)
+        with self._lock:
+            pattern = self._patterns.get(pid)
+            if not pattern:
+                return
+            stats = pattern.loop_budget_stats.get(key, [0, 0])
+            stats[1] += 1
+            if success:
+                stats[0] += 1
+            pattern.loop_budget_stats[key] = stats
+        self._mark_dirty()
+
+    def get_optimal_loop_budget(self, query: str) -> Optional[int]:
+        """Return the minimum effective loop depth for this query type.
+
+        Uses Bayesian estimation: finds the smallest loop count where
+        success_rate >= _LOOP_BUDGET_SUCCESS_RATE with at least
+        _LOOP_BUDGET_MIN_OBS observations.
+        """
+        _, pid = self._classify_and_pid(query)
+        with self._lock:
+            pattern = self._patterns.get(pid)
+            if not pattern or not pattern.loop_budget_stats:
+                return None
+            for loops in sorted(pattern.loop_budget_stats.keys(), key=int):
+                s, t = pattern.loop_budget_stats[loops]
+                if (t >= self._LOOP_BUDGET_MIN_OBS
+                        and s / t >= self._LOOP_BUDGET_SUCCESS_RATE):
+                    return int(loops)
+        return None
+
+    def record_strategy_arm(
+        self,
+        query: str,
+        strategy: str,
+        success: bool,
+    ) -> None:
+        """Update the contextual bandit arm for a strategy.
+
+        Each (pattern, strategy) pair maintains independent Thompson
+        Sampling parameters (alpha, beta) for strategy selection.
+        """
+        if strategy not in SearchStrategy.ALL:
+            return
+        _, pid = self._classify_and_pid(query)
+        with self._lock:
+            pattern = self._patterns.get(pid)
+            if not pattern:
+                return
+            arm = pattern.strategy_arms.get(strategy, [1.0, 1.0])
+            if success:
+                arm[0] += 1.0
+            else:
+                arm[1] += 1.0
+            pattern.strategy_arms[strategy] = arm
+        self._mark_dirty()
+
+    def suggest_strategy_arm(self, query: str) -> Optional[str]:
+        """Thompson Sampling over strategy arms for the query's pattern.
+
+        Returns the strategy with the highest sampled value, or None
+        if no arms have been observed.
+        """
+        _, pid = self._classify_and_pid(query)
+        with self._lock:
+            pattern = self._patterns.get(pid)
+            if not pattern or not pattern.strategy_arms:
+                return None
+            best_strategy = None
+            best_sample = -1.0
+            for strategy, (alpha, beta) in pattern.strategy_arms.items():
+                sample = random.betavariate(max(alpha, 0.01), max(beta, 0.01))
+                if sample > best_sample:
+                    best_sample = sample
+                    best_strategy = strategy
+        return best_strategy
+
+    def get_meta_knowledge(self, query: str) -> Dict[str, Any]:
+        """Aggregate all meta-knowledge for the MAP planner.
+
+        Combines pattern statistics, distilled rules, loop budget,
+        and strategy arm data into a single dict consumed by the
+        :class:`MemoryAugmentedPlanner`.
+        """
+        features, pid = self._classify_and_pid(query)
+        qt = features["query_type"]
+        cx = features["complexity"]
+
+        mk: Dict[str, Any] = {
+            "query_type": qt,
+            "complexity": cx,
+            "entity_count": features.get("entity_count", 0),
+            "hop_hint": features.get("hop_hint", "single"),
+            "distilled_rules": [],
+            "failure_warnings": [],
+            "success_rate": 0.0,
+            "avg_loops": 4.0,
+            "avg_tokens": 0,
+            "best_keyword_strategy": "",
+        }
+
+        with self._lock:
+            pattern = self._patterns.get(pid)
+            if pattern:
+                mk["distilled_rules"] = list(pattern.distilled_rules)
+                mk["failure_warnings"] = list(pattern.failure_warnings)
+                mk["success_rate"] = pattern.success_rate
+                mk["avg_tokens"] = pattern.avg_tokens
+                mk["best_keyword_strategy"] = pattern.best_keyword_strategy
+
+                # Compute avg_loops from loop_budget_stats if available
+                if pattern.loop_budget_stats:
+                    total_loops = 0
+                    total_count = 0
+                    for loops_str, (s, t) in pattern.loop_budget_stats.items():
+                        total_loops += int(loops_str) * t
+                        total_count += t
+                    if total_count > 0:
+                        mk["avg_loops"] = total_loops / total_count
+
+            # Enrich from distillation if pattern-level rules are empty
+            key = f"{qt}|{cx}"
+            distill = self._distillations.get(key)
+            if distill and not mk["distilled_rules"]:
+                mk["distilled_rules"] = list(distill.rules)
+                mk["failure_warnings"] = list(distill.failure_warnings)
+                mk["success_rate"] = distill.success_rate
+                mk["avg_loops"] = distill.avg_loops
+                mk["avg_tokens"] = distill.avg_tokens
+                mk["best_keyword_strategy"] = distill.best_keyword_strategy
+
+        return mk
 
     # ── Warmup seeding ────────────────────────────────────────────────
 
