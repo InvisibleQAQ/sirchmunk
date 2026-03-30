@@ -1335,10 +1335,12 @@ class AgenticSearch(BaseSearch):
 
         # ---- Memory: strategy hint (zero-LLM) ----
         _STRATEGY_CONFIDENCE_MIN = 0.7
+        _hint_resolution_level = None  # Track resolution level for MAP gating
         if self._memory and mode != "FILENAME_ONLY":
             try:
                 hint = self._memory.suggest_strategy(query)
                 if hint and hint.confidence >= _STRATEGY_CONFIDENCE_MIN:
+                    _hint_resolution_level = hint.resolution_level
                     _loguru_logger.info(
                         "[memory] Strategy hint applied: conf={:.2f} mode={}",
                         hint.confidence, hint.mode,
@@ -1528,9 +1530,25 @@ class AgenticSearch(BaseSearch):
         )
 
         # Memory → BeliefState: extract cross-session priors for warm-start
+        # MAP runs in parallel as a background task (if conditions met)
         _memory_prior = None
         _memory_bridge = None
+        _search_plan = None
+        _map_task = None
+
         if self._memory:
+            # Start MAP as background task if resolution_level is low (L0/L1)
+            # High-confidence patterns (L2+) already have good strategy - skip expensive LLM call
+            if _hint_resolution_level is None or _hint_resolution_level <= 1:
+                _map_task = asyncio.create_task(
+                    asyncio.wait_for(self._memory.plan_search(query), timeout=12.0)
+                )
+            else:
+                _loguru_logger.info(
+                    "[MAP] Skipped: high-confidence pattern (L%s)", _hint_resolution_level
+                )
+
+            # Memory Bridge runs synchronously (~0.1s)
             try:
                 from sirchmunk.memory.bridge import MemoryBridge
                 _memory_bridge = MemoryBridge(
@@ -1555,35 +1573,31 @@ class AgenticSearch(BaseSearch):
             except Exception:
                 pass
 
-        # ==============================================================
-        # Phase 1.5: Memory-Augmented Planning (MAP)
-        # Generate a search plan from distilled meta-knowledge.
-        # High-confidence plans drive guided execution; lower ones
-        # serve as warm-start hints for the ReAct agent.
-        # ==============================================================
-        _search_plan = None
-        if self._memory:
-            try:
-                _search_plan = await self._memory.plan_search(query)
-                if _search_plan:
-                    _loguru_logger.info(
-                        "[MAP] Plan: conf={:.2f}, steps={}, strategy={}",
-                        _search_plan.confidence,
-                        len(_search_plan.plan_steps),
-                        _search_plan.keyword_strategy,
-                    )
-                    # Inject plan into MemoryPrior for BeliefState access
-                    if _memory_prior is not None:
-                        _memory_prior.search_plan = _search_plan
-                    # Adaptive loop budget from meta-knowledge
-                    learned_budget = self._memory.get_optimal_loop_budget(query)
-                    if learned_budget and learned_budget < max_loops:
-                        max_loops = max(learned_budget, 3)
-                        _loguru_logger.debug(
-                            "[MAP] Adaptive loop budget: %d", max_loops,
+            # Await MAP result (already running in background)
+            if _map_task is not None:
+                try:
+                    _search_plan = await _map_task
+                    if _search_plan:
+                        _loguru_logger.info(
+                            "[MAP] Plan: conf={:.2f}, steps={}, strategy={}",
+                            _search_plan.confidence,
+                            len(_search_plan.plan_steps),
+                            _search_plan.keyword_strategy,
                         )
-            except Exception:
-                pass
+                        # Inject plan into MemoryPrior for BeliefState access
+                        if _memory_prior is not None:
+                            _memory_prior.search_plan = _search_plan
+                        # Adaptive loop budget from meta-knowledge
+                        learned_budget = self._memory.get_optimal_loop_budget(query)
+                        if learned_budget and learned_budget < max_loops:
+                            max_loops = max(learned_budget, 3)
+                            _loguru_logger.debug(
+                                "[MAP] Adaptive loop budget: %d", max_loops,
+                            )
+                except asyncio.TimeoutError:
+                    _loguru_logger.info("[MAP] Timeout after 12s, skipping plan")
+                except Exception:
+                    pass
 
         # ==============================================================
         # Phase 2: ReAct-driven iterative retrieval
