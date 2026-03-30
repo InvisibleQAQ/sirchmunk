@@ -20,6 +20,7 @@ Cost model:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -85,12 +86,18 @@ class StrategyDistiller:
         )
 
         try:
-            resp = await self._llm.achat(
-                messages=[{"role": "user", "content": prompt}],
-                stream=False,
+            resp = await asyncio.wait_for(
+                self._llm.achat(
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=False,
+                ),
+                timeout=30.0,
             )
             raw = (resp.content or "").strip()
             return self._parse_distillation(raw, trajectories, query_type, complexity)
+        except asyncio.TimeoutError:
+            logger.info("Strategy distillation timed out after 30s, skipping")
+            return None
         except Exception as exc:
             logger.debug("Strategy distillation failed: %s", exc)
             return None
