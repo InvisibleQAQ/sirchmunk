@@ -132,7 +132,7 @@ class ReActSearchAgent:
         log_callback: Optional async logging callback.
     """
 
-    _GUIDED_CONFIDENCE_THRESHOLD = 0.7
+    _GUIDED_CONFIDENCE_THRESHOLD = 0.6
     _GUIDED_EVIDENCE_TRUNCATION = 4000
 
     def __init__(
@@ -388,23 +388,29 @@ class ReActSearchAgent:
 
             # BA-ReAct: ESS-based early stopping when evidence is concentrated
             belief = getattr(context, "belief_state", None)
-            if (
-                belief
-                and belief.should_stop_early()
-                and context.loop_count >= 3
-            ):
-                await self._logger.info(
-                    f"[ReAct] Belief ESS suggests evidence convergence "
-                    f"(ESS={belief.compute_ess():.1f}) — nudging answer"
-                )
+            _stop_urgency = "none"
+            if belief and context.loop_count >= 3:
+                _stop_urgency = belief.stop_urgency()
+                if _stop_urgency != "none":
+                    await self._logger.info(
+                        f"[ReAct] Belief ESS suggests evidence convergence "
+                        f"(ESS={belief.compute_ess():.1f}, urgency={_stop_urgency})"
+                    )
 
             # Append reasoning + tool call + observation to conversation
             messages.append({"role": "assistant", "content": content})
+            continuation = self._build_continuation_prompt(context)
+            if _stop_urgency == "hard":
+                continuation += (
+                    "\n\n⚠️ IMPORTANT: Evidence is highly concentrated and "
+                    "sufficient. You MUST provide your final answer NOW using "
+                    "<ANSWER>...</ANSWER> tags. Do NOT call any more tools."
+                )
             messages.append({
                 "role": "user",
                 "content": (
                     f"**Tool result** ({tool_name}):\n{result_text}\n\n"
-                    f"{self._build_continuation_prompt(context)}"
+                    f"{continuation}"
                 ),
             })
 

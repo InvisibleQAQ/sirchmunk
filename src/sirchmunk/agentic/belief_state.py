@@ -287,11 +287,29 @@ class BeliefState:
         n = len(self._beliefs)
         if n < 3:
             return False
-        if self._actions < 3:
+        if self._actions < 2:
             return False
         ess = self.compute_ess()
         n_read = sum(1 for v in self._reads.values() if v > 0)
-        return ess < 2.5 and n_read >= 3
+        return ess < 2.5 and n_read >= 2
+
+    def stop_urgency(self) -> str:
+        """Return urgency level for early stopping: 'none', 'soft', 'hard'.
+
+        - 'hard': extremely concentrated evidence + many reads (force answer)
+        - 'soft': moderately concentrated (nudge to answer)
+        - 'none': continue exploring
+        """
+        n = len(self._beliefs)
+        n_read = sum(1 for v in self._reads.values() if v > 0)
+        if n < 3 or self._actions < 2:
+            return "none"
+        ess = self.compute_ess()
+        if ess < 2.0 and n_read >= 3:
+            return "hard"
+        if ess < 2.5 and n_read >= 2:
+            return "soft"
+        return "none"
 
     # ------------------------------------------------------------------
     # Advisory signals
@@ -322,13 +340,16 @@ class BeliefState:
             parts.append(f"Promising unread: {names}")
 
         # ESS-based concentration signal — only after real observations
-        # (not just warm_start priors) to prevent premature termination
-        n = len(self._beliefs)
-        n_read = sum(1 for v in self._reads.values() if v > 0)
-        if n >= 3 and self._actions >= 2 and n_read >= 2:
-            ess = self.compute_ess()
-            if ess / n < 0.3:
-                parts.append("Evidence concentrated — consider answering")
+        urgency = self.stop_urgency()
+        if urgency == "hard":
+            parts.append(
+                "⚠️ Evidence is highly concentrated — you MUST provide your "
+                "answer NOW using <ANSWER>...</ANSWER> tags"
+            )
+        elif urgency == "soft":
+            parts.append(
+                "Evidence concentrated — strongly consider answering now"
+            )
 
         # Chain hint advisory (only useful in early rounds)
         if self._chain_hint and self._actions < 3:

@@ -1456,7 +1456,7 @@ class AgenticSearch(BaseSearch):
             max_token_budget=max_token_budget,
             max_loops=max_loops,
         )
-        _llm_usage_start = len(self.llm_usages)
+        _local_usages: List[Dict[str, Any]] = []
 
         # ==============================================================
         # Phase 0a: Direct document analysis (intent-gated short-circuit)
@@ -1493,7 +1493,7 @@ class AgenticSearch(BaseSearch):
             return_exceptions=True,
         )
 
-        kw_result = phase1_results[0] if not isinstance(phase1_results[0], Exception) else ({}, [])
+        kw_result = phase1_results[0] if not isinstance(phase1_results[0], Exception) else ({}, [], None)
         scan_result = phase1_results[1] if not isinstance(phase1_results[1], Exception) else None
         knowledge_hits = phase1_results[2] if not isinstance(phase1_results[2], Exception) else []
         spec_context = phase1_results[3] if not isinstance(phase1_results[3], Exception) else ""
@@ -1502,7 +1502,14 @@ class AgenticSearch(BaseSearch):
             if isinstance(phase1_results[i], Exception):
                 await self._logger.warning(f"[Phase 1] {label} probe failed: {phase1_results[i]}")
 
-        query_keywords, initial_keywords = kw_result if isinstance(kw_result, tuple) else ({}, [])
+        if isinstance(kw_result, tuple) and len(kw_result) >= 3:
+            query_keywords, initial_keywords, _kw_usage = kw_result
+            if _kw_usage:
+                _local_usages.append(_kw_usage)
+        elif isinstance(kw_result, tuple):
+            query_keywords, initial_keywords = kw_result
+        else:
+            query_keywords, initial_keywords = {}, []
 
         # Memory: expand keywords with semantic bridge + filter noise
         if self._memory and query_keywords:
@@ -1539,16 +1546,11 @@ class AgenticSearch(BaseSearch):
         _map_task = None
 
         if self._memory:
-            # Start MAP as background task if resolution_level is low (L0/L1)
-            # High-confidence patterns (L2+) already have good strategy - skip expensive LLM call
-            if hint_resolution_level is None or hint_resolution_level <= 1:
-                _map_task = asyncio.create_task(
-                    asyncio.wait_for(self._memory.plan_search(query), timeout=12.0)
-                )
-            else:
-                _loguru_logger.info(
-                    "[MAP] Skipped: high-confidence pattern (L%s)", hint_resolution_level
-                )
+            # Start MAP as background task unconditionally — even high-confidence
+            # patterns benefit from a concrete plan (guided execution or hints).
+            _map_task = asyncio.create_task(
+                asyncio.wait_for(self._memory.plan_search(query), timeout=30.0)
+            )
 
             # Memory Bridge runs synchronously (~0.1s)
             try:
@@ -1597,7 +1599,7 @@ class AgenticSearch(BaseSearch):
                                 "[MAP] Adaptive loop budget: %d", max_loops,
                             )
                 except asyncio.TimeoutError:
-                    _loguru_logger.info("[MAP] Timeout after 12s, skipping plan")
+                    _loguru_logger.info("[MAP] Timeout after 30s, skipping plan")
                 except Exception:
                     pass
 
@@ -1633,9 +1635,8 @@ class AgenticSearch(BaseSearch):
             )
             should_save = cluster is not None
 
-        # Sync LLM token accounting into context
-        new_usages = self.llm_usages[_llm_usage_start:]
-        for usage in new_usages:
+        # Sync non-ReAct LLM token accounting into context
+        for usage in _local_usages:
             if usage and isinstance(usage, dict):
                 total_tok = usage.get("total_tokens", 0)
                 if total_tok == 0:
@@ -2500,7 +2501,7 @@ class AgenticSearch(BaseSearch):
 
     async def _probe_keywords(
         self, query: str, *, enable_cross_lingual: bool = True,
-    ) -> Tuple[Dict[str, float], List[str]]:
+    ) -> Tuple[Dict[str, float], List[str], Optional[Dict[str, Any]]]:
         """Extract multi-level keywords from the query via LLM.
 
         Also extracts cross-lingual alternative keywords from the
@@ -2514,7 +2515,7 @@ class AgenticSearch(BaseSearch):
                 Disable for monolingual datasets like HotpotQA.
 
         Returns:
-            Tuple of (keyword_idf_dict, keyword_list).
+            Tuple of (keyword_idf_dict, keyword_list, llm_usage_or_None).
         """
         await self._logger.info("[Probe:Keywords] Extracting keywords...")
 
@@ -2529,7 +2530,7 @@ class AgenticSearch(BaseSearch):
                 enable_thinking=False,
             )
             await self._logger.info(f"[Timing] Keyword extraction: {_time.time()-_t0:.2f}s")
-            self.llm_usages.append(kw_response.usage)
+            _kw_usage = kw_response.usage
 
             keyword_sets = self._extract_and_validate_multi_level_keywords(
                 kw_response.content, num_levels=2,
@@ -2552,10 +2553,10 @@ class AgenticSearch(BaseSearch):
                     merged = {**kw_set, **alt_keywords}
                     kw_list = list(merged.keys())
                     await self._logger.info(f"[Probe:Keywords] Extracted: {kw_list}")
-                    return merged, kw_list
+                    return merged, kw_list, _kw_usage
 
             if alt_keywords:
-                return alt_keywords, list(alt_keywords.keys())
+                return alt_keywords, list(alt_keywords.keys()), _kw_usage
         except Exception as exc:
             await self._logger.info(f"[Phase 1] keywords probe failed: {exc}")
 
@@ -2563,9 +2564,9 @@ class AgenticSearch(BaseSearch):
         if fallback:
             kw_list = list(fallback.keys())
             await self._logger.info(f"[Probe:Keywords] Heuristic fallback: {kw_list}")
-            return fallback, kw_list
+            return fallback, kw_list, None
 
-        return {}, []
+        return {}, [], None
 
     @staticmethod
     def _has_directory_paths(paths: List[str]) -> bool:
