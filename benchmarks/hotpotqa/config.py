@@ -77,6 +77,12 @@ class ExperimentConfig:
     llm_api_key: str
     llm_model: str
     llm_timeout: float
+    llm_max_retries: int
+    llm_retry_base_delay: float
+    llm_retry_max_delay: float
+    post_llm_timeout: float
+    post_llm_max_retries: int
+    postprocess_timeout_sec: float
 
     # Post-processing
     extract_answer: bool
@@ -114,6 +120,7 @@ class ExperimentConfig:
     max_concurrent: int
     request_delay: float
     sample_max_retries: int
+    map_timeout_sec: float
 
     def __post_init__(self) -> None:
         self.dataset_dir = Path(self.dataset_dir).resolve()
@@ -161,6 +168,12 @@ def get_config(
         "llm_api_key": os.getenv("LLM_API_KEY", ""),
         "llm_model": os.getenv("LLM_MODEL_NAME", ""),
         "llm_timeout": float(os.getenv("LLM_TIMEOUT", "120")),
+        "llm_max_retries": int(os.getenv("HOTPOT_LLM_MAX_RETRIES", "1")),
+        "llm_retry_base_delay": float(os.getenv("HOTPOT_LLM_RETRY_BASE_DELAY", "2.0")),
+        "llm_retry_max_delay": float(os.getenv("HOTPOT_LLM_RETRY_MAX_DELAY", "30.0")),
+        "post_llm_timeout": float(os.getenv("HOTPOT_POST_LLM_TIMEOUT", "45")),
+        "post_llm_max_retries": int(os.getenv("HOTPOT_POST_LLM_MAX_RETRIES", "0")),
+        "postprocess_timeout_sec": float(os.getenv("HOTPOT_POSTPROCESS_TIMEOUT_SEC", "90")),
         "extract_answer": _bool_env(os.getenv("HOTPOT_EXTRACT_ANSWER"), True),
         "enable_reflection": _bool_env(os.getenv("HOTPOT_ENABLE_REFLECTION"), True),
         "enable_llm_judge": _bool_env(os.getenv("HOTPOT_ENABLE_LLM_JUDGE"), True),
@@ -180,6 +193,7 @@ def get_config(
         "max_concurrent": int(os.getenv("HOTPOT_MAX_CONCURRENT", "5")),
         "request_delay": float(os.getenv("HOTPOT_REQUEST_DELAY", "0.5")),
         "sample_max_retries": int(os.getenv("HOTPOT_SAMPLE_MAX_RETRIES", "2")),
+        "map_timeout_sec": float(os.getenv("HOTPOT_MAP_TIMEOUT_SEC", "8")),
     }
 
     for k, v in overrides.items():

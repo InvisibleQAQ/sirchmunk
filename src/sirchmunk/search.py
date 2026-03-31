@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
 import ast
+import contextlib
 import hashlib
 import json
 import logging
@@ -102,6 +103,7 @@ class AgenticSearch(BaseSearch):
         rga_max_parse_lines: int = 0,
         merge_max_files: int = 0,
         title_lookup_fn=None,
+        map_timeout_sec: Optional[float] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -109,6 +111,16 @@ class AgenticSearch(BaseSearch):
         # Store rga max_count setting
         self._rga_max_count = rga_max_count
         self._title_lookup_fn = title_lookup_fn
+        _env_map_timeout = os.getenv("SIRCHMUNK_MAP_TIMEOUT_SEC")
+        _map_timeout_raw = (
+            map_timeout_sec
+            if map_timeout_sec is not None
+            else (_env_map_timeout if _env_map_timeout else 8.0)
+        )
+        try:
+            self._map_timeout_sec = max(1.0, float(_map_timeout_raw))
+        except (TypeError, ValueError):
+            self._map_timeout_sec = 8.0
 
         # Normalise and store default search paths
         if paths is not None:
@@ -1602,9 +1614,12 @@ class AgenticSearch(BaseSearch):
         if self._memory:
             # Start MAP as background task unconditionally — even high-confidence
             # patterns benefit from a concrete plan (guided execution or hints).
-            _map_task = asyncio.create_task(
-                asyncio.wait_for(self._memory.plan_search(query), timeout=30.0)
-            )
+            _map_task = asyncio.create_task(self._memory.plan_search(query))
+            _map_timeout = self._map_timeout_sec
+            # When strategy confidence is already high, cap MAP wait more
+            # aggressively to avoid adding fixed latency.
+            if strategy_hint and getattr(strategy_hint, "confidence", 0.0) >= 0.75:
+                _map_timeout = min(_map_timeout, 4.0)
 
             # Memory Bridge runs synchronously (~0.1s)
             try:
@@ -1643,7 +1658,7 @@ class AgenticSearch(BaseSearch):
             # Await MAP result (already running in background)
             if _map_task is not None:
                 try:
-                    _search_plan = await _map_task
+                    _search_plan = await asyncio.wait_for(_map_task, timeout=_map_timeout)
                     if _search_plan:
                         _loguru_logger.info(
                             "[MAP] Plan: conf={:.2f}, steps={}, strategy={}",
@@ -1662,7 +1677,12 @@ class AgenticSearch(BaseSearch):
                                 "[MAP] Adaptive loop budget: %d", max_loops,
                             )
                 except asyncio.TimeoutError:
-                    _loguru_logger.info("[MAP] Timeout after 30s, skipping plan")
+                    _map_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await _map_task
+                    _loguru_logger.info(
+                        "[MAP] Timeout after %.1fs, skipping plan", _map_timeout,
+                    )
                 except Exception:
                     pass
 

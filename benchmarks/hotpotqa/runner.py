@@ -1202,6 +1202,72 @@ async def _reflect_on_answer(
         return answer
 
 
+async def _run_postprocess_pipeline(
+    *,
+    question: str,
+    raw_answer: str,
+    files_read: List[str],
+    llm: Any,
+    cfg: ExperimentConfig,
+    evidence_texts: List[str],
+    reasoning_texts: List[str],
+    gold_answer: str,
+) -> Tuple[List[str], List[List], str]:
+    """Run SP/answer post-processing with a hard per-sample timeout budget.
+
+    This isolates high-variance LLM post-processing latency from exploding
+    the end-to-end sample time when provider-side calls stall.
+    """
+    _start = time.time()
+    titles: Set[str] = set()
+    predicted_sp: List[List] = []
+    answer = ""
+    sp_candidates: Dict[str, List[str]] = {}
+
+    titles, predicted_sp, sp_candidates, combined_answer = await _extract_sp_with_llm(
+        question, raw_answer, files_read, llm,
+        evidence_texts=evidence_texts,
+        reasoning_texts=reasoning_texts,
+        extract_answer=cfg.extract_answer,
+    )
+
+    if cfg.extract_answer and raw_answer:
+        # Use the combined answer from SP extraction first (saves one LLM call).
+        answer = combined_answer or ""
+
+        if not answer and predicted_sp and sp_candidates:
+            answer = await _extract_grounded_answer(
+                question, predicted_sp, sp_candidates, raw_answer, llm,
+            )
+
+        if not answer and len(raw_answer.strip()) > 80:
+            answer = await _extract_short_answer(
+                question, raw_answer, llm, reasoning_texts=reasoning_texts,
+            )
+
+        if not answer:
+            answer = raw_answer
+
+        answer = _normalize_prediction(answer, gold=gold_answer)
+        if not answer:
+            answer = _normalize_prediction(raw_answer, gold=gold_answer)
+    else:
+        answer = _normalize_prediction(raw_answer, gold=gold_answer)
+
+    if cfg.enable_reflection and answer:
+        if _should_reflect(question, answer, raw_answer):
+            answer = await _reflect_on_answer(
+                question, answer, predicted_sp, sp_candidates, llm,
+            )
+
+    _elapsed = time.time() - _start
+    logger.debug(
+        "[postprocess] completed in %.2fs (titles=%d, sp=%d)",
+        _elapsed, len(titles), len(predicted_sp),
+    )
+    return list(titles), predicted_sp, answer
+
+
 _SAMPLE_RETRYABLE_KEYWORDS = ("429", "RateLimitError", "rate limit",
                               "APIConnectionError", "APITimeoutError",
                               "InternalServerError", "502", "503", "504")
@@ -1217,7 +1283,7 @@ def _is_retryable_error(error_str: str) -> bool:
 async def run_single(
     entry: Dict[str, Any],
     searcher: Any,
-    llm: Any,
+    post_llm: Any,
     cfg: ExperimentConfig,
     semaphore: "AdaptiveSemaphore | asyncio.Semaphore",
 ) -> Dict[str, Any]:
@@ -1230,6 +1296,9 @@ async def run_single(
     for attempt in range(max_attempts):
         async with semaphore:
             t0 = time.time()
+            search_elapsed = 0.0
+            post_elapsed = 0.0
+            postprocess_timed_out = False
             error = None
             raw_answer = ""
             answer = ""
@@ -1250,6 +1319,7 @@ async def run_single(
                     enable_cross_lingual=cfg.enable_cross_lingual,
                     query_type_hint=entry.get("type") or None,
                 )
+                search_elapsed = time.time() - t0
 
                 raw_answer = getattr(result, "answer", "") or str(result)
                 files_read = list(getattr(result, "read_file_ids", None) or set())
@@ -1271,57 +1341,44 @@ async def run_single(
 
                 evidence_texts = _collect_evidence_texts(cluster, result)
                 _reasoning_texts = list(getattr(result, "reasoning_texts", None) or [])
-
-                titles, predicted_sp, sp_candidates, combined_answer = (
-                    await _extract_sp_with_llm(
-                        question, raw_answer, files_read, llm,
-                        evidence_texts=evidence_texts,
-                        reasoning_texts=_reasoning_texts,
-                        extract_answer=cfg.extract_answer,
-                    )
-                )
-                retrieved_titles = list(titles)
-
-                if cfg.extract_answer and raw_answer:
-                    # Use the combined answer from SP extraction (saves 1 LLM call)
-                    answer = combined_answer or ""
-
-                    # Fallback: evidence-grounded extraction if combined failed
-                    if not answer and predicted_sp and sp_candidates:
-                        answer = await _extract_grounded_answer(
-                            question, predicted_sp, sp_candidates,
-                            raw_answer, llm,
-                        )
-
-                    # Fallback: LLM extraction from verbose raw answer
-                    if not answer and len(raw_answer.strip()) > 80:
-                        answer = await _extract_short_answer(
-                            question, raw_answer, llm,
+                _post_t0 = time.time()
+                try:
+                    retrieved_titles, predicted_sp, answer = await asyncio.wait_for(
+                        _run_postprocess_pipeline(
+                            question=question,
+                            raw_answer=raw_answer,
+                            files_read=files_read,
+                            llm=post_llm,
+                            cfg=cfg,
+                            evidence_texts=evidence_texts,
                             reasoning_texts=_reasoning_texts,
-                        )
-
-                    # Last resort: use raw answer directly
-                    if not answer:
-                        answer = raw_answer
-
-                    gold_answer = entry.get("answer") or ""
-                    answer = _normalize_prediction(answer, gold=gold_answer)
-                    if not answer:
-                        answer = _normalize_prediction(raw_answer, gold=gold_answer)
-                else:
-                    gold_answer = entry.get("answer") or ""
-                    answer = _normalize_prediction(raw_answer, gold=gold_answer)
-
-                if cfg.enable_reflection and answer:
-                    if _should_reflect(question, answer, raw_answer):
-                        answer = await _reflect_on_answer(
-                            question, answer, predicted_sp,
-                            sp_candidates, llm,
-                        )
+                            gold_answer=entry.get("answer") or "",
+                        ),
+                        timeout=max(5.0, cfg.postprocess_timeout_sec),
+                    )
+                except asyncio.TimeoutError:
+                    postprocess_timed_out = True
+                    logger.warning(
+                        "[run_single] %s postprocess timed out after %.1fs; "
+                        "falling back to normalized raw answer",
+                        qid, cfg.postprocess_timeout_sec,
+                    )
+                    answer = _normalize_prediction(
+                        raw_answer, gold=entry.get("answer") or "",
+                    )
+                    retrieved_titles = []
+                    predicted_sp = []
+                post_elapsed = time.time() - _post_t0
             except Exception as e:
                 error = str(e)
 
             elapsed = time.time() - t0
+            telemetry["stage_seconds"] = {
+                "search": round(search_elapsed, 2),
+                "postprocess": round(post_elapsed, 2),
+            }
+            if postprocess_timed_out:
+                telemetry["postprocess_timed_out"] = True
             if hasattr(semaphore, "record_duration"):
                 semaphore.record_duration(elapsed)
             if cfg.request_delay > 0:
@@ -1377,18 +1434,28 @@ async def run_batch(
         from sirchmunk.retrieve.text_retriever import GrepRetriever
         GrepRetriever.ensure_ugrep_index(_ugrep_cp)
 
-    llm = OpenAIChat(
+    search_llm = OpenAIChat(
         api_key=cfg.llm_api_key,
         base_url=cfg.llm_base_url,
         model=cfg.llm_model,
-        max_retries=4,
-        retry_base_delay=2.0,
-        retry_max_delay=60.0,
+        max_retries=cfg.llm_max_retries,
+        retry_base_delay=cfg.llm_retry_base_delay,
+        retry_max_delay=cfg.llm_retry_max_delay,
+        call_timeout=cfg.llm_timeout,
+    )
+    post_llm = OpenAIChat(
+        api_key=cfg.llm_api_key,
+        base_url=cfg.llm_base_url,
+        model=cfg.llm_model,
+        max_retries=cfg.post_llm_max_retries,
+        retry_base_delay=cfg.llm_retry_base_delay,
+        retry_max_delay=cfg.llm_retry_max_delay,
+        call_timeout=cfg.post_llm_timeout,
     )
     from sirchmunk.search import BatchStepStats
 
     searcher = AgenticSearch(
-        llm=llm,
+        llm=search_llm,
         reuse_knowledge=cfg.reuse_knowledge,
         verbose=False,
         enable_memory=cfg.enable_memory,
@@ -1398,6 +1465,7 @@ async def run_batch(
         rga_max_parse_lines=cfg.rga_max_parse_lines,
         merge_max_files=cfg.merge_max_files,
         title_lookup_fn=lookup_title_files if _WIKI_TITLE_INDEX else None,
+        map_timeout_sec=cfg.map_timeout_sec,
     )
     searcher.batch_step_stats = BatchStepStats()
 
@@ -1407,7 +1475,7 @@ async def run_batch(
 
     async def _tracked(entry):
         nonlocal completed
-        r = await run_single(entry, searcher, llm, cfg, semaphore)
+        r = await run_single(entry, searcher, post_llm, cfg, semaphore)
         completed += 1
         status = "OK" if not r["error"] else f"ERR: {r['error'][:60]}"
         t = r.get("telemetry", {})
@@ -1529,9 +1597,10 @@ async def run_batch_llm_only(
         api_key=cfg.llm_api_key,
         base_url=cfg.llm_base_url,
         model=cfg.llm_model,
-        max_retries=4,
-        retry_base_delay=2.0,
-        retry_max_delay=60.0,
+        max_retries=cfg.llm_max_retries,
+        retry_base_delay=cfg.llm_retry_base_delay,
+        retry_max_delay=cfg.llm_retry_max_delay,
+        call_timeout=cfg.llm_timeout,
     )
 
     semaphore = asyncio.Semaphore(cfg.max_concurrent)
