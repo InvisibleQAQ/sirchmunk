@@ -1248,6 +1248,7 @@ async def run_single(
                     return_context=True,
                     enable_thinking=cfg.enable_thinking,
                     enable_cross_lingual=cfg.enable_cross_lingual,
+                    query_type_hint=entry.get("type") or None,
                 )
 
                 raw_answer = getattr(result, "answer", "") or str(result)
@@ -1384,6 +1385,8 @@ async def run_batch(
         retry_base_delay=2.0,
         retry_max_delay=60.0,
     )
+    from sirchmunk.search import BatchStepStats
+
     searcher = AgenticSearch(
         llm=llm,
         reuse_knowledge=cfg.reuse_knowledge,
@@ -1396,6 +1399,7 @@ async def run_batch(
         merge_max_files=cfg.merge_max_files,
         title_lookup_fn=lookup_title_files if _WIKI_TITLE_INDEX else None,
     )
+    searcher.batch_step_stats = BatchStepStats()
 
     semaphore = AdaptiveSemaphore(cfg.max_concurrent)
     total = len(samples)

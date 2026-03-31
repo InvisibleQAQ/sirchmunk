@@ -458,6 +458,26 @@ class FailureMemory(MemoryStore):
         except Exception:
             return paths
 
+    def get_confirmed_dead_paths(self, limit: int = 200) -> List[str]:
+        """Return all paths confirmed as persistently useless.
+
+        Unlike ``filter_dead_paths`` (which checks a given list), this
+        proactively returns the full set of dead paths so callers can
+        warm-start negative priors without knowing candidate files.
+        """
+        try:
+            rows = self._db.fetch_all(
+                "SELECT path FROM dead_paths "
+                f"WHERE times_retrieved >= {self._DEAD_PATH_MIN_RETRIEVALS} "
+                "AND times_useful = 0 "
+                "ORDER BY times_retrieved DESC "
+                f"LIMIT {limit}",
+                [],
+            )
+            return [r[0] for r in rows] if rows else []
+        except Exception:
+            return []
+
     def record_path_result(self, path: str, useful: bool) -> None:
         """Update dead-path tracking for *path*."""
         now = datetime.now(timezone.utc).isoformat()

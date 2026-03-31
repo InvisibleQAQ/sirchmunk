@@ -428,7 +428,12 @@ class KeywordSearchTool(BaseTool):
             },
         )
 
-        return result_text, {"keywords": keywords, "files_found": len(deduped), "tokens": approx_tokens}
+        return result_text, {
+            "keywords": keywords,
+            "files_found": len(deduped),
+            "files_discovered": discovered_paths,
+            "tokens": approx_tokens,
+        }
 
     @staticmethod
     def _select_diverse_snippets(

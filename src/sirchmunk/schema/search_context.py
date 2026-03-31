@@ -96,6 +96,8 @@ class SearchContext:
     # BA-ReAct: cached MCES RoiResults for Phase 3 reuse
     # Keys are file paths; values are dicts with summary/is_found/snippets.
     mces_cache: Dict[str, Dict[str, Any]] = field(default_factory=dict, init=False)
+    # Step-level bandit: per-tool-call outcomes for D1 contextual bandit
+    step_outcomes: List[Dict[str, Any]] = field(default_factory=list, init=False)
 
     # ---- Token accounting ----
 

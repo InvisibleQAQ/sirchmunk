@@ -49,6 +49,40 @@ from sirchmunk.utils.utils import (
 from sirchmunk.utils.chat_utils import CHAT_QUERY_RE, CHAT_RESPONSE_SYSTEM
 
 
+class BatchStepStats:
+    """Thread-safe accumulator of tool success rates across concurrent queries.
+
+    Created once per batch, shared by all AgenticSearch instances in that batch.
+    Provides lightweight real-time cross-query learning within a single batch.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stats: Dict[str, List[bool]] = {}
+
+    def record(self, action: str, success: bool) -> None:
+        with self._lock:
+            self._stats.setdefault(action, []).append(success)
+
+    def get_success_rate(self, action: str) -> Optional[float]:
+        with self._lock:
+            obs = self._stats.get(action)
+            if not obs or len(obs) < 5:
+                return None
+            return sum(obs) / len(obs)
+
+    def get_summary(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            result = {}
+            for action, obs in self._stats.items():
+                if len(obs) >= 5:
+                    result[action] = {
+                        "success_rate": round(sum(obs) / len(obs), 3),
+                        "total": len(obs),
+                    }
+            return result
+
+
 class AgenticSearch(BaseSearch):
 
     def __init__(
@@ -140,6 +174,7 @@ class AgenticSearch(BaseSearch):
         self.embedding_client = None
         self._memory = None
         self._pending_feedback: List[asyncio.Task] = []
+        self.batch_step_stats: Optional[BatchStepStats] = None
 
         # ---- Background warm-up: non-blocking ----
         self._warmup_event = threading.Event()
@@ -226,6 +261,9 @@ class AgenticSearch(BaseSearch):
                         embedding_util=self.embedding_client,
                     )
                     self.grep_retriever.set_memory(self._memory)
+                    # Deferred embedding injection (in case embedding loaded after init)
+                    if self.embedding_client:
+                        self._memory.set_embedding_util(self.embedding_client)
                     _loguru_logger.info("[warmup] Retrieval memory enabled and initialised")
                 except Exception as exc:
                     _loguru_logger.info(f"[warmup] Retrieval memory not available: {exc}")
@@ -1229,6 +1267,7 @@ class AgenticSearch(BaseSearch):
         chat_history: Optional[List[Dict[str, str]]] = None,
         enable_thinking: bool = False,
         enable_cross_lingual: bool = True,
+        query_type_hint: Optional[str] = None,
     ) -> Union[str, SearchContext, List[Dict[str, Any]]]:
         """Perform intelligent search with multi-mode support.
 
@@ -1334,13 +1373,20 @@ class AgenticSearch(BaseSearch):
             return msg
 
         # ---- Memory: strategy hint (zero-LLM) ----
-        _STRATEGY_CONFIDENCE_MIN = 0.7
+        _STRATEGY_CONFIDENCE_BY_LEVEL = {
+            0: 0.35, 1: 0.45, 2: 0.55, 3: 0.65, 4: 0.70,
+        }
         _hint_resolution_level = None  # Track resolution level for MAP gating
+        _applied_strategy_hint = None  # Track the full hint for budget fields
         if self._memory and mode != "FILENAME_ONLY":
             try:
                 hint = self._memory.suggest_strategy(query)
-                if hint and hint.confidence >= _STRATEGY_CONFIDENCE_MIN:
+                _conf_threshold = _STRATEGY_CONFIDENCE_BY_LEVEL.get(
+                    getattr(hint, "resolution_level", 4), 0.7,
+                ) if hint else 0.7
+                if hint and hint.confidence >= _conf_threshold:
                     _hint_resolution_level = hint.resolution_level
+                    _applied_strategy_hint = hint
                     _loguru_logger.info(
                         "[memory] Strategy hint applied: conf={:.2f} mode={}",
                         hint.confidence, hint.mode,
@@ -1359,8 +1405,11 @@ class AgenticSearch(BaseSearch):
                     if hint.token_budget is not None and hint.token_budget > 0:
                         max_token_budget = max(hint.token_budget, 20000)
                     _loguru_logger.debug(
-                        "[memory] strategy hint applied: mode={}, resolution_level={}, token_budget={}",
+                        "[memory] strategy hint applied: mode={}, resolution_level={}, token_budget={}, "
+                        "entity_priority={}, early_stop_agg={}",
                         hint.mode, hint.resolution_level, hint.token_budget,
+                        getattr(hint, "entity_resolution_priority", None),
+                        getattr(hint, "early_stop_aggressiveness", None),
                     )
             except Exception:
                 pass
@@ -1406,6 +1455,8 @@ class AgenticSearch(BaseSearch):
                 enable_thinking=enable_thinking,
                 enable_cross_lingual=enable_cross_lingual,
                 hint_resolution_level=_hint_resolution_level,
+                query_type_hint=query_type_hint,
+                strategy_hint=_applied_strategy_hint,
             )
 
         # ---- Unified return wrapping ----
@@ -1440,6 +1491,8 @@ class AgenticSearch(BaseSearch):
         enable_thinking: bool = False,
         enable_cross_lingual: bool = True,
         hint_resolution_level: Optional[int] = None,
+        query_type_hint: Optional[str] = None,
+        strategy_hint: Any = None,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """ReAct-first iterative retrieval pipeline (Phases 0a–4).
 
@@ -1565,14 +1618,23 @@ class AgenticSearch(BaseSearch):
                         list(query_keywords.keys()) if query_keywords else None
                     ),
                 )
+                # Inject budget allocation fields from strategy hint
+                if _memory_prior and strategy_hint:
+                    erp = getattr(strategy_hint, "entity_resolution_priority", None)
+                    esa = getattr(strategy_hint, "early_stop_aggressiveness", None)
+                    if erp:
+                        _memory_prior.entity_resolution_priority = erp
+                    if esa is not None:
+                        _memory_prior.early_stop_aggressiveness = esa
                 if _memory_prior and not _memory_prior.is_empty:
                     _loguru_logger.info(
                         "[memory] Prior: entity_paths={}, dead={}, "
-                        "chain={}, strategy_rules={}",
+                        "chain={}, strategy_rules={}, step_hints={}",
                         len(_memory_prior.entity_paths),
                         len(_memory_prior.dead_paths),
                         "yes" if _memory_prior.chain_hint else "no",
                         len(_memory_prior.strategy_rules),
+                        len(_memory_prior.step_action_hints),
                     )
             except Exception:
                 pass
@@ -1604,6 +1666,27 @@ class AgenticSearch(BaseSearch):
                     pass
 
         # ==============================================================
+        # Phase 1.5: Query structure parsing (lightweight LLM call)
+        # Extracts entities, relation type, and bridge clues for
+        # complex queries. Gated: only for bridge/comparison when MAP
+        # confidence is below guided execution threshold.
+        # ==============================================================
+        _query_structure = None
+        _GUIDED_CONFIDENCE_THRESHOLD = 0.6
+        _should_parse = (
+            query_type_hint in ("bridge", "comparison")
+            or (query_keywords and len(query_keywords) >= 3)
+        )
+        _map_conf = getattr(_search_plan, "confidence", 0.0) if _search_plan else 0.0
+        if _should_parse and _map_conf < _GUIDED_CONFIDENCE_THRESHOLD:
+            try:
+                _query_structure = await self._parse_query_structure(
+                    query, query_type_hint or "unknown",
+                )
+            except Exception:
+                pass
+
+        # ==============================================================
         # Phase 2: ReAct-driven iterative retrieval
         # The agent receives Phase 1 warm-start data (keywords, spec
         # context) and uses enhanced tools (BM25-reranked keyword search,
@@ -1611,15 +1694,34 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         await self._logger.info("[Phase 2] Launching ReAct agent for iterative retrieval")
 
+        # Inject query structure into spec_context for ReAct agent
+        _enriched_spec = spec_context
+        if _query_structure:
+            _struct_parts = []
+            if _query_structure.get("entities"):
+                _struct_parts.append(f"Entities: {', '.join(_query_structure['entities'])}")
+            if _query_structure.get("relation_type"):
+                _struct_parts.append(f"Relation: {_query_structure['relation_type']}")
+            if _query_structure.get("bridge_clue"):
+                _struct_parts.append(f"Bridge clue: {_query_structure['bridge_clue']}")
+            if _query_structure.get("target_attribute"):
+                _struct_parts.append(f"Target: {_query_structure['target_attribute']}")
+            if _struct_parts:
+                _enriched_spec = (
+                    (_enriched_spec or "")
+                    + "\n[Query structure] " + " | ".join(_struct_parts)
+                )
+
         answer, context = await self._react_refinement(
             query=query, paths=paths,
-            initial_keywords=initial_keywords, spec_context=spec_context,
+            initial_keywords=initial_keywords, spec_context=_enriched_spec,
             enable_dir_scan=enable_dir_scan,
             max_loops=max_loops, max_token_budget=max_token_budget,
             max_depth=max_depth, include=include, exclude=exclude,
             enable_thinking=enable_thinking,
             memory_prior=_memory_prior,
             search_plan=_search_plan,
+            batch_step_stats=self.batch_step_stats,
         )
 
         # ==============================================================
@@ -1708,7 +1810,20 @@ class AgenticSearch(BaseSearch):
                     paths_searched=paths,
                     files_read=list(context.read_file_ids),
                     files_discovered=_discovered,
+                    query_type_override=query_type_hint or None,
                 )
+
+                # Extract title_lookup results for CorpusMemory persistence
+                _title_results = []
+                for log in getattr(context, "retrieval_logs", []):
+                    if getattr(log, "tool_name", "") == "title_lookup":
+                        _meta = getattr(log, "metadata", {}) or {}
+                        _title = _meta.get("title", "")
+                        _paths_found = _meta.get("paths_found", 0)
+                        if _title and _paths_found > 0:
+                            _title_results.append({"title": _title, "paths_found": _paths_found})
+                if _title_results:
+                    signal.title_lookup_results = _title_results
 
                 # Enrich with BA-ReAct belief data
                 if _memory_bridge and belief_state:
@@ -1735,7 +1850,10 @@ class AgenticSearch(BaseSearch):
                     _heuristic_outcome = 0.6
                     if cluster and getattr(cluster, "confidence", 0) > 0.5:
                         _heuristic_outcome = 0.75
-                self._memory.record_trajectory(query, context, _heuristic_outcome)
+                self._memory.record_trajectory(
+                    query, context, _heuristic_outcome,
+                    query_type_override=query_type_hint,
+                )
             except Exception:
                 pass
             # Trigger strategy distillation when enough trajectories accumulate
@@ -2499,6 +2617,45 @@ class AgenticSearch(BaseSearch):
     # Phase 1 probes (each designed to run concurrently)
     # ------------------------------------------------------------------
 
+    async def _parse_query_structure(
+        self, query: str, query_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Lightweight LLM call to extract structured slots from the query.
+
+        Returns dict with keys: entities, relation_type, bridge_clue,
+        target_attribute. Returns None on failure. Cost: ~500 tokens.
+        """
+        prompt = (
+            "Extract the structure of this search query as JSON.\n"
+            f"Query type: {query_type}\n"
+            f"Query: {query}\n\n"
+            "Return JSON with these fields:\n"
+            '- "entities": list of named entities to search for\n'
+            '- "relation_type": "bridge" | "comparison" | "factual"\n'
+            '- "bridge_clue": connecting phrase between entities (if bridge)\n'
+            '- "target_attribute": what the question asks for\n\n'
+            "Return ONLY the JSON object, no other text."
+        )
+        try:
+            resp = await asyncio.wait_for(
+                self.llm.achat(
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=False,
+                ),
+                timeout=10.0,
+            )
+            raw = (resp.content or "").strip()
+            brace_start = raw.find("{")
+            brace_end = raw.rfind("}")
+            if brace_start < 0 or brace_end <= brace_start:
+                return None
+            import json as _json
+            return _json.loads(raw[brace_start:brace_end + 1])
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+
     async def _probe_keywords(
         self, query: str, *, enable_cross_lingual: bool = True,
     ) -> Tuple[Dict[str, float], List[str], Optional[Dict[str, Any]]]:
@@ -3183,6 +3340,7 @@ class AgenticSearch(BaseSearch):
         enable_thinking: bool = False,
         memory_prior: Any = None,
         search_plan: Any = None,
+        batch_step_stats: Any = None,
     ) -> Tuple[str, SearchContext]:
         """Fall back to ReAct loop when parallel probing yields insufficient evidence.
 
@@ -3210,6 +3368,7 @@ class AgenticSearch(BaseSearch):
             enable_decomposition=True,
             memory_prior=memory_prior,
             search_plan=search_plan,
+            batch_step_stats=batch_step_stats,
         )
 
         augmented_query = query

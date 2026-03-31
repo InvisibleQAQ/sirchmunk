@@ -12,6 +12,7 @@ Storage layout::
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import threading
@@ -29,6 +30,7 @@ from .schemas import (
     QueryPattern,
     ReasoningChain,
     SearchStrategy,
+    StepArmStats,
     StrategyDistillation,
     StrategyHint,
     compute_pattern_id,
@@ -63,10 +65,13 @@ class PatternMemory(MemoryStore):
         self._chains_file = base_dir / "reasoning_chains.json"
         self._trajectories_file = base_dir / "trajectories.json"
         self._distillations_file = base_dir / "distillations.json"
+        self._step_stats_file = base_dir / "step_bandit.json"
         self._patterns: Dict[str, QueryPattern] = {}
         self._chains: Dict[str, ReasoningChain] = {}
         self._trajectories: List[AbstractTrajectory] = []
         self._distillations: Dict[str, StrategyDistillation] = {}
+        # Step-level bandit: outer key = "{query_type}|step_{bucket}", inner key = action
+        self._step_stats: Dict[str, Dict[str, StepArmStats]] = {}
         self._lock = threading.RLock()
         self._dirty = False
         self._last_save_time: float = 0.0
@@ -153,7 +158,24 @@ class PatternMemory(MemoryStore):
             self._distillations = self._load_json(
                 self._distillations_file, StrategyDistillation.from_dict,
             )
+            self._step_stats = self._load_step_stats(self._step_stats_file)
             self._dirty = False
+
+    @staticmethod
+    def _load_step_stats(path: Path) -> Dict[str, Dict[str, StepArmStats]]:
+        if not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            result: Dict[str, Dict[str, StepArmStats]] = {}
+            for ctx_key, arms in raw.items():
+                result[ctx_key] = {
+                    act: StepArmStats.from_dict(v) for act, v in arms.items()
+                }
+            return result
+        except Exception as exc:
+            logger.warning(f"PatternMemory: failed to load step_bandit.json: {exc}")
+            return {}
 
     @staticmethod
     def _load_json(path: Path, factory):
@@ -206,6 +228,14 @@ class PatternMemory(MemoryStore):
                 self._atomic_write(
                     self._distillations_file,
                     {k: v.to_dict() for k, v in self._distillations.items()},
+                )
+            if self._step_stats:
+                self._atomic_write(
+                    self._step_stats_file,
+                    {
+                        ctx: {act: arm.to_dict() for act, arm in arms.items()}
+                        for ctx, arms in self._step_stats.items()
+                    },
                 )
             self._dirty = False
             self._last_save_time = time.monotonic()
@@ -272,29 +302,35 @@ class PatternMemory(MemoryStore):
                 if pattern.sample_count < min_samples:
                     continue
 
-                # Thompson Sampling: draw from Beta posterior
-                sampled = random.betavariate(
-                    max(pattern.alpha, 0.01), max(pattern.beta_param, 0.01),
-                )
-                if sampled >= self._MIN_SUCCESS_RATE:
+                alpha_v = max(pattern.alpha, 0.01)
+                beta_v = max(pattern.beta_param, 0.01)
+                posterior_mean = alpha_v / (alpha_v + beta_v)
+
+                # Thompson Sampling draw decides explore/exploit
+                sampled = random.betavariate(alpha_v, beta_v)
+
+                # Epsilon-greedy overlay: forced exploration that decays with data
+                epsilon = max(0.05, 0.2 / math.sqrt(max(pattern.sample_count, 1)))
+                ts_accepted = sampled >= self._MIN_SUCCESS_RATE
+                forced_explore = (not ts_accepted) and random.random() < epsilon
+
+                if ts_accepted or forced_explore:
                     if level >= 2:
-                        # Fine-grained match (L2+) — trust it, return immediately
                         token_budget = self._estimate_token_budget(pattern, features)
-                        return StrategyHint(
+                        return self._enrich_hint_budget(StrategyHint(
                             mode=pattern.optimal_mode,
                             top_k_files=pattern.optimal_params.get("top_k_files"),
                             max_loops=pattern.optimal_params.get("max_loops"),
                             enable_dir_scan=pattern.optimal_params.get("enable_dir_scan"),
                             keyword_strategy=pattern.optimal_params.get("keyword_strategy"),
-                            confidence=sampled,
+                            confidence=posterior_mean,
                             source_pattern_id=pattern.pattern_id,
                             resolution_level=level,
                             token_budget=token_budget,
-                        )
+                        ), query_type, pattern)
                     else:
-                        # Coarse match (L0 or L1) — save it but try warm transfer first
-                        coarse_match = (pattern, sampled, level)
-                        break  # Don't need to check coarser levels
+                        coarse_match = (pattern, posterior_mean, level)
+                        break
 
             # Hierarchical lookup found nothing or only coarse match; try legacy soft-match fallback
             soft_pattern = self._soft_match(features) if coarse_match is None else None
@@ -314,19 +350,19 @@ class PatternMemory(MemoryStore):
 
         # Fall back to coarse match if warm transfer wasn't better
         if coarse_match:
-            pattern, sampled, level = coarse_match
+            pattern, pm_confidence, level = coarse_match
             token_budget = self._estimate_token_budget(pattern, features)
-            return StrategyHint(
+            return self._enrich_hint_budget(StrategyHint(
                 mode=pattern.optimal_mode,
                 top_k_files=pattern.optimal_params.get("top_k_files"),
                 max_loops=pattern.optimal_params.get("max_loops"),
                 enable_dir_scan=pattern.optimal_params.get("enable_dir_scan"),
                 keyword_strategy=pattern.optimal_params.get("keyword_strategy"),
-                confidence=sampled,
+                confidence=pm_confidence,
                 source_pattern_id=pattern.pattern_id,
                 resolution_level=level,
                 token_budget=token_budget,
-            )
+            ), query_type, pattern)
 
         # Legacy soft-match fallback (only when no coarse match was found)
         if not soft_pattern:
@@ -335,24 +371,26 @@ class PatternMemory(MemoryStore):
             return None
 
         # Thompson Sampling on soft-matched pattern
-        sampled = random.betavariate(
-            max(soft_pattern.alpha, 0.01), max(soft_pattern.beta_param, 0.01),
-        )
-        if sampled < self._MIN_SUCCESS_RATE:
+        alpha_s = max(soft_pattern.alpha, 0.01)
+        beta_s = max(soft_pattern.beta_param, 0.01)
+        sampled = random.betavariate(alpha_s, beta_s)
+        epsilon_s = max(0.05, 0.2 / math.sqrt(max(soft_pattern.sample_count, 1)))
+        if sampled < self._MIN_SUCCESS_RATE and random.random() >= epsilon_s:
             return None
 
+        posterior_mean_s = alpha_s / (alpha_s + beta_s)
         token_budget = self._estimate_token_budget(soft_pattern, features)
-        return StrategyHint(
+        return self._enrich_hint_budget(StrategyHint(
             mode=soft_pattern.optimal_mode,
             top_k_files=soft_pattern.optimal_params.get("top_k_files"),
             max_loops=soft_pattern.optimal_params.get("max_loops"),
             enable_dir_scan=soft_pattern.optimal_params.get("enable_dir_scan"),
             keyword_strategy=soft_pattern.optimal_params.get("keyword_strategy"),
-            confidence=sampled,
+            confidence=posterior_mean_s,
             source_pattern_id=soft_pattern.pattern_id,
             resolution_level=soft_pattern.resolution_level,
             token_budget=token_budget,
-        )
+        ), query_type, soft_pattern)
 
     def _soft_match(self, features: Dict[str, Any]) -> Optional[QueryPattern]:
         """Find the nearest pattern when exact pid is absent.
@@ -470,6 +508,126 @@ class PatternMemory(MemoryStore):
         except Exception:
             pass
         return None
+
+    def _enrich_hint_budget(
+        self,
+        hint: StrategyHint,
+        query_type: str,
+        pattern: Optional[QueryPattern] = None,
+    ) -> StrategyHint:
+        """Populate budget allocation fields on a StrategyHint from step bandit data."""
+        # entity_resolution_priority from step_0 bandit arms
+        ctx0 = self._step_context_key(query_type, 0)
+        arms0 = self._step_stats.get(ctx0, {})
+        tl_arm = arms0.get("title_lookup")
+        ks_arm = arms0.get("keyword_search")
+        if tl_arm and ks_arm and tl_arm.total >= 3 and ks_arm.total >= 3:
+            tl_pm = tl_arm.alpha / (tl_arm.alpha + tl_arm.beta_param)
+            ks_pm = ks_arm.alpha / (ks_arm.alpha + ks_arm.beta_param)
+            if tl_pm > ks_pm + 0.05:
+                hint.entity_resolution_priority = "title_lookup_first"
+            elif ks_pm > tl_pm + 0.05:
+                hint.entity_resolution_priority = "keyword_first"
+
+        # early_stop_aggressiveness from pattern's avg loop budget
+        if pattern and pattern.loop_budget_stats:
+            total_success = sum(v[0] for v in pattern.loop_budget_stats.values())
+            total_obs = sum(v[1] for v in pattern.loop_budget_stats.values())
+            if total_obs >= 3:
+                # Weighted average successful loop count
+                weighted_loops = sum(
+                    int(k) * v[0] for k, v in pattern.loop_budget_stats.items()
+                    if k.isdigit()
+                )
+                avg_success_loops = weighted_loops / max(total_success, 1)
+                max_loops = hint.max_loops or 8
+                hint.early_stop_aggressiveness = max(
+                    0.0, min(1.0, 1.0 - avg_success_loops / max_loops),
+                )
+
+        return hint
+
+    # ── Step-level Contextual Bandit ────────────────────────────────────
+
+    _STEP_BUCKET_MAX = 3
+    _STEP_INFO_GAIN_EMA = 0.3
+
+    @staticmethod
+    def _step_context_key(query_type: str, step_index: int) -> str:
+        bucket = min(step_index, PatternMemory._STEP_BUCKET_MAX)
+        return f"{query_type}|step_{bucket}"
+
+    def record_step_outcome(
+        self,
+        query_type: str,
+        step_index: int,
+        action: str,
+        success: bool,
+        info_gain: float = 0.0,
+    ) -> None:
+        """Update the step-level bandit arm for (query_type, step, action)."""
+        ctx = self._step_context_key(query_type, step_index)
+        with self._lock:
+            if ctx not in self._step_stats:
+                self._step_stats[ctx] = {}
+            arms = self._step_stats[ctx]
+            if action not in arms:
+                arms[action] = StepArmStats(action=action)
+            arm = arms[action]
+            arm.total += 1
+            if success:
+                arm.alpha += 1.0
+            else:
+                arm.beta_param += 1.0
+            arm.avg_info_gain += self._STEP_INFO_GAIN_EMA * (
+                info_gain - arm.avg_info_gain
+            )
+        self._mark_dirty()
+
+    def suggest_step_action(
+        self,
+        query_type: str,
+        step_index: int,
+    ) -> Optional[str]:
+        """Thompson Sampling over step-bandit arms; returns best action or None."""
+        ctx = self._step_context_key(query_type, step_index)
+        with self._lock:
+            arms = self._step_stats.get(ctx)
+            if not arms:
+                return None
+            # Require at least 3 observations for any arm before recommending
+            if all(a.total < 3 for a in arms.values()):
+                return None
+            best_action: Optional[str] = None
+            best_sample = -1.0
+            for act, arm in arms.items():
+                sample = random.betavariate(
+                    max(arm.alpha, 0.01), max(arm.beta_param, 0.01),
+                )
+                if sample > best_sample:
+                    best_sample = sample
+                    best_action = act
+            return best_action
+
+    def get_step_stats_summary(self, query_type: str) -> Dict[str, Any]:
+        """Return a summary of step bandit stats for advisory display."""
+        summary: Dict[str, Any] = {}
+        with self._lock:
+            for step_idx in range(self._STEP_BUCKET_MAX + 1):
+                ctx = self._step_context_key(query_type, step_idx)
+                arms = self._step_stats.get(ctx)
+                if not arms:
+                    continue
+                step_summary = {}
+                for act, arm in arms.items():
+                    pm = arm.alpha / (arm.alpha + arm.beta_param)
+                    step_summary[act] = {
+                        "posterior_mean": round(pm, 3),
+                        "total": arm.total,
+                        "avg_info_gain": round(arm.avg_info_gain, 3),
+                    }
+                summary[f"step_{step_idx}"] = step_summary
+        return summary
 
     def set_embedding_util(self, embedding_util: Any) -> None:
         """Inject embedding util after deferred warm-up."""
@@ -613,6 +771,7 @@ class PatternMemory(MemoryStore):
         params: Dict[str, Any],
         latency: float = 0.0,
         tokens: int = 0,
+        query_type_override: Optional[str] = None,
     ) -> None:
         """Record a search outcome with continuous *confidence* (0-1).
 
@@ -624,6 +783,8 @@ class PatternMemory(MemoryStore):
         auto-split/merge when conditions are met.
         """
         features = self.classify_query(query)
+        if query_type_override:
+            features["query_type"] = query_type_override
 
         # Extract feature components for hierarchical pattern IDs
         query_type = features["query_type"]

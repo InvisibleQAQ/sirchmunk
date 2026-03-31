@@ -30,6 +30,10 @@ class StrategyHint:
     source_pattern_id: Optional[str] = None
     token_budget: Optional[int] = None    # suggested token budget
     resolution_level: int = 4             # which HMRPL level produced this hint
+    # Budget allocation hints (derived from step bandit + pattern stats)
+    first_hop_budget_ratio: Optional[float] = None
+    entity_resolution_priority: Optional[str] = None  # "title_lookup_first" | "keyword_first"
+    early_stop_aggressiveness: Optional[float] = None  # 0.0-1.0
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -196,6 +200,11 @@ class FeedbackSignal:
     high_value_files: Optional[List[str]] = None
     dead_candidates: Optional[List[str]] = None
 
+    # Ground-truth query type from benchmark data (overrides heuristic classifier)
+    query_type_override: Optional[str] = None
+    # Title-lookup results: list of (title, [paths]) for CorpusMemory persistence
+    title_lookup_results: Optional[List[Dict[str, Any]]] = None
+
     # Computed by manager during dispatch (for inject_evaluation delta correction)
     heuristic_confidence: Optional[float] = None
 
@@ -329,12 +338,43 @@ class StrategyDistillation:
     avg_loops: float = 0.0
     avg_tokens: float = 0.0
     distilled_at: str = ""
+    # Structure-aware distillation fields (B2)
+    optimal_action_sequence: List[str] = field(default_factory=list)
+    avg_loops_success: float = 0.0
+    avg_loops_failure: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in self.__dict__.items()}
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "StrategyDistillation":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+# ────────────────────────────────────────────────────────────────────
+#  Step-level Bandit model
+# ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class StepArmStats:
+    """Per-(query_type, step_bucket, action) Thompson Sampling arm.
+
+    Used by the step-level contextual bandit (D1) to learn which tool
+    is most effective at each step of the ReAct loop, conditioned on
+    query type.
+    """
+
+    action: str
+    alpha: float = 1.0
+    beta_param: float = 1.0
+    total: int = 0
+    avg_info_gain: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "StepArmStats":
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 

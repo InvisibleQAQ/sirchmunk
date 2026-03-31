@@ -68,6 +68,15 @@ class MemoryPrior:
     strategy_rules: List[str] = field(default_factory=list)
     """Distilled strategy rules relevant to this query type."""
 
+    step_action_hints: Dict[int, str] = field(default_factory=dict)
+    """Step-level bandit recommended actions: {step_index: action_name}."""
+
+    entity_resolution_priority: Optional[str] = None
+    """From step bandit: "title_lookup_first" or "keyword_first"."""
+
+    early_stop_aggressiveness: Optional[float] = None
+    """From pattern stats: 0.0 (never early-stop) to 1.0 (very aggressive)."""
+
     @property
     def is_empty(self) -> bool:
         return (
@@ -76,6 +85,7 @@ class MemoryPrior:
             and self.chain_hint is None
             and self.search_plan is None
             and not self.strategy_rules
+            and not self.step_action_hints
         )
 
 
@@ -169,13 +179,16 @@ class MemoryBridge:
             except Exception:
                 pass
 
-        # 2. FailureMemory: dead paths
-        if candidate_files:
-            try:
+        # 2. FailureMemory: dead paths (proactive + filtered)
+        try:
+            confirmed = getattr(mem, "get_confirmed_dead_paths", None)
+            if confirmed:
+                prior.dead_paths = set(confirmed(limit=200))
+            if candidate_files:
                 alive = mem.filter_dead_paths(candidate_files)
-                prior.dead_paths = set(candidate_files) - set(alive)
-            except Exception:
-                pass
+                prior.dead_paths |= set(candidate_files) - set(alive)
+        except Exception:
+            pass
 
         # 3. PatternMemory: reasoning chain template
         try:
@@ -187,6 +200,17 @@ class MemoryBridge:
         try:
             mk = mem.get_meta_knowledge(query)
             prior.strategy_rules = mk.get("distilled_rules", [])
+        except Exception:
+            pass
+
+        # 5. Step-level bandit: recommended actions per step
+        try:
+            from .pattern_memory import PatternMemory as _PM
+            _qt = _PM.classify_query(query).get("query_type", "factual")
+            for step_idx in range(4):
+                best = mem.suggest_step_action(_qt, step_idx)
+                if best:
+                    prior.step_action_hints[step_idx] = best
         except Exception:
             pass
 

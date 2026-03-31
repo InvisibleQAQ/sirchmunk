@@ -58,6 +58,8 @@ class BeliefState:
         self._memory_priors: Dict[str, float] = {}
         self._chain_hint: Optional[List[Dict[str, str]]] = None
         self._strategy_rules: List[str] = []
+        self._step_hints: Dict[int, str] = {}
+        self._batch_stats: Any = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -94,6 +96,7 @@ class BeliefState:
         self._dead_paths = set(prior.dead_paths) if prior.dead_paths else set()
         self._chain_hint = prior.chain_hint
         self._strategy_rules = list(prior.strategy_rules) if prior.strategy_rules else []
+        self._step_hints = dict(prior.step_action_hints) if prior.step_action_hints else {}
 
         cap = self._MAX_WARM_BELIEF
 
@@ -106,6 +109,10 @@ class BeliefState:
                 self._memory_priors[fp] = max(
                     self._memory_priors.get(fp, 0.0), score,
                 )
+
+    def set_batch_stats(self, batch_stats: Any) -> None:
+        """Attach intra-batch experience sharing object (C3)."""
+        self._batch_stats = batch_stats
 
     # ------------------------------------------------------------------
     # Belief updates
@@ -361,6 +368,27 @@ class BeliefState:
         if self._strategy_rules and self._actions < 3:
             rules_text = "; ".join(self._strategy_rules[:3])
             parts.append(f"Strategy hints: {rules_text}")
+
+        # Step-level bandit: recommend specific action for current step
+        if self._step_hints and self._actions < 4:
+            hint = self._step_hints.get(self._actions)
+            if hint:
+                parts.append(f"Recommended action: {hint}")
+
+        # Intra-batch experience sharing (C3)
+        if self._batch_stats and self._actions >= 1:
+            try:
+                summary = self._batch_stats.get_summary()
+                if summary:
+                    batch_hints = []
+                    for act, info in summary.items():
+                        sr = info.get("success_rate", 0)
+                        if sr >= 0.7:
+                            batch_hints.append(f"{act}({sr:.0%})")
+                    if batch_hints:
+                        parts.append(f"Batch-effective tools: {', '.join(batch_hints)}")
+            except Exception:
+                pass
 
         return " | ".join(parts)
 

@@ -96,6 +96,7 @@ class RetrievalMemory:
 
         self._pattern_memory = PatternMemory(
             base_dir=self._memory_dir / "pattern_memory",
+            embedding_util=embedding_util,
         )
         self._corpus_memory = CorpusMemory(
             db=self._corpus_db,
@@ -203,6 +204,13 @@ class RetrievalMemory:
         except Exception:
             return paths
 
+    def get_confirmed_dead_paths(self, limit: int = 200) -> List[str]:
+        """FailureMemory → all confirmed dead paths (proactive query)."""
+        try:
+            return self._failure_memory.get_confirmed_dead_paths(limit)
+        except Exception:
+            return []
+
     def get_chain_hint(
         self,
         query: str,
@@ -210,6 +218,22 @@ class RetrievalMemory:
         """PatternMemory → reasoning chain template."""
         try:
             return self._pattern_memory.get_chain_hint(query)
+        except Exception:
+            return None
+
+    def set_embedding_util(self, embedding_util: Any) -> None:
+        """Inject/replace embedding utility for warm-transfer pattern matching."""
+        try:
+            self._pattern_memory.set_embedding_util(embedding_util)
+        except Exception:
+            pass
+
+    def suggest_step_action(
+        self, query_type: str, step_index: int,
+    ) -> Optional[str]:
+        """Step-level bandit: recommended action for (query_type, step)."""
+        try:
+            return self._pattern_memory.suggest_step_action(query_type, step_index)
         except Exception:
             return None
 
@@ -280,6 +304,7 @@ class RetrievalMemory:
                 params=params,
                 latency=signal.latency_sec,
                 tokens=signal.total_tokens,
+                query_type_override=getattr(signal, "query_type_override", None),
             )
         except Exception as exc:
             logger.debug(f"[memory:dispatch] PatternMemory failed: {exc}")
@@ -300,6 +325,25 @@ class RetrievalMemory:
                 )
         except Exception as exc:
             logger.debug(f"[memory:dispatch] CorpusMemory entity failed: {exc}")
+
+        # 3b. CorpusMemory — title_lookup results persistence
+        if getattr(signal, "title_lookup_results", None) and signal.files_read:
+            try:
+                for tl in signal.title_lookup_results:
+                    title = tl.get("title", "")
+                    if not title:
+                        continue
+                    matching_paths = [
+                        fp for fp in signal.files_read
+                        if title.lower().replace(" ", "_") in fp.lower()
+                    ]
+                    if matching_paths:
+                        pairs = [(title, fp) for fp in matching_paths[:5]]
+                        self._corpus_memory.batch_record_entity_paths(
+                            pairs, success=True, confidence=0.95,
+                        )
+            except Exception as exc:
+                logger.debug(f"[memory:dispatch] title_lookup persistence failed: {exc}")
 
         # 4. CorpusMemory — keyword co-occurrence + semantic bridge
         if confidence >= 0.5 and signal.keywords_used:
@@ -344,6 +388,8 @@ class RetrievalMemory:
 
             if confidence < 0.3:
                 features = PatternMemory.classify_query(signal.query)
+                if getattr(signal, "query_type_override", None):
+                    features["query_type"] = signal.query_type_override
                 pid = compute_pattern_id_at_level(
                     features["query_type"],
                     features["complexity"],
@@ -611,6 +657,7 @@ class RetrievalMemory:
         query: str,
         context: Any,
         outcome: float,
+        query_type_override: Optional[str] = None,
     ) -> None:
         """Abstract a SearchContext into a strategy-level trajectory.
 
@@ -626,8 +673,12 @@ class RetrievalMemory:
             The completed search context with logs and metadata.
         outcome : float
             Evaluation score (0-1), e.g. EM or heuristic confidence.
+        query_type_override : str, optional
+            Ground-truth query type (e.g. from benchmark dataset).
         """
         features = PatternMemory.classify_query(query)
+        if query_type_override:
+            features["query_type"] = query_type_override
         steps: List[AbstractTrajectoryStep] = []
         for log in getattr(context, "retrieval_logs", []):
             step = AbstractTrajectoryStep(
@@ -649,6 +700,19 @@ class RetrievalMemory:
             total_tokens=getattr(context, "total_llm_tokens", 0),
             outcome=outcome,
         )
+
+        # D1: Dispatch step-level outcomes to the step bandit
+        for step in getattr(context, "step_outcomes", []):
+            try:
+                self._pattern_memory.record_step_outcome(
+                    query_type=features["query_type"],
+                    step_index=step["step_index"],
+                    action=step["action"],
+                    success=step["success"],
+                    info_gain=step.get("info_gain", 0.0),
+                )
+            except Exception:
+                pass
 
         try:
             self._pattern_memory.store_trajectory(trajectory)

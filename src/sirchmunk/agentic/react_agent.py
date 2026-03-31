@@ -147,6 +147,7 @@ class ReActSearchAgent:
         enable_belief_tracking: bool = True,
         memory_prior: Any = None,
         search_plan: Any = None,
+        batch_step_stats: Any = None,
     ) -> None:
         self.llm = llm
         self.registry = tool_registry
@@ -157,6 +158,7 @@ class ReActSearchAgent:
         self.enable_belief_tracking = enable_belief_tracking
         self._memory_prior = memory_prior
         self._search_plan = search_plan
+        self._batch_step_stats = batch_step_stats
         self._logger = create_logger(log_callback=log_callback, enable_async=True)
 
     # ---- Public API ----
@@ -188,6 +190,8 @@ class ReActSearchAgent:
             belief = BeliefState()
             if self._memory_prior is not None:
                 belief.warm_start(self._memory_prior)
+            if self._batch_step_stats is not None:
+                belief.set_batch_stats(self._batch_step_stats)
             context.belief_state = belief
 
         # MAP guided execution: when a high-confidence plan is available,
@@ -355,6 +359,20 @@ class ReActSearchAgent:
 
             # Update BA-ReAct belief state from tool observations
             self._update_beliefs(context, tool_name, meta)
+
+            # Step-level bandit: record per-tool outcome for D1 contextual learning
+            if hasattr(context, "step_outcomes"):
+                _step_success = self._evaluate_step_success(tool_name, meta, result_text)
+                _info_gain = self._compute_step_info_gain(context, tool_name, meta)
+                context.step_outcomes.append({
+                    "step_index": context.loop_count - 1,
+                    "action": tool_name,
+                    "success": _step_success,
+                    "info_gain": _info_gain,
+                })
+                # Intra-batch experience sharing (C3)
+                if self._batch_step_stats:
+                    self._batch_step_stats.record(tool_name, _step_success)
 
             # Truncate if the tool returned too much text
             if len(result_text) > 8000:
@@ -604,6 +622,47 @@ class ReActSearchAgent:
                 )
                 base += f"\nSuggested reasoning pattern: {steps}"
         return base
+
+    @staticmethod
+    def _evaluate_step_success(
+        tool_name: str,
+        meta: Dict[str, Any],
+        result_text: str,
+    ) -> bool:
+        """Heuristic success for a single tool call (for step bandit)."""
+        if tool_name == "keyword_search":
+            return meta.get("files_found", 0) > 0
+        if tool_name == "title_lookup":
+            return meta.get("paths_found", 0) > 0
+        if tool_name == "file_read":
+            return (
+                meta.get("deep_extracted", False)
+                or len(result_text) > 200
+            )
+        return bool(result_text and len(result_text) > 50)
+
+    @staticmethod
+    def _compute_step_info_gain(
+        context: "SearchContext",
+        tool_name: str,
+        meta: Dict[str, Any],
+    ) -> float:
+        """Estimate information gain from this tool call (0-1)."""
+        belief = getattr(context, "belief_state", None)
+        if belief and hasattr(belief, "compute_ess"):
+            try:
+                ess = belief.compute_ess()
+                # Lower ESS means more concentrated evidence — higher info gain
+                return max(0.0, 1.0 - ess / 5.0)
+            except Exception:
+                pass
+        if tool_name == "keyword_search":
+            return min(meta.get("files_found", 0) / 5.0, 1.0)
+        if tool_name == "title_lookup":
+            return 0.8 if meta.get("paths_found", 0) > 0 else 0.0
+        if tool_name == "file_read":
+            return 0.6 if len(meta.get("summary", "")) > 50 else 0.2
+        return 0.3
 
     @staticmethod
     def _update_beliefs(

@@ -114,10 +114,12 @@ class StrategyDistiller:
             steps_desc = " → ".join(
                 f"{s.action}({s.strategy})" for s in t.steps[:max_steps]
             )
+            action_seq = " → ".join(s.action for s in t.steps[:max_steps])
             lines.append(
                 f"{i}. [{outcome_label}] type={t.query_type} "
                 f"complexity={t.complexity} hops={t.hop_hint} "
                 f"loops={t.loops_used} tokens={t.total_tokens} "
+                f"actions: [{action_seq}] "
                 f"steps: {steps_desc}"
             )
         return "\n".join(lines)
@@ -145,6 +147,29 @@ class StrategyDistiller:
 
         threshold = StrategyDistiller._SUCCESS_THRESHOLD
         n_success = sum(1 for t in trajectories if t.outcome >= threshold)
+
+        # Compute optimal action sequence from successful trajectories
+        success_trajs = [t for t in trajectories if t.outcome >= threshold]
+        fail_trajs = [t for t in trajectories if t.outcome < threshold]
+        optimal_action_seq = data.get("optimal_action_sequence", [])
+        if not optimal_action_seq and success_trajs:
+            from collections import Counter
+            action_seqs = [
+                tuple(s.action for s in t.steps[:6]) for t in success_trajs
+            ]
+            if action_seqs:
+                most_common = Counter(action_seqs).most_common(1)[0][0]
+                optimal_action_seq = list(most_common)
+
+        avg_loops_s = (
+            sum(t.loops_used for t in success_trajs) / max(len(success_trajs), 1)
+            if success_trajs else 0.0
+        )
+        avg_loops_f = (
+            sum(t.loops_used for t in fail_trajs) / max(len(fail_trajs), 1)
+            if fail_trajs else 0.0
+        )
+
         return StrategyDistillation(
             query_type=query_type,
             complexity=complexity,
@@ -159,4 +184,7 @@ class StrategyDistiller:
                 sum(t.total_tokens for t in trajectories) / max(len(trajectories), 1),
             ),
             distilled_at=datetime.now(timezone.utc).isoformat(),
+            optimal_action_sequence=optimal_action_seq,
+            avg_loops_success=avg_loops_s,
+            avg_loops_failure=avg_loops_f,
         )
