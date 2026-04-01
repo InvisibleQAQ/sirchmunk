@@ -126,6 +126,9 @@ class ExperimentConfig:
     sp_max_articles: int
     sp_max_tokens: int
 
+    # SP extraction mode
+    sp_heuristic_only: bool
+
     def __post_init__(self) -> None:
         self.dataset_dir = Path(self.dataset_dir).resolve()
         self.wiki_corpus_dir = Path(self.wiki_corpus_dir).resolve()
@@ -200,6 +203,7 @@ def get_config(
         "map_timeout_sec": float(os.getenv("HOTPOT_MAP_TIMEOUT_SEC", "8")),
         "sp_max_articles": int(os.getenv("HOTPOT_SP_MAX_ARTICLES", "5")),
         "sp_max_tokens": int(os.getenv("HOTPOT_SP_MAX_TOKENS", "5000")),
+        "sp_heuristic_only": _bool_env(os.getenv("HOTPOT_SP_HEURISTIC_ONLY"), False),
     }
 
     for k, v in overrides.items():

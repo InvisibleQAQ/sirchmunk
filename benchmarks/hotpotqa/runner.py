@@ -1236,6 +1236,7 @@ async def _extract_sp_with_llm(
     extract_answer: bool = False,
     sp_max_articles: int = 5,
     sp_max_tokens: int = 5000,
+    sp_heuristic_only: bool = False,
 ) -> Tuple[Set[str], List[List], Dict[str, List[str]], str]:
     """Extract supporting facts (and optionally a grounded answer) via LLM.
 
@@ -1289,7 +1290,7 @@ async def _extract_sp_with_llm(
         return tracked_titles, [], {}, ""
 
     # --- Heuristic SP extraction (fast path) ---
-    heuristic_only = os.getenv("HOTPOT_SP_HEURISTIC_ONLY", "0") == "1"
+    heuristic_only = sp_heuristic_only
 
     h_titles, h_sp, h_answer = _extract_sp_heuristic(
         question, answer, candidates,
@@ -1536,6 +1537,7 @@ async def _run_postprocess_pipeline(
         extract_answer=cfg.extract_answer,
         sp_max_articles=cfg.sp_max_articles,
         sp_max_tokens=cfg.sp_max_tokens,
+        sp_heuristic_only=cfg.sp_heuristic_only,
     )
 
     if cfg.extract_answer and raw_answer:
