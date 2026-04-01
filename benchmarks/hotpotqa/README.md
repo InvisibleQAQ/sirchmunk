@@ -222,7 +222,7 @@ LinearRAG reports **64.30%** Contain-Acc and **66.50%** GPT-Acc on HotpotQA
     Avg files read:         12.4
     Avg titles retrieved:   89
     Avg SP predictions:     356
-    Total search time:    422.5 s
+    Cumulative search time: 422.5 s
     Total wall time:       423.5 s
     Errors:                   0 / 50
 ```
