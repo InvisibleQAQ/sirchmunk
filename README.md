@@ -475,14 +475,14 @@ python scripts/stop_web.py
 
 Pre-built Docker images are available on Alibaba Cloud Container Registry:
 
-| Region | Image |
-|---|---|
-| US West | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6` |
-| China Beijing | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6` |
+| Region | Image                                                                                                   |
+|---|---------------------------------------------------------------------------------------------------------|
+| US West | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3`  |
+| China Beijing | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3` |
 
 ```bash
 # Pull the image
-docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6
+docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3
 
 # Start the service
 docker run -d \
@@ -501,7 +501,7 @@ docker run -d \
   -e SIRCHMUNK_SEARCH_PATHS=/mnt/docs \
   -v /path/to/your_work_path:/data/sirchmunk \
   -v /path/to/your/docs:/mnt/docs:ro \
-  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6
+  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3
   
 # Stop and remove the service
 docker stop sirchmunk && docker rm sirchmunk
