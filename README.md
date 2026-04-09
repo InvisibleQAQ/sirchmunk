@@ -502,6 +502,9 @@ docker run -d \
   -v /path/to/your_work_path:/data/sirchmunk \
   -v /path/to/your/docs:/mnt/docs:ro \
   modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6
+  
+# Stop and remove the service
+docker stop sirchmunk && docker rm sirchmunk
 ```
 
 
