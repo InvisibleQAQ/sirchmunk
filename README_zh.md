@@ -152,6 +152,9 @@
 
 ## 🎉 News
 
+* 🚀 **2026年3月31日**: Sirchmunk v0.0.6post3
+  - **Docker 多架构支持**：通过 Docker Buildx 原生构建 `linux/amd64` 和 `linux/arm64` 镜像；CI 自动构建双架构。
+  - **FAST 模式优化**：`_fast_find_best_file` 新增文件级去重与动态分数剪枝；知识集群复用增加搜索范围感知。
 * 🚀 **2026年3月20日**: Sirchmunk v0.0.6post1
   - **🐿️x🦞OpenClaw 技能**：Sirchmunk 已发布为 [OpenClaw](https://openclaw.org/) 技能，上架 [ClawHub](https://clawhub.ai/wangxingjun778/sirchmunk) — 任何兼容 OpenClaw 的 AI Agent均可通过自然语言搜索本地文件。详见 [openclaw-recipe](recipes/openclaw_skills/README.md)。
   - **Search API**：新增 SSE 流式端点（`POST /api/v1/search/stream`），支持实时日志输出；通过 `SIRCHMUNK_MAX_CONCURRENT_SEARCHES` 控制并发；`paths` 参数同时支持字符串和数组，且为可选（回退到 `SIRCHMUNK_SEARCH_PATHS`）。
@@ -474,14 +477,14 @@ python scripts/stop_web.py
 
 预构建的 Docker 镜像托管在阿里云容器镜像服务：
 
-| 区域 | 镜像 |
-|---|---|
-| 美西 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6` |
-| 北京 | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6` |
+| 区域 | 镜像                                                                                                      |
+|---|---------------------------------------------------------------------------------------------------------|
+| 美西 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3`  |
+| 北京 | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3` |
 
 ```bash
 # 拉取镜像（根据地理位置选择最近的 Registry）
-docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6
+docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3
 
 # 启动服务
 docker run -d \
@@ -500,7 +503,10 @@ docker run -d \
   -e SIRCHMUNK_SEARCH_PATHS=/mnt/docs \
   -v /path/to/your_work_path:/data/sirchmunk \
   -v /path/to/your/docs:/mnt/docs:ro \
-  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6
+  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3
+  
+# 停止和删除容器
+docker stop sirchmunk && docker rm sirchmunk
 ```
 
 
