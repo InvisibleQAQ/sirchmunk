@@ -38,6 +38,7 @@ import { processLatexContent } from "@/lib/latex";
 import { getTranslation, type Language } from "@/lib/i18n";
 import FileBrowser from "@/components/FileBrowser";
 import FileUpload from "@/components/FileUpload";
+import CollectionBrowser from "../components/CollectionBrowser";
 
 interface KnowledgeBase {
   name: string;
@@ -91,6 +92,8 @@ export default function HomePage() {
   const [showModeDropdown, setShowModeDropdown] = useState(false);
   const [enableSuggestions, setEnableSuggestions] = useState(true);
   const [showUpload, setShowUpload] = useState(false);
+  const [showCollectionBrowser, setShowCollectionBrowser] = useState(false);
+  const [manualPath, setManualPath] = useState("");
   const chatEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -404,15 +407,12 @@ export default function HomePage() {
               {t("Select File or Folder")}
             </h3>
 
+            {tkinterAvailable ? (
             <div className="space-y-3">
               {/* Single File Button */}
               <button
                 type="button"
                 onClick={async () => {
-                  if (!tkinterAvailable) {
-                    setFileBrowserMode("files");
-                    return;
-                  }
                   try {
                     const response = await fetch(apiUrl("/api/v1/file-picker"), {
                       method: "POST",
@@ -457,10 +457,6 @@ export default function HomePage() {
               <button
                 type="button"
                 onClick={async () => {
-                  if (!tkinterAvailable) {
-                    setFileBrowserMode("directory");
-                    return;
-                  }
                   try {
                     const response = await fetch(apiUrl("/api/v1/file-picker"), {
                       method: "POST",
@@ -529,6 +525,79 @@ export default function HomePage() {
                 />
               </div>
             </div>
+            ) : (
+            <div className="space-y-3">
+              {/* Remote mode: Upload & Collection management */}
+              <button
+                onClick={() => { setShowUpload(true); setShowFileSelector(false); }}
+                className="w-full flex items-center gap-3 p-4 rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+              >
+                <svg className="w-6 h-6 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                </svg>
+                <div className="text-left">
+                  <div className="font-medium text-gray-900 dark:text-gray-100">{t("Upload Files")}</div>
+                  <div className="text-sm text-gray-500 dark:text-gray-400">{t("Upload files from your computer to the server")}</div>
+                </div>
+              </button>
+
+              <button
+                onClick={() => { setShowCollectionBrowser(true); setShowFileSelector(false); }}
+                className="w-full flex items-center gap-3 p-4 rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+              >
+                <svg className="w-6 h-6 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                </svg>
+                <div className="text-left">
+                  <div className="font-medium text-gray-900 dark:text-gray-100">{t("Browse Collections")}</div>
+                  <div className="text-sm text-gray-500 dark:text-gray-400">{t("Select from previously uploaded file collections")}</div>
+                </div>
+              </button>
+
+              <div className="flex items-center gap-2 p-4 rounded-lg border border-gray-200 dark:border-gray-600">
+                <svg className="w-6 h-6 text-purple-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                </svg>
+                <input
+                  type="text"
+                  value={manualPath}
+                  onChange={(e) => setManualPath(e.target.value)}
+                  placeholder={t("Enter server path (e.g., /data/docs)")}
+                  className="flex-1 px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && manualPath.trim()) {
+                      const path = manualPath.trim();
+                      if (!selectedPaths.includes(path)) {
+                        setSelectedPaths(prev => [...prev, path]);
+                      }
+                      setSelectedPath(path);
+                      setChatState(prev => ({ ...prev, enableRag: true, selectedKb: path }));
+                      setManualPath("");
+                      setShowFileSelector(false);
+                    }
+                  }}
+                />
+                <button
+                  onClick={() => {
+                    const path = manualPath.trim();
+                    if (path) {
+                      if (!selectedPaths.includes(path)) {
+                        setSelectedPaths(prev => [...prev, path]);
+                      }
+                      setSelectedPath(path);
+                      setChatState(prev => ({ ...prev, enableRag: true, selectedKb: path }));
+                      setManualPath("");
+                      setShowFileSelector(false);
+                    }
+                  }}
+                  disabled={!manualPath.trim()}
+                  className="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium"
+                >
+                  {t("Add")}
+                </button>
+              </div>
+            </div>
+            )}
 
             <div className="flex gap-3 mt-6">
               <button
@@ -1263,8 +1332,27 @@ export default function HomePage() {
         isOpen={showUpload}
         onClose={() => setShowUpload(false)}
         onUploadComplete={(path) => {
-          console.log("Upload complete, collection path:", path);
+          if (path && !selectedPaths.includes(path)) {
+            setSelectedPaths(prev => [...prev, path]);
+          }
+          setSelectedPath(path);
+          setChatState(prev => ({ ...prev, enableRag: true, selectedKb: path }));
           setShowUpload(false);
+          setShowFileSelector(false);
+        }}
+      />
+
+      <CollectionBrowser
+        isOpen={showCollectionBrowser}
+        onClose={() => setShowCollectionBrowser(false)}
+        onSelectPath={(path) => {
+          if (!selectedPaths.includes(path)) {
+            setSelectedPaths(prev => [...prev, path]);
+          }
+          setSelectedPath(path);
+          setChatState(prev => ({ ...prev, enableRag: true, selectedKb: path }));
+          setShowCollectionBrowser(false);
+          setShowFileSelector(false);
         }}
       />
     </div>

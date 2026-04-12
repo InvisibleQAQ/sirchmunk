@@ -1325,6 +1325,8 @@ async def get_file_picker_status():
         "success": True,
         "data": {
             "tkinter_available": avail,
+            "deployment_mode": "local" if avail else "remote",
+            "upload_enabled": True,
             "server_browser": True,
             "supported_types": ["files", "directory"],
             "features": {
