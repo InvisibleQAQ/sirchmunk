@@ -153,6 +153,17 @@ async def internal_error_handler(request, exc):
         }
     )
 
+# Favicon route — browsers always request /favicon.ico; serve it from the
+# static directory when available, otherwise return 204 No Content to avoid 404.
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    if _ui_available:
+        ico_path = _static_dir / "favicon.ico"
+        if ico_path.is_file():
+            return FileResponse(ico_path, media_type="image/x-icon")
+    return Response(status_code=204)
+
+
 # Mount static files for WebUI when enabled.
 # This MUST be after all API route registrations so that API endpoints
 # take priority over the catch-all static file serving.
