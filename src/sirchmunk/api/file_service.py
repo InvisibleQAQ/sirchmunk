@@ -154,9 +154,10 @@ class FileStorageService:
     def _compute_total_usage(self) -> int:
         total = 0
         if self._upload_root.exists():
-            for f in self._upload_root.rglob("*"):
-                if f.is_file() and f.name != self._MANIFEST_FILE:
-                    total += f.stat().st_size
+            for d in self._upload_root.iterdir():
+                if d.is_dir() and not d.name.startswith("."):
+                    entries = self._read_manifest(d.name)
+                    total += sum(e.get("size_bytes", 0) for e in entries)
         return total
 
     # ------------------------------------------------------------------

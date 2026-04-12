@@ -210,7 +210,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+            "script-src 'self' 'unsafe-inline'; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: blob:; "
             "connect-src 'self' ws: wss:; "
@@ -273,13 +273,27 @@ file_browser_limiter = RateLimiter(per_second=5, per_minute=100)
 
 
 class AuditLogger:
-    """Append-only JSON-Lines audit log for path access events."""
+    """Append-only JSON-Lines audit log for path access events.
+
+    Uses Python's ``logging.FileHandler`` instead of raw ``open()`` so
+    that writes are process-safe under multi-worker deployments
+    (e.g. ``uvicorn --workers 4``).
+    """
 
     def __init__(self):
         work_path = os.getenv("SIRCHMUNK_WORK_PATH", os.path.expanduser("~/.sirchmunk"))
         log_dir = Path(work_path).expanduser().resolve()
         log_dir.mkdir(parents=True, exist_ok=True)
-        self._log_file = log_dir / "audit.log"
+        log_file = log_dir / "audit.log"
+
+        self._logger = logging.getLogger("audit")
+        self._logger.setLevel(logging.INFO)
+        self._logger.propagate = False
+
+        if not self._logger.handlers:
+            handler = logging.FileHandler(log_file, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            self._logger.addHandler(handler)
 
     def log(self, *, client_ip: str, action: str, path: str, result: str) -> None:
         """Write a single audit event."""
@@ -291,10 +305,9 @@ class AuditLogger:
             "result": result,
         }
         try:
-            with open(self._log_file, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(event, ensure_ascii=False) + "\n")
-        except OSError:
-            logger.warning("Failed to write audit log entry")
+            self._logger.info(json.dumps(event, ensure_ascii=False))
+        except Exception:
+            logger.warning("Failed to write audit log entry", exc_info=True)
 
 
 audit_logger = AuditLogger()

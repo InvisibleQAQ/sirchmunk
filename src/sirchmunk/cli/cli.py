@@ -1282,12 +1282,11 @@ def cmd_upload(args: argparse.Namespace) -> int:
         for i in range(0, len(files_to_upload), batch_size):
             batch = files_to_upload[i:i + batch_size]
             multipart_files = []
-            for f in batch:
-                multipart_files.append(
-                    ("files", (f.name, open(f, "rb"), "application/octet-stream"))
-                )
-
             try:
+                for f in batch:
+                    multipart_files.append(
+                        ("files", (f.name, open(f, "rb"), "application/octet-stream"))
+                    )
                 resp = client.post(
                     url,
                     files=multipart_files,
