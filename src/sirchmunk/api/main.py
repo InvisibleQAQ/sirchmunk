@@ -49,6 +49,7 @@ from .history import router as history_router, dashboard_router
 from .chat import router as chat_router
 from .monitor import router as monitor_router
 from .search import router as search_router
+from .files import router as files_router
 
 # Determine whether to serve the WebUI static files.
 # Set by `sirchmunk web serve` via environment variable.
@@ -95,6 +96,7 @@ app.include_router(dashboard_router)
 app.include_router(chat_router)
 app.include_router(monitor_router)
 app.include_router(search_router)
+app.include_router(files_router)
 
 # Root endpoint: return API info when UI is not served,
 # otherwise let the static mount handle "/"

@@ -37,6 +37,7 @@ import { apiUrl } from "@/lib/api";
 import { processLatexContent } from "@/lib/latex";
 import { getTranslation, type Language } from "@/lib/i18n";
 import FileBrowser from "@/components/FileBrowser";
+import FileUpload from "@/components/FileUpload";
 
 interface KnowledgeBase {
   name: string;
@@ -89,6 +90,7 @@ export default function HomePage() {
   const [showPathDropdown, setShowPathDropdown] = useState(false);
   const [showModeDropdown, setShowModeDropdown] = useState(false);
   const [enableSuggestions, setEnableSuggestions] = useState(true);
+  const [showUpload, setShowUpload] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -948,13 +950,24 @@ export default function HomePage() {
               )}
             </div>
 
-            <button
-              onClick={newChatSession}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded-lg transition-colors"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              {t("New Chat")}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowUpload(true)}
+                className="p-2 rounded-md hover:bg-gray-100 dark:hover:bg-gray-700"
+                title="Upload files"
+              >
+                <svg className="w-5 h-5 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                </svg>
+              </button>
+              <button
+                onClick={newChatSession}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded-lg transition-colors"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                {t("New Chat")}
+              </button>
+            </div>
           </div>
 
           {/* Messages Area */}
@@ -1246,6 +1259,14 @@ export default function HomePage() {
       )}
       </div>
 
+      <FileUpload
+        isOpen={showUpload}
+        onClose={() => setShowUpload(false)}
+        onUploadComplete={(path) => {
+          console.log("Upload complete, collection path:", path);
+          setShowUpload(false);
+        }}
+      />
     </div>
   );
 }
