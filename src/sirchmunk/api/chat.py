@@ -25,7 +25,7 @@ from sirchmunk.search import AgenticSearch
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.api.components.history_storage import HistoryStorage
 from sirchmunk.api.components.monitor_tracker import llm_usage_tracker
-from sirchmunk.api.security import is_path_allowed, verify_ws_token, detect_prompt_injection
+from sirchmunk.api.security import is_path_allowed, verify_ws_token
 
 logger = logging.getLogger(__name__)
 
@@ -1135,15 +1135,6 @@ async def chat_websocket(websocket: WebSocket):
             enable_rag = request_data.get("enable_rag", False)
             enable_web_search = request_data.get("enable_web_search", False)
             search_mode = request_data.get("search_mode", "FAST")
-
-            # Prompt injection detection
-            if detect_prompt_injection(message):
-                await manager.send_personal_message(json.dumps({
-                    "type": "warning",
-                    "message": "Your query contains potentially unsafe patterns and has been filtered."
-                }), websocket)
-                logger.warning("Prompt injection attempt detected")
-                continue  # skip this message, go back to waiting for next WS message
 
             logger.debug("Chat request: rag=%s, mode=%s", enable_rag, search_mode)
             

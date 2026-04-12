@@ -1,6 +1,7 @@
 """Security utilities for Sirchmunk API: authentication, path validation,
 prompt-injection detection, filename sanitization, and HTTP security headers."""
 
+import hmac
 import logging
 import os
 import re
@@ -16,15 +17,28 @@ logger = logging.getLogger(__name__)
 # Token Authentication
 # ---------------------------------------------------------------------------
 
-_API_TOKEN: Optional[str] = os.getenv("SIRCHMUNK_API_TOKEN") or None  # treat empty string as None
+def _get_api_token() -> Optional[str]:
+    """Read and normalize API token from environment on each call."""
+    raw = os.getenv("SIRCHMUNK_API_TOKEN")
+    if raw is None:
+        return None
+    token = raw.strip()
+    return token or None
 
 
 async def verify_token(request: Request) -> None:
     """Verify Bearer token. No-op when SIRCHMUNK_API_TOKEN is unset."""
-    if not _API_TOKEN:
+    token = _get_api_token()
+    if not token:
         return
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer ") or auth[7:] != _API_TOKEN:
+    if not auth.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing token",
+        )
+    presented = auth[7:].strip()
+    if not hmac.compare_digest(presented, token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing token",
@@ -33,13 +47,14 @@ async def verify_token(request: Request) -> None:
 
 def verify_ws_token(websocket: WebSocket) -> bool:
     """Verify WebSocket token from query param or Authorization header."""
-    if not _API_TOKEN:
-        return True
-    token = websocket.query_params.get("token", "")
+    token = _get_api_token()
     if not token:
+        return True
+    candidate = websocket.query_params.get("token", "")
+    if not candidate:
         auth = websocket.headers.get("authorization", "")
-        token = auth[7:] if auth.startswith("Bearer ") else ""
-    return token == _API_TOKEN
+        candidate = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    return bool(candidate) and hmac.compare_digest(candidate, token)
 
 
 # ---------------------------------------------------------------------------
@@ -78,31 +93,9 @@ def _is_subpath(child: Path, parent: Path) -> bool:
     except ValueError:
         return False
 
-
-# ---------------------------------------------------------------------------
-# Prompt Injection Detection
-# ---------------------------------------------------------------------------
-
-_INJECTION_PATTERNS = [
-    re.compile(r"ignore\s+(all\s+)?previous\s+instructions", re.I),
-    re.compile(r"disregard\s+(all\s+)?above", re.I),
-    re.compile(r"system\s*prompt", re.I),
-    re.compile(r"you\s+are\s+now\s+(?:a|an)\s+", re.I),
-    re.compile(r"<\s*/?(?:system|assistant|user)\s*>", re.I),
-    re.compile(r"\[\s*INST\s*\]", re.I),
-    re.compile(r"```\s*system", re.I),
-]
-
-
-def detect_prompt_injection(text: str) -> bool:
-    """Return True if *text* matches known prompt-injection patterns."""
-    return any(p.search(text) for p in _INJECTION_PATTERNS)
-
-
 # ---------------------------------------------------------------------------
 # Filename Sanitization
 # ---------------------------------------------------------------------------
-
 
 def sanitize_filename(filename: str) -> str:
     """Strip path components and dangerous characters from *filename*."""
@@ -122,10 +115,21 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Inject standard security headers into every HTTP response."""
 
     async def dispatch(self, request: Request, call_next):
-        """Process the request and add security headers to the response."""
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self' ws: wss:; font-src 'self';",
+        )
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=63072000; includeSubDomains",
+        )
+        response.headers.setdefault(
+            "Permissions-Policy",
+            "geolocation=(), microphone=(), camera=()",
+        )
         return response
