@@ -424,7 +424,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         Exit code (0 for success, non-zero for failure)
     """
     try:
-        work_path = Path(args.work_path).expanduser().resolve()
+        work_path = Path(
+            getattr(args, "work_path", None) or str(_get_default_work_path())
+        ).expanduser().resolve()
 
         print("=" * 60)
         print("  Sirchmunk Initialization")
@@ -1388,6 +1390,12 @@ Examples:
         action="store_true",
         help="Show version and exit",
     )
+    parser.add_argument(
+        "--work-path",
+        dest="global_work_path",
+        default=None,
+        help="Global working directory (can be used before sub-commands).",
+    )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -1399,7 +1407,7 @@ Examples:
     )
     init_parser.add_argument(
         "--work-path",
-        default=str(_get_default_work_path()),
+        default=None,
         help="Working directory path (default: ~/.sirchmunk)",
     )
     init_parser.set_defaults(func=cmd_init)
@@ -1416,7 +1424,7 @@ Examples:
     serve_parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     serve_parser.add_argument(
         "--work-path",
-        default=str(_get_default_work_path()),
+        default=None,
         help="Working directory (default: ~/.sirchmunk)",
     )
     serve_parser.set_defaults(func=cmd_serve)
@@ -1475,7 +1483,7 @@ Examples:
     web_serve_parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     web_serve_parser.add_argument(
         "--work-path",
-        default=str(_get_default_work_path()),
+        default=None,
         help="Working directory (default: ~/.sirchmunk)",
     )
     web_serve_parser.set_defaults(func=cmd_web_serve)
@@ -1500,7 +1508,7 @@ Examples:
     mcp_serve_parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     mcp_serve_parser.add_argument(
         "--work-path",
-        default=str(_get_default_work_path()),
+        default=None,
         help="Working directory (default: ~/.sirchmunk)",
     )
     mcp_serve_parser.set_defaults(func=cmd_mcp_serve)
@@ -1561,6 +1569,12 @@ def run_cmd():
     """Main entry point for the CLI."""
     parser = create_parser()
     args = parser.parse_args()
+
+    # Allow --work-path both before and after sub-commands.
+    # Sub-command specific --work-path still works as before.
+    if getattr(args, "global_work_path", None):
+        if not hasattr(args, "work_path") or getattr(args, "work_path", None) is None:
+            setattr(args, "work_path", args.global_work_path)
 
     # Handle --version flag
     if args.version:
