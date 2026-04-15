@@ -396,7 +396,8 @@ def _run_base_init(work_path: Path) -> int:
       "command": "sirchmunk",
       "args": ["mcp", "serve"],
       "env": {
-        "SIRCHMUNK_SEARCH_PATHS": ""
+        "SIRCHMUNK_SEARCH_PATHS": "",
+        "SIRCHMUNK_WORK_PATH": "/path/to/your_work_path"
       }
     }
   }
@@ -1076,14 +1077,14 @@ def _serve_dev_mode(args: argparse.Namespace, work_path: Path) -> int:
 # sirchmunk mcp serve
 # ------------------------------------------------------------------
 
-def _setup_stdio_safe_environment():
+def _setup_stdio_safe_environment(work_path: Path):
     """Configure environment for safe stdio MCP communication.
 
     In MCP stdio mode, stdout is reserved exclusively for JSON-RPC messages.
     Any non-JSON output to stdout will break the protocol.
     """
     os.environ["MODELSCOPE_LOG_LEVEL"] = str(logging.ERROR)
-    os.environ["MODELSCOPE_CACHE"] = os.path.expanduser("~/.sirchmunk/.cache/models")
+    os.environ["MODELSCOPE_CACHE"] = str(work_path / ".cache" / "models")
     os.environ["TRANSFORMERS_VERBOSITY"] = "error"
     os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -1124,7 +1125,7 @@ def cmd_mcp_serve(args: argparse.Namespace) -> int:
         # Set up safe environment BEFORE any sirchmunk imports for stdio mode
         if transport == "stdio":
             os.environ["MCP_TRANSPORT"] = "stdio"
-            _setup_stdio_safe_environment()
+            _setup_stdio_safe_environment(work_path)
 
         # Load .env before importing config (so env vars are available)
         env_file = work_path / ".env"
